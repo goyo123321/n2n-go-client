@@ -21,7 +21,7 @@ type NATMetadata struct {
 
 func probeNAT(localUDPPort int, stunServers []string) *NATMetadata {
     meta := &NATMetadata{
-        // ★ 修复：P2PEndpoint 不再预设 0.0.0.0，STUN 成功后才填
+        // P2PEndpoint 不再预设 0.0.0.0，STUN 成功后才填
         P2PEndpoint:     "",
         NATType:         "unknown",
         Behavior:        "BehaviorPortChanged",
@@ -44,11 +44,12 @@ func probeNAT(localUDPPort int, stunServers []string) *NATMetadata {
             continue
         }
 
-        // ★ 修复：显式生成 TransactionID，避免使用包级变量
-        msg := stun.MustBuild(stun.NewTransactionID(), stun.BindingRequest)
+        // ★ 修正：stun.TransactionID 是 Setter，AddTo() 每次会生成随机 ID
+        // 之前误用 stun.NewTransactionID()（返回 [12]byte，不是 Setter）导致编译失败
+        msg := stun.MustBuild(stun.TransactionID, stun.BindingRequest)
         var xorAddr stun.XORMappedAddress
 
-        // ★ 修复：给每个 STUN 服务器加 3 秒超时
+        // 给每个 STUN 服务器加 3 秒超时
         done := make(chan struct{})
         go func() {
             defer close(done)
@@ -78,7 +79,7 @@ func probeNAT(localUDPPort int, stunServers []string) *NATMetadata {
     }
 
     meta.PublicEndpoint = net.JoinHostPort(results[0].ip, strconv.Itoa(results[0].port))
-    // ★ 修复：用 STUN 结果作为 P2PEndpoint，而不是 0.0.0.0
+    // 用 STUN 结果作为 P2PEndpoint，而不是 0.0.0.0
     meta.P2PEndpoint = meta.PublicEndpoint
 
     firstPort := results[0].port
