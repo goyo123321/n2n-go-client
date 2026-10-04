@@ -43,8 +43,6 @@ on:
         required: false
         type: boolean
         default: false
-
-      # ★ E2E 相关参数
       node_name:
         description: '【E2E 设备名】客户端上报给 Worker 的 NODE_NAME'
         required: false
@@ -102,7 +100,6 @@ jobs:
           USE_FIXED_ROOM: ${{ inputs.use_fixed_room }}
           NODE_NAME_IN: ${{ inputs.node_name }}
           SHARE_DIR_IN: ${{ inputs.share_dir }}
-          # ★ 新增
           CLIENT_ID_MODE: ${{ inputs.client_id_mode }}
           CLIENT_ID_IN: ${{ inputs.client_id }}
         run: |
@@ -161,10 +158,10 @@ jobs:
                 exit 1
               fi
               WSS="$CLEAN_WSS"
-              WSS_SOURCE="custom (with token)"
+              WSS_SOURCE="custom-with-token"
               HAS_WSS="true"
               CONNECT_TOKEN="$EXTRACTED_TOKEN"
-              TOKEN_SOURCE="extracted from custom_wss"
+              TOKEN_SOURCE="extracted-from-custom_wss"
               echo "::notice::从 custom_wss 提取 token（${#EXTRACTED_TOKEN} 字符）"
             else
               WSS="$CUSTOM_WSS"
@@ -179,7 +176,7 @@ jobs:
             echo "::warning::use_custom_wss 勾选了但 custom_wss 为空，回退到 Secret"
             if [ -n "$SECRET_WSS" ]; then
               WSS="$SECRET_WSS"
-              WSS_SOURCE="secret (custom 为空回退)"
+              WSS_SOURCE="secret-fallback"
               HAS_WSS="true"
               if [ -n "$SECRET_CONNECT_TOKEN" ]; then
                 CONNECT_TOKEN="$SECRET_CONNECT_TOKEN"
@@ -220,7 +217,6 @@ jobs:
           NODE_NAME="${NODE_NAME_IN:-CI E2E}"
           SHARE_DIR="${SHARE_DIR_IN:-/tmp/shared}"
 
-          # ★ 新增：根据 client_id_mode 决定 CLIENT_ID
           case "$CLIENT_ID_MODE" in
             fixed)
               FINAL_CLIENT_ID="ci-test"
@@ -256,9 +252,9 @@ jobs:
           echo "::notice::Token 来源: $TOKEN_SOURCE"
           echo "::notice::房间名: $ROOM ($ROOM_MODE)"
           echo "::notice::设备名: $NODE_NAME"
-          echo "::notice::客户端ID模式: $CLIENT_ID_MODE → $FINAL_CLIENT_ID"
+          echo "::notice::客户端ID模式: $CLIENT_ID_MODE -> $FINAL_CLIENT_ID"
 
-  # ========== 第二步：单元测试 ==========
+  # ========== 第二步：单元测试 + 编译校验 ==========
   test:
     needs: prepare
     runs-on: ubuntu-latest
@@ -281,6 +277,7 @@ jobs:
         run: go vet ./...
 
       - name: go test
+        shell: bash
         run: |
           if find . -name '*_test.go' | grep -q .; then
             go test -v -count=1 ./...
@@ -291,7 +288,7 @@ jobs:
       - name: Build native (linux amd64)
         run: go build -o /tmp/n2n-test .
 
-      - name: Smoke test — 未设 SIGNALING_URL 应报错退出
+      - name: Smoke test - 未设 SIGNALING_URL 应报错退出
         shell: bash
         run: |
           chmod +x /tmp/n2n-test
@@ -302,6 +299,7 @@ jobs:
           echo "---- 退出码: $EXIT ----"
           echo "$OUTPUT"
           echo "----------------------"
+
           if [ "$EXIT" = "0" ]; then
             echo "::error::未设置 SIGNALING_URL 时应非 0 退出，实际 $EXIT"
             exit 1
@@ -310,7 +308,7 @@ jobs:
             echo "::error::错误信息未包含 SIGNALING_URL"
             exit 1
           fi
-          echo "✅ Smoke test 通过"
+          echo "Smoke test 通过"
 
       - name: Cross-compile linux/arm64
         run: GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o /dev/null .
@@ -336,10 +334,10 @@ jobs:
         run: |
           echo "## 单元测试结果" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ go vet" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ go build (native)" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Smoke test" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ 交叉编译: linux/arm64, darwin/amd64, darwin/arm64, windows/amd64" >> $GITHUB_STEP_SUMMARY
+          echo "- go vet" >> $GITHUB_STEP_SUMMARY
+          echo "- go build (native)" >> $GITHUB_STEP_SUMMARY
+          echo "- Smoke test" >> $GITHUB_STEP_SUMMARY
+          echo "- 交叉编译: linux/arm64, darwin/amd64, darwin/arm64, windows/amd64" >> $GITHUB_STEP_SUMMARY
 
   # ========== 第三步：构建 5 个平台 ==========
   build:
@@ -372,6 +370,7 @@ jobs:
         run: go mod tidy
 
       - name: Build
+        shell: bash
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
@@ -431,11 +430,12 @@ jobs:
           fi
 
       - name: Check TUN availability
+        shell: bash
         run: |
           if [ -c /dev/net/tun ]; then
-            echo "✅ /dev/net/tun 存在"
+            echo "/dev/net/tun 存在"
           else
-            echo "⚠️ /dev/net/tun 不存在，TUN 会失败但不影响信令测试"
+            echo "/dev/net/tun 不存在，TUN 会失败但不影响信令测试"
           fi
 
       - name: Start client in background
@@ -472,7 +472,7 @@ jobs:
           echo "等待客户端初始化（3 秒）..."
           sleep 3
           echo "===== 客户端日志（前 20 行）====="
-          cat /tmp/client.log | head -20 || echo "(无日志)"
+          head -20 /tmp/client.log || echo "无日志文件"
 
       - name: Verify via Worker API (with retry)
         id: verify
@@ -483,50 +483,50 @@ jobs:
         run: |
           HTTP_URL="https://${SIGNALING_URL#wss://}"
           HTTP_URL="${HTTP_URL#ws://}"
-          STATUS_URL="$HTTP_URL/api/public/status/$ROOM"
+          STATUS_URL="${HTTP_URL}/api/public/status/${ROOM}"
 
-          echo "轮询查询（最多 10 次，每次间隔 2 秒）..."
-          echo "URL: $STATUS_URL"
+          echo "轮询查询(最多 10 次, 每次间隔 2 秒)..."
+          echo "URL: ${STATUS_URL}"
           echo ""
 
           MAX_ATTEMPTS=10
-          for i in $(seq 1 $MAX_ATTEMPTS); do
-            echo "--- 尝试 $i/$MAX_ATTEMPTS ---"
-            RESPONSE=$(curl -s "$STATUS_URL" 2>&1)
-            echo "响应: $RESPONSE"
+          for i in $(seq 1 ${MAX_ATTEMPTS}); do
+            echo "--- 尝试 ${i}/${MAX_ATTEMPTS} ---"
+            RESPONSE=$(curl -s "${STATUS_URL}" 2>&1)
+            echo "响应: ${RESPONSE}"
 
-            PEER_COUNT=$(echo "$RESPONSE" | jq -r '.peerCount // 0' 2>/dev/null || echo "0")
-            echo "peerCount=$PEER_COUNT"
+            PEER_COUNT=$(printf '%s' "${RESPONSE}" | jq -r '.peerCount // 0' 2>/dev/null || echo "0")
+            echo "peerCount=${PEER_COUNT}"
 
-            if [ "$PEER_COUNT" -ge 1 ]; then
+            if [ "${PEER_COUNT}" -ge 1 ]; then
               echo ""
-              echo "✅ 第 $i 次尝试检测到客户端"
+              echo "第 ${i} 次尝试检测到客户端"
               echo "result=success" >> $GITHUB_OUTPUT
 
-              NAT_TYPE=$(echo "$RESPONSE" | jq -r '.peers[0].natType // "unknown"')
-              echo "该客户端 NAT 类型: $NAT_TYPE"
-              echo "nat_type=$NAT_TYPE" >> $GITHUB_OUTPUT
-
-              REPORTED_NAME=$(echo "$RESPONSE" | jq -r '.peers[0].name // ""')
-              echo "Worker 收到的设备名: $REPORTED_NAME"
-              if [ -n "$REPORTED_NAME" ]; then
-                echo "✅ NODE_NAME 已正确上报"
+              NAT_TYPE=$(printf '%s' "${RESPONSE}" | jq -r '.peers[0].natType // empty' 2>/dev/null)
+              if [ -z "${NAT_TYPE}" ]; then
+                NAT_TYPE="unknown"
               fi
+              echo "该客户端 NAT 类型: ${NAT_TYPE}"
+              echo "nat_type=${NAT_TYPE}" >> $GITHUB_OUTPUT
+
+              REPORTED_NAME=$(printf '%s' "${RESPONSE}" | jq -r '.peers[0].name // empty' 2>/dev/null)
+              echo "Worker 收到的设备名: ${REPORTED_NAME}"
 
               exit 0
             fi
 
-            if [ "$i" -lt "$MAX_ATTEMPTS ]; then
-              echo "  未检测到，等 2 秒后重试..."
+            if [ "${i}" -lt "${MAX_ATTEMPTS}" ]; then
+              echo "未检测到, 等 2 秒后重试..."
               sleep 2
             fi
           done
 
           echo ""
-          echo "❌ $MAX_ATTEMPTS 次尝试均未检测到客户端"
+          echo "${MAX_ATTEMPTS} 次尝试均未检测到客户端"
           echo ""
           echo "===== 客户端完整日志 ====="
-          cat /tmp/client.log || echo "(无日志)"
+          cat /tmp/client.log || echo "无日志文件"
           echo "========================"
           echo "result=failed" >> $GITHUB_OUTPUT
           exit 1
@@ -537,12 +537,13 @@ jobs:
         run: |
           LOG=$(cat /tmp/client.log || echo "")
           echo "===== 关键日志检查 ====="
-          echo "$LOG" | grep -q "已连接信令" && echo "✅ 已连接信令" || echo "⚠️ 无 '已连接信令'"
-          echo "$LOG" | grep -q "分配虚拟 IP" && echo "✅ 分配虚拟 IP" || echo "⚠️ 无 '分配虚拟 IP'"
-          echo "$LOG" | grep -q "\[TUN\]" && echo "✅ TUN 日志" || echo "⚠️ 无 TUN 日志"
+          echo "$LOG" | grep -q "已连接信令" && echo "已连接信令" || echo "无 '已连接信令'"
+          echo "$LOG" | grep -q "分配虚拟 IP" && echo "分配虚拟 IP" || echo "无 '分配虚拟 IP'"
+          echo "$LOG" | grep -q "\[TUN\]" && echo "有 TUN 日志" || echo "无 TUN 日志"
 
       - name: Cleanup
         if: always()
+        shell: bash
         run: |
           sudo pkill -f "n2n-client-linux-amd64" || true
 
@@ -555,7 +556,7 @@ jobs:
           echo "- WSS: \`${{ needs.prepare.outputs.wss }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- WSS 来源: \`${{ needs.prepare.outputs.wss_source }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- Token 来源: \`${{ needs.prepare.outputs.token_source }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- 房间名: \`${{ needs.prepare.outputs.room }}\`（${{ needs.prepare.outputs.room_mode }}）" >> $GITHUB_STEP_SUMMARY
+          echo "- 房间名: \`${{ needs.prepare.outputs.room }}\` (${{ needs.prepare.outputs.room_mode }})" >> $GITHUB_STEP_SUMMARY
           echo "- 设备名: \`${{ needs.prepare.outputs.node_name }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- 共享目录: \`${{ needs.prepare.outputs.share_dir }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- 客户端 ID: \`${{ needs.prepare.outputs.client_id }}\`" >> $GITHUB_STEP_SUMMARY
@@ -583,6 +584,7 @@ jobs:
           path: artifacts
 
       - name: Collect artifacts
+        shell: bash
         run: |
           mkdir -p release
           find artifacts -type f -exec cp {} release/ \;
@@ -590,6 +592,7 @@ jobs:
           ls -la release/
 
       - name: Create tag if not exists
+        shell: bash
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
@@ -624,4 +627,4 @@ jobs:
           echo "- 版本: \`${{ needs.prepare.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- E2E: \`${{ needs.e2e-test.result }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- 房间: \`${{ needs.prepare.outputs.room }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- 发布: ✅" >> $GITHUB_STEP_SUMMARY
+          echo "- 发布: 成功" >> $GITHUB_STEP_SUMMARY
