@@ -15,6 +15,7 @@
 - **文件共享** — 内置 HTTP + WebDAV 服务器
 - **自动发现** — 节点上线自动探测对方共享盘
 - **连接密码** — 支持 `CONNECT_TOKEN` 保护 Worker
+- **ID 持久化** — 未指定 `CLIENT_ID` 时自动生成并保存，重启复用
 - **无依赖** — Windows 版内嵌 wintun.dll
 
 ## 🏗️ 架构
@@ -49,17 +50,21 @@
 **每对 peer 独立决策**：A↔B 可能走 P2P，A↔C 走 TURN，A↔D 走 WS，互不影响。
 
 ## 🚀 快速开始
-一键脚本
-支持 Linux / macOS / Termux(proot)
+
+一键脚本，支持 Linux / macOS / Termux(proot)：
+
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/goyo123321/n2n-go-client/main/install.sh)
 ```
 
 或：
-支持 Linux / macOS
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/goyo123321/n2n-go-client/main/install.sh | bash
 ```
+
+> 部署脚本执行完后默认**自动启动客户端**，直接回车即可。
+
 ### 1. 下载
 
 从 [Releases](https://github.com/goyo123321/n2n-go-client/releases) 下载对应平台：
@@ -130,8 +135,8 @@ $env:SHARE_DIR="D:\shared"
 |:---|:---|:---|:---|
 | `SIGNALING_URL` | ✅ | — | edge-signal 的 WSS 地址 |
 | `CONNECT_TOKEN` | ⚠️ | `""` | 连接密码（Worker 配了才需要）|
-| `CLIENT_ID` | ⚠️ 建议 | hostname-时间戳 | 客户端唯一 ID |
-| `ROOM_ID` | ❌ | `default-room` | 房间名 |
+| `CLIENT_ID` | ❌ | 自动生成并持久化 | 客户端唯一 ID。未设置时首次启动生成 `hostname-随机数`，保存在 `$INSTALL_DIR/client_id`，重启复用 |
+| `ROOM_ID` | ❌ | `default-room` | 房间名。只允许 `[A-Za-z0-9_-]+` |
 | `NODE_NAME` | ❌ | hostname | 显示名 |
 | `SHARE_DIR` | ❌ | `./shared` | 共享目录 |
 | `SHARE_PORT` | ❌ | `9090` | 共享盘 HTTP 端口 |
@@ -146,9 +151,10 @@ $env:SHARE_DIR="D:\shared"
 ```
 n2n-go-client v1.1.0 启动
 [配置] 未设置 CONNECT_TOKEN
+[配置] 生成并持久化 CLIENT_ID: pc-a-1704067200 -> /home/user/.n2n-go/client_id
 [P2P] UDP 监听端口 50001
 [NAT] EasyNAT（端口保持），pub=1.2.3.4:54321
-已连接信令，Client ID: pc-a，节点名: A的电脑
+已连接信令，Client ID: pc-a-1704067200，节点名: A的电脑
 分配虚拟 IP: 10.64.0.2
 [TUN] n2n0 已启动，IP: 10.64.0.2
 [TURN] 获取到 custom TURN 服务器: turn:xxx:3478
@@ -156,7 +162,7 @@ n2n-go-client v1.1.0 启动
 [共享盘] 监听 10.64.0.2:9090，目录: ./shared
 
 ================= 本机信息 =================
-  Client ID   : pc-a
+  Client ID   : pc-a-1704067200
   节点名       : A的电脑
   虚拟 IP     : 10.64.0.2
   P2P 端口    : 50001
@@ -187,13 +193,20 @@ n2n-go-client v1.1.0 启动
 
 ```
 [NAT-HOLE] ❌ 失败 role=0 target=1.2.3.4 attempts=50
-[连接] mac-b → TURN 中继 (5.6.7.8:50000)   ← 优先 TURN
+[连接] mac-b → WS 中继 (TURN 未就绪，最后兜底)
+```
+
+**TURN 稍后就绪时，自动升级**：
+
+```
+[TURN] TURN 中继就绪: 5.6.7.8:50000
+[连接] mac-b → TURN 中继 (延迟升级, 5.6.7.8:50000)
 ```
 
 **TURN 也不可用时**：
 
 ```
-[连接] mac-b → WS 中继 (最后兜底)           ← 最后兜底
+[连接] mac-b → WS 中继 (最后兜底)
 ```
 
 ## 🎯 使用场景
@@ -274,7 +287,7 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o n2n-client-windows-amd64.exe
 Actions → Build n2n-go Client → Run workflow
   version: v1.1.0
   publish: ✓
-  platforms: （留空=全部）
+  platforms: （留空=全部5个平台）
 ```
 
 ## 📁 项目结构
@@ -284,7 +297,7 @@ n2n-go-client/
 ├── main.go                       # 主程序
 ├── ws_transport.go               # WebSocket 传输层
 ├── relay_fallback.go             # 三级降级管理器
-├── turn_client.go                # TURN 客户端（新增）
+├── turn_client.go                # TURN 客户端
 ├── nat_probe.go                  # NAT 类型探测
 ├── nathole_executor.go           # 打洞指令执行
 ├── tun_linux.go                  # Linux TUN
@@ -294,6 +307,7 @@ n2n-go-client/
 ├── wintun_embed_windows.go       # wintun.dll 内嵌
 ├── file_server.go                # 共享盘 HTTP/WebDAV
 ├── share_registry.go             # 共享盘节点注册表
+├── install.sh                    # 一键部署脚本
 └── go.mod
 ```
 
@@ -318,7 +332,13 @@ Windows 防火墙可能拦截 TUN 接口的 ICMP。如无法 ping 通：
 
 ### CLIENT_ID 稳定性
 
-**强烈建议手动指定**。默认值每次重启会变，导致虚拟 IP 漂移。
+**可以不手动指定**。未设置时客户端会在 `$INSTALL_DIR/client_id`
+（默认 `~/.n2n-go/client_id`）首次生成并持久化一个 ID，重启复用，虚拟 IP 不会漂移。
+
+**但手动指定仍然推荐**，尤其在以下场景：
+- 多台设备共用同一个 `$INSTALL_DIR`（如 NFS 挂载）
+- 想用可读的 ID（如 `pc-a`、`nas`）方便在面板里识别
+- 迁移机器时想保留原来的虚拟 IP
 
 ### 端口冲突
 
@@ -380,6 +400,20 @@ Android 内核**不允许普通 App 创建 TUN 网卡**。Termux 里运行客户
 1. 检查对方端口：日志里有 `共享盘地址`
 2. 检查本机是否能 ping 通对方
 3. 浏览器访问 `http://10.64.0.x:9090/api/node_info`
+
+**Q: 重启后虚拟 IP 变了？**
+
+客户端会持久化 `CLIENT_ID` 到 `$INSTALL_DIR/client_id`，正常情况下重启 IP 不变。
+如果 IP 变了，说明 `client_id` 文件被删或换目录了，检查：
+
+```bash
+cat ~/.n2n-go/client_id
+```
+
+**Q: 面板加载慢 / 请求数暴涨？**
+
+面板默认 **30 秒轮询一次**，且**页面切到后台时完全停止**。
+想调整间隔，改 `public/app.js` 和 `public/admin.js` 顶部的 `POLL_INTERVAL_MS`（服务端项目里）。
 
 ## 🔗 与 edge-signal 配合
 
