@@ -1,0 +1,7 @@
+dist/
+wintun.dll
+wintun.zip
+wintun-extract/
+*.exe
+*.log
+# ★ go.sum 不再忽略 —— 必须提交，否则 CI 每次重新生成，依赖漂移
