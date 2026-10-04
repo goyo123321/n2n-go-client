@@ -107,7 +107,7 @@ ask_config() {
         read -rp "连接密码 CONNECT_TOKEN (无则回车): " CONNECT_TOKEN
     fi
 
-    # ★ 修复：ROOM_ID 只允许 [A-Za-z0-9_-]，防止 URL 路径歧义
+    # ROOM_ID 只允许 [A-Za-z0-9_-]
     while [ -z "$ROOM_ID" ]; do
         read -rp "房间名 ROOM_ID (default-room): " input
         input="${input:-default-room}"
@@ -119,7 +119,6 @@ ask_config() {
     done
 
     if [ -z "$CLIENT_ID" ]; then
-        # ★ 修复：默认 CLIENT_ID 用 hostname + 持久化提示（实际持久化由客户端程序完成）
         default_id="$(hostname)"
         echo -e "${YELLOW}提示：强烈建议手动指定 CLIENT_ID，否则重启后虚拟 IP 会漂移${NC}"
         read -rp "客户端 ID CLIENT_ID ($default_id): " input
@@ -311,10 +310,17 @@ main() {
     echo -e "    ${GREEN}$INSTALL_DIR/start.sh${NC}"
     echo ""
 
+    # ★ 修改：默认 Y，只有显式输入 n/N 才跳过启动
     read -rp "现在启动？(Y/n): " input
-    if [[ "$input" =~ ^[Yy]$ ]]; then
-        exec "$INSTALL_DIR/start.sh"
+    if [[ "$input" =~ ^[Nn]$ ]]; then
+        log "已跳过启动"
+        echo ""
+        echo "  手动启动: $INSTALL_DIR/start.sh"
+        echo ""
+        exit 0
     fi
+
+    exec "$INSTALL_DIR/start.sh"
 }
 
 main "$@"
