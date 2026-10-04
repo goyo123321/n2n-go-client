@@ -1,0 +1,627 @@
+name: Build n2n-go Client
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '【版本号】必须以 v 开头。示例: v1.0.1'
+        required: true
+        type: string
+        default: 'v1.0.1'
+      publish:
+        description: '【是否发布】勾=创建 GitHub Release（用户可下载）；不勾=只构建，产物在 Actions 页保留30天'
+        required: false
+        type: boolean
+        default: true
+      platforms:
+        description: '【构建平台】留空=全部5个平台。示例: linux-amd64 / linux-amd64,darwin-arm64 / windows-amd64'
+        required: false
+        type: string
+        default: ''
+      use_custom_wss:
+        description: '【自定义WSS】勾=用下面 custom_wss 填的地址；不勾=用 GitHub Secret 里的 SIGNALING_URL'
+        required: false
+        type: boolean
+        default: false
+      custom_wss:
+        description: '【WSS地址】示例: wss://edge-signal.xloavnui.workers.dev （不带token）或 wss://edge-signal.xloavnui.workers.dev?token=abc123 （带token）'
+        required: false
+        type: string
+        default: ''
+      custom_wss_has_token:
+        description: '【WSS带token】custom_wss 里有 ?token=xxx 时必勾'
+        required: false
+        type: boolean
+        default: false
+      use_fixed_room:
+        description: '【固定房间】勾=E2E 用固定房间名 ci-test；不勾=每次新房间 ci-test-<run_id>'
+        required: false
+        type: boolean
+        default: false
+      skip_e2e:
+        description: '【跳过E2E】勾=不跑真实连接测试，直接构建+发布（紧急发版用）'
+        required: false
+        type: boolean
+        default: false
+
+      # ★ E2E 相关参数
+      node_name:
+        description: '【E2E 设备名】客户端上报给 Worker 的 NODE_NAME'
+        required: false
+        type: string
+        default: 'CI E2E'
+      share_dir:
+        description: '【E2E 共享目录】SHARE_DIR'
+        required: false
+        type: string
+        default: '/tmp/shared'
+      client_id_mode:
+        description: '【E2E 客户端ID模式】auto=ci-test-<run_id>（并发安全，推荐）；fixed=固定 ci-test；custom=用下面 client_id 填的值'
+        required: false
+        type: choice
+        options:
+          - auto
+          - fixed
+          - custom
+        default: 'auto'
+      client_id:
+        description: '【自定义 CLIENT_ID】仅当 client_id_mode=custom 时生效'
+        required: false
+        type: string
+        default: 'ci-test'
+
+jobs:
+  # ========== 第一步：解析参数 ==========
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      publish: ${{ steps.resolve.outputs.publish }}
+      matrix: ${{ steps.resolve.outputs.matrix }}
+      has_wss: ${{ steps.resolve.outputs.has_wss }}
+      wss: ${{ steps.resolve.outputs.wss }}
+      wss_source: ${{ steps.resolve.outputs.wss_source }}
+      connect_token: ${{ steps.resolve.outputs.connect_token }}
+      token_source: ${{ steps.resolve.outputs.token_source }}
+      room: ${{ steps.resolve.outputs.room }}
+      room_mode: ${{ steps.resolve.outputs.room_mode }}
+      node_name: ${{ steps.resolve.outputs.node_name }}
+      share_dir: ${{ steps.resolve.outputs.share_dir }}
+      client_id: ${{ steps.resolve.outputs.client_id }}
+    steps:
+      - name: Resolve inputs
+        id: resolve
+        shell: bash
+        env:
+          SECRET_WSS: ${{ secrets.SIGNALING_URL }}
+          SECRET_CONNECT_TOKEN: ${{ secrets.CONNECT_TOKEN }}
+          USE_CUSTOM: ${{ inputs.use_custom_wss }}
+          CUSTOM_WSS: ${{ inputs.custom_wss }}
+          CUSTOM_WSS_HAS_TOKEN: ${{ inputs.custom_wss_has_token }}
+          SKIP_E2E: ${{ inputs.skip_e2e }}
+          USE_FIXED_ROOM: ${{ inputs.use_fixed_room }}
+          NODE_NAME_IN: ${{ inputs.node_name }}
+          SHARE_DIR_IN: ${{ inputs.share_dir }}
+          # ★ 新增
+          CLIENT_ID_MODE: ${{ inputs.client_id_mode }}
+          CLIENT_ID_IN: ${{ inputs.client_id }}
+        run: |
+          VERSION="${{ inputs.version }}"
+          PUBLISH="${{ inputs.publish }}"
+          PLATFORMS="${{ inputs.platforms }}"
+
+          if [ "$PUBLISH" = "true" ]; then
+            if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+              echo "::error::版本号必须以 v 开头，形如 v1.0.0，实际: $VERSION"
+              exit 1
+            fi
+          fi
+
+          ALL=$(jq -cn '[
+            {"goos":"linux","goarch":"amd64"},
+            {"goos":"linux","goarch":"arm64"},
+            {"goos":"darwin","goarch":"amd64"},
+            {"goos":"darwin","goarch":"arm64"},
+            {"goos":"windows","goarch":"amd64"}
+          ]')
+
+          if [ -z "$PLATFORMS" ]; then
+            MATRIX="$ALL"
+          else
+            MATRIX=$(echo "$ALL" | jq -c --arg p "$PLATFORMS" '
+              ($p | split(",") | map(gsub("^\\s+|\\s+$"; ""))) as $want
+              | map(select((.goos + "-" + .goarch) as $k | $want | index($k)))
+            ')
+            if [ "$MATRIX" = "[]" ]; then
+              echo "::error::platforms 参数没有匹配到任何平台: $PLATFORMS"
+              exit 1
+            fi
+          fi
+          MATRIX=$(echo "$MATRIX" | jq -c .)
+
+          WSS=""
+          WSS_SOURCE="none"
+          HAS_WSS="false"
+          CONNECT_TOKEN=""
+          TOKEN_SOURCE="none"
+
+          if [ "$SKIP_E2E" = "true" ]; then
+            WSS_SOURCE="skipped-by-user"
+            echo "::notice::用户勾选了 skip_e2e，跳过 E2E 测试"
+          elif [ "$USE_CUSTOM" = "true" ] && [ -n "$CUSTOM_WSS" ]; then
+            if [ "$CUSTOM_WSS_HAS_TOKEN" = "true" ]; then
+              EXTRACTED_TOKEN=$(printf '%s' "$CUSTOM_WSS" | sed -n 's/.*[?&]token=\([^&]*\).*/\1/p')
+              CLEAN_WSS=$(printf '%s' "$CUSTOM_WSS" | sed 's/[?].*//')
+              if [ -z "$EXTRACTED_TOKEN" ]; then
+                echo "::error::勾选了 custom_wss_has_token 但 URL 里没有 ?token= 参数"
+                exit 1
+              fi
+              if [ -z "$CLEAN_WSS" ]; then
+                echo "::error::提取后的 WSS 地址为空"
+                exit 1
+              fi
+              WSS="$CLEAN_WSS"
+              WSS_SOURCE="custom (with token)"
+              HAS_WSS="true"
+              CONNECT_TOKEN="$EXTRACTED_TOKEN"
+              TOKEN_SOURCE="extracted from custom_wss"
+              echo "::notice::从 custom_wss 提取 token（${#EXTRACTED_TOKEN} 字符）"
+            else
+              WSS="$CUSTOM_WSS"
+              WSS_SOURCE="custom"
+              HAS_WSS="true"
+              if [ -n "$SECRET_CONNECT_TOKEN" ]; then
+                CONNECT_TOKEN="$SECRET_CONNECT_TOKEN"
+                TOKEN_SOURCE="secret"
+              fi
+            fi
+          elif [ "$USE_CUSTOM" = "true" ] && [ -z "$CUSTOM_WSS" ]; then
+            echo "::warning::use_custom_wss 勾选了但 custom_wss 为空，回退到 Secret"
+            if [ -n "$SECRET_WSS" ]; then
+              WSS="$SECRET_WSS"
+              WSS_SOURCE="secret (custom 为空回退)"
+              HAS_WSS="true"
+              if [ -n "$SECRET_CONNECT_TOKEN" ]; then
+                CONNECT_TOKEN="$SECRET_CONNECT_TOKEN"
+                TOKEN_SOURCE="secret"
+              fi
+            fi
+          elif [ -n "$SECRET_WSS" ]; then
+            WSS="$SECRET_WSS"
+            WSS_SOURCE="secret"
+            HAS_WSS="true"
+            if [ -n "$SECRET_CONNECT_TOKEN" ]; then
+              CONNECT_TOKEN="$SECRET_CONNECT_TOKEN"
+              TOKEN_SOURCE="secret"
+            fi
+          else
+            echo "::warning::未配置任何 WSS 地址，E2E 测试会被跳过"
+          fi
+
+          if [ -n "$WSS" ]; then
+            if [[ ! "$WSS" =~ ^wss?:// ]]; then
+              echo "::error::WSS 地址必须以 wss:// 或 ws:// 开头，实际: $WSS"
+              exit 1
+            fi
+            if [[ "$WSS" == *"?"* ]]; then
+              echo "::error::WSS 地址不应该带 query string，实际: $WSS"
+              exit 1
+            fi
+          fi
+
+          if [ "$USE_FIXED_ROOM" = "true" ]; then
+            ROOM="ci-test"
+            ROOM_MODE="fixed"
+          else
+            ROOM="ci-test-${{ github.run_id }}"
+            ROOM_MODE="random"
+          fi
+
+          NODE_NAME="${NODE_NAME_IN:-CI E2E}"
+          SHARE_DIR="${SHARE_DIR_IN:-/tmp/shared}"
+
+          # ★ 新增：根据 client_id_mode 决定 CLIENT_ID
+          case "$CLIENT_ID_MODE" in
+            fixed)
+              FINAL_CLIENT_ID="ci-test"
+              ;;
+            custom)
+              if [ -z "$CLIENT_ID_IN" ]; then
+                echo "::warning::client_id_mode=custom 但 client_id 为空，回退到 auto"
+                FINAL_CLIENT_ID="ci-test-${{ github.run_id }}"
+              else
+                FINAL_CLIENT_ID="$CLIENT_ID_IN"
+              fi
+              ;;
+            auto|*)
+              FINAL_CLIENT_ID="ci-test-${{ github.run_id }}"
+              ;;
+          esac
+
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "publish=$PUBLISH" >> $GITHUB_OUTPUT
+          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+          echo "has_wss=$HAS_WSS" >> $GITHUB_OUTPUT
+          echo "wss=$WSS" >> $GITHUB_OUTPUT
+          echo "wss_source=$WSS_SOURCE" >> $GITHUB_OUTPUT
+          echo "connect_token=$CONNECT_TOKEN" >> $GITHUB_OUTPUT
+          echo "token_source=$TOKEN_SOURCE" >> $GITHUB_OUTPUT
+          echo "room=$ROOM" >> $GITHUB_OUTPUT
+          echo "room_mode=$ROOM_MODE" >> $GITHUB_OUTPUT
+          echo "node_name=$NODE_NAME" >> $GITHUB_OUTPUT
+          echo "share_dir=$SHARE_DIR" >> $GITHUB_OUTPUT
+          echo "client_id=$FINAL_CLIENT_ID" >> $GITHUB_OUTPUT
+
+          echo "::notice::WSS 来源: $WSS_SOURCE, 地址: $WSS"
+          echo "::notice::Token 来源: $TOKEN_SOURCE"
+          echo "::notice::房间名: $ROOM ($ROOM_MODE)"
+          echo "::notice::设备名: $NODE_NAME"
+          echo "::notice::客户端ID模式: $CLIENT_ID_MODE → $FINAL_CLIENT_ID"
+
+  # ========== 第二步：单元测试 ==========
+  test:
+    needs: prepare
+    runs-on: ubuntu-latest
+    name: Unit Test & Compile Check
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache: false
+
+      - name: Show Go version
+        run: go version
+
+      - name: go mod tidy
+        run: go mod tidy
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: |
+          if find . -name '*_test.go' | grep -q .; then
+            go test -v -count=1 ./...
+          else
+            echo "::notice::没有找到测试文件，跳过 go test"
+          fi
+
+      - name: Build native (linux amd64)
+        run: go build -o /tmp/n2n-test .
+
+      - name: Smoke test — 未设 SIGNALING_URL 应报错退出
+        shell: bash
+        run: |
+          chmod +x /tmp/n2n-test
+          set +e
+          OUTPUT=$(/tmp/n2n-test 2>&1)
+          EXIT=$?
+          set -e
+          echo "---- 退出码: $EXIT ----"
+          echo "$OUTPUT"
+          echo "----------------------"
+          if [ "$EXIT" = "0" ]; then
+            echo "::error::未设置 SIGNALING_URL 时应非 0 退出，实际 $EXIT"
+            exit 1
+          fi
+          if ! echo "$OUTPUT" | grep -q "SIGNALING_URL"; then
+            echo "::error::错误信息未包含 SIGNALING_URL"
+            exit 1
+          fi
+          echo "✅ Smoke test 通过"
+
+      - name: Cross-compile linux/arm64
+        run: GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o /dev/null .
+
+      - name: Cross-compile darwin/amd64
+        run: GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build -o /dev/null .
+
+      - name: Cross-compile darwin/arm64
+        run: GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -o /dev/null .
+
+      - name: Cross-compile windows/amd64
+        shell: bash
+        run: |
+          curl -sSL -o wintun.zip \
+            "https://www.wintun.net/builds/wintun-0.14.1.zip"
+          unzip -q wintun.zip -d wintun-extract
+          cp "wintun-extract/wintun/bin/amd64/wintun.dll" ./wintun.dll
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o /dev/null .
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          echo "## 单元测试结果" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ go vet" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ go build (native)" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Smoke test" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ 交叉编译: linux/arm64, darwin/amd64, darwin/arm64, windows/amd64" >> $GITHUB_STEP_SUMMARY
+
+  # ========== 第三步：构建 5 个平台 ==========
+  build:
+    needs: [prepare, test]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache: false
+
+      - name: Download wintun.dll (Windows only)
+        if: matrix.goos == 'windows'
+        shell: bash
+        run: |
+          WINTUN_VERSION="0.14.1"
+          curl -sSL -o wintun.zip \
+            "https://www.wintun.net/builds/wintun-${WINTUN_VERSION}.zip"
+          unzip -q wintun.zip -d wintun-extract
+          cp "wintun-extract/wintun/bin/amd64/wintun.dll" ./wintun.dll
+          ls -la wintun.dll
+
+      - name: go mod tidy
+        run: go mod tidy
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          mkdir -p dist
+          OUTPUT="dist/n2n-client-${{ matrix.goos }}-${{ matrix.goarch }}"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            OUTPUT="${OUTPUT}.exe"
+          fi
+          go build \
+            -ldflags "-X main.BuildVersion=${VERSION}" \
+            -o "$OUTPUT" .
+          echo "构建完成: $OUTPUT"
+          ls -la dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: n2n-client-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/
+          retention-days: 30
+
+  # ========== 第四步：E2E 测试 ==========
+  e2e-test:
+    needs: [prepare, build]
+    if: needs.prepare.outputs.has_wss == 'true'
+    runs-on: ubuntu-latest
+    name: E2E Test - Real Connection
+    steps:
+      - name: Download Linux amd64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: n2n-client-linux-amd64
+          path: dist/
+
+      - name: Prepare binary
+        run: |
+          chmod +x dist/n2n-client-linux-amd64
+          file dist/n2n-client-linux-amd64
+
+      - name: Show test config
+        shell: bash
+        run: |
+          echo "WSS 地址: ${{ needs.prepare.outputs.wss }}"
+          echo "WSS 来源: ${{ needs.prepare.outputs.wss_source }}"
+          echo "Token 来源: ${{ needs.prepare.outputs.token_source }}"
+          echo "房间名: ${{ needs.prepare.outputs.room }}"
+          echo "房间模式: ${{ needs.prepare.outputs.room_mode }}"
+          echo "设备名: ${{ needs.prepare.outputs.node_name }}"
+          echo "共享目录: ${{ needs.prepare.outputs.share_dir }}"
+          echo "客户端 ID: ${{ needs.prepare.outputs.client_id }}"
+          if [ -n "${{ needs.prepare.outputs.connect_token }}" ]; then
+            echo "CONNECT_TOKEN: 已设置"
+          else
+            echo "CONNECT_TOKEN: 未设置"
+          fi
+
+      - name: Check TUN availability
+        run: |
+          if [ -c /dev/net/tun ]; then
+            echo "✅ /dev/net/tun 存在"
+          else
+            echo "⚠️ /dev/net/tun 不存在，TUN 会失败但不影响信令测试"
+          fi
+
+      - name: Start client in background
+        id: start
+        shell: bash
+        env:
+          SIGNALING_URL: ${{ needs.prepare.outputs.wss }}
+          CONNECT_TOKEN: ${{ needs.prepare.outputs.connect_token }}
+          ROOM: ${{ needs.prepare.outputs.room }}
+          NODE_NAME: ${{ needs.prepare.outputs.node_name }}
+          SHARE_DIR: ${{ needs.prepare.outputs.share_dir }}
+          CID: ${{ needs.prepare.outputs.client_id }}
+        run: |
+          echo "::notice::使用 CLIENT_ID: $CID"
+          echo "cid=$CID" >> $GITHUB_OUTPUT
+          echo "room=$ROOM" >> $GITHUB_OUTPUT
+
+          mkdir -p "$SHARE_DIR"
+
+          sudo timeout --signal=KILL 120 \
+            env SIGNALING_URL="$SIGNALING_URL" \
+                CONNECT_TOKEN="$CONNECT_TOKEN" \
+                ROOM_ID="$ROOM" \
+                CLIENT_ID="$CID" \
+                NODE_NAME="$NODE_NAME" \
+                SHARE_DIR="$SHARE_DIR" \
+                ./dist/n2n-client-linux-amd64 \
+            > /tmp/client.log 2>&1 &
+          echo "started=true" >> $GITHUB_OUTPUT
+
+      - name: Wait for client to bootstrap
+        shell: bash
+        run: |
+          echo "等待客户端初始化（3 秒）..."
+          sleep 3
+          echo "===== 客户端日志（前 20 行）====="
+          cat /tmp/client.log | head -20 || echo "(无日志)"
+
+      - name: Verify via Worker API (with retry)
+        id: verify
+        shell: bash
+        env:
+          SIGNALING_URL: ${{ needs.prepare.outputs.wss }}
+          ROOM: ${{ needs.prepare.outputs.room }}
+        run: |
+          HTTP_URL="https://${SIGNALING_URL#wss://}"
+          HTTP_URL="${HTTP_URL#ws://}"
+          STATUS_URL="$HTTP_URL/api/public/status/$ROOM"
+
+          echo "轮询查询（最多 10 次，每次间隔 2 秒）..."
+          echo "URL: $STATUS_URL"
+          echo ""
+
+          MAX_ATTEMPTS=10
+          for i in $(seq 1 $MAX_ATTEMPTS); do
+            echo "--- 尝试 $i/$MAX_ATTEMPTS ---"
+            RESPONSE=$(curl -s "$STATUS_URL" 2>&1)
+            echo "响应: $RESPONSE"
+
+            PEER_COUNT=$(echo "$RESPONSE" | jq -r '.peerCount // 0' 2>/dev/null || echo "0")
+            echo "peerCount=$PEER_COUNT"
+
+            if [ "$PEER_COUNT" -ge 1 ]; then
+              echo ""
+              echo "✅ 第 $i 次尝试检测到客户端"
+              echo "result=success" >> $GITHUB_OUTPUT
+
+              NAT_TYPE=$(echo "$RESPONSE" | jq -r '.peers[0].natType // "unknown"')
+              echo "该客户端 NAT 类型: $NAT_TYPE"
+              echo "nat_type=$NAT_TYPE" >> $GITHUB_OUTPUT
+
+              REPORTED_NAME=$(echo "$RESPONSE" | jq -r '.peers[0].name // ""')
+              echo "Worker 收到的设备名: $REPORTED_NAME"
+              if [ -n "$REPORTED_NAME" ]; then
+                echo "✅ NODE_NAME 已正确上报"
+              fi
+
+              exit 0
+            fi
+
+            if [ "$i" -lt "$MAX_ATTEMPTS ]; then
+              echo "  未检测到，等 2 秒后重试..."
+              sleep 2
+            fi
+          done
+
+          echo ""
+          echo "❌ $MAX_ATTEMPTS 次尝试均未检测到客户端"
+          echo ""
+          echo "===== 客户端完整日志 ====="
+          cat /tmp/client.log || echo "(无日志)"
+          echo "========================"
+          echo "result=failed" >> $GITHUB_OUTPUT
+          exit 1
+
+      - name: Check client log
+        if: always()
+        shell: bash
+        run: |
+          LOG=$(cat /tmp/client.log || echo "")
+          echo "===== 关键日志检查 ====="
+          echo "$LOG" | grep -q "已连接信令" && echo "✅ 已连接信令" || echo "⚠️ 无 '已连接信令'"
+          echo "$LOG" | grep -q "分配虚拟 IP" && echo "✅ 分配虚拟 IP" || echo "⚠️ 无 '分配虚拟 IP'"
+          echo "$LOG" | grep -q "\[TUN\]" && echo "✅ TUN 日志" || echo "⚠️ 无 TUN 日志"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          sudo pkill -f "n2n-client-linux-amd64" || true
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          echo "## E2E Test 结果" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- WSS: \`${{ needs.prepare.outputs.wss }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- WSS 来源: \`${{ needs.prepare.outputs.wss_source }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Token 来源: \`${{ needs.prepare.outputs.token_source }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- 房间名: \`${{ needs.prepare.outputs.room }}\`（${{ needs.prepare.outputs.room_mode }}）" >> $GITHUB_STEP_SUMMARY
+          echo "- 设备名: \`${{ needs.prepare.outputs.node_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- 共享目录: \`${{ needs.prepare.outputs.share_dir }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- 客户端 ID: \`${{ needs.prepare.outputs.client_id }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- 结果: \`${{ steps.verify.outputs.result }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- NAT 类型: \`${{ steps.verify.outputs.nat_type }}\`" >> $GITHUB_STEP_SUMMARY
+
+  # ========== 第五步：发布 Release ==========
+  release:
+    needs: [prepare, build, e2e-test]
+    if: |
+      always() &&
+      needs.prepare.outputs.publish == 'true' &&
+      needs.build.result == 'success' &&
+      (needs.e2e-test.result == 'success' || needs.e2e-test.result == 'skipped')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p release
+          find artifacts -type f -exec cp {} release/ \;
+          echo "待发布文件:"
+          ls -la release/
+
+      - name: Create tag if not exists
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          if git rev-parse "$VERSION" >/dev/null 2>&1; then
+            echo "tag $VERSION 已存在，跳过创建"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git tag -a "$VERSION" -m "Release $VERSION"
+            git push origin "$VERSION"
+            echo "已创建并推送 tag: $VERSION"
+          fi
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.version }}
+          name: ${{ needs.prepare.outputs.version }}
+          files: release/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          echo "## Release 结果" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- 版本: \`${{ needs.prepare.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- E2E: \`${{ needs.e2e-test.result }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- 房间: \`${{ needs.prepare.outputs.room }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- 发布: ✅" >> $GITHUB_STEP_SUMMARY
