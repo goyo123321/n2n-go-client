@@ -1,0 +1,140 @@
+name: Update go.sum
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: '操作的目标分支'
+        required: true
+        type: string
+        default: 'main'
+      go_version:
+        description: 'Go 版本'
+        required: false
+        type: string
+        default: '1.21'
+      commit_message:
+        description: '提交信息（留空则用默认）'
+        required: false
+        type: string
+        default: ''
+      force_commit:
+        description: '强制提交（即使没有变化）'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go_version }}
+          cache: false
+
+      - name: Show Go version
+        run: go version
+
+      - name: Before — show go.mod / go.sum
+        run: |
+          echo "=== go.mod (before) ==="
+          cat go.mod
+          echo ""
+          echo "=== go.sum (before) ==="
+          if [ -f go.sum ]; then
+            wc -l go.sum
+            head -20 go.sum
+          else
+            echo "(go.sum 不存在)"
+          fi
+
+      - name: Run go mod tidy
+        run: |
+          go mod tidy -v
+          echo "go mod tidy 完成"
+
+      - name: Run go mod verify
+        continue-on-error: true
+        run: go mod verify
+
+      - name: After — show go.mod / go.sum
+        run: |
+          echo "=== go.mod (after) ==="
+          cat go.mod
+          echo ""
+          echo "=== go.sum (after) ==="
+          if [ -f go.sum ]; then
+            wc -l go.sum
+            head -20 go.sum
+          else
+            echo "(go.sum 不存在)"
+          fi
+
+      - name: Check diff
+        id: diff
+        shell: bash
+        run: |
+          if git diff --quiet go.mod go.sum 2>/dev/null; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "::notice::go.mod 和 go.sum 无变化"
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "::notice::检测到变化："
+            git diff --stat go.mod go.sum
+          fi
+
+      - name: Configure git
+        if: steps.diff.outputs.changed == 'true' || inputs.force_commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Commit and push
+        if: steps.diff.outputs.changed == 'true' || inputs.force_commit
+        shell: bash
+        env:
+          CUSTOM_MSG: ${{ inputs.commit_message }}
+          VERSION: ${{ inputs.go_version }}
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          # 提交信息
+          if [ -n "$CUSTOM_MSG" ]; then
+            MSG="$CUSTOM_MSG"
+          else
+            MSG="chore: update go.sum (Go ${VERSION}) [skip ci]"
+          fi
+
+          git add go.mod go.sum 2>/dev/null || git add go.mod
+
+          # 如果 force_commit 但没有实际变化，允许空提交
+          if git diff --cached --quiet; then
+            echo "::warning::没有可提交的变化，force_commit 生效，创建空提交"
+            git commit --allow-empty -m "$MSG"
+          else
+            git commit -m "$MSG"
+          fi
+
+          git push origin "$BRANCH"
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          echo "## Update go.sum 结果" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- 分支: \`${{ inputs.branch }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Go 版本: \`${{ inputs.go_version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- 是否有变化: \`${{ steps.diff.outputs.changed }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- 提交信息: \`${{ inputs.commit_message || '（默认）' }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- 强制提交: \`${{ inputs.force_commit }}\`" >> $GITHUB_STEP_SUMMARY
