@@ -6,7 +6,7 @@ import (
     "strconv"
     "time"
 
-    "github.com/pion/stun/v2"
+    "github.com/pion/stun/v3"
 )
 
 type NATMetadata struct {
@@ -44,8 +44,7 @@ func probeNAT(localUDPPort int, stunServers []string) *NATMetadata {
             continue
         }
 
-        // ★ 修正：stun.TransactionID 是 Setter，AddTo() 每次会生成随机 ID
-        // 之前误用 stun.NewTransactionID()（返回 [12]byte，不是 Setter）导致编译失败
+        // stun.TransactionID 是 Setter，AddTo() 每次会生成随机 ID
         msg := stun.MustBuild(stun.TransactionID, stun.BindingRequest)
         var xorAddr stun.XORMappedAddress
 
