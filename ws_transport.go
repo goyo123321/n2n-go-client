@@ -17,6 +17,14 @@ type WSTransport struct {
 	clientId  string
 	onMessage func(map[string]interface{})
 	onBinary  func([]byte)
+
+	// ★ 新增：重连相关
+	fullURL      string
+	dialer       *websocket.Dialer
+	stopCh       chan struct{}
+	reconnectMu  sync.Mutex
+	stopping     bool
+	heartbeatCh  chan struct{}
 }
 
 // NewWSTransport 建立 WebSocket 连接。
@@ -32,12 +40,25 @@ func NewWSTransport(signalingURL, roomId, clientId, connectToken string) (*WSTra
 
 	log.Printf("[WS] 连接 %s", maskToken(fullURL))
 
-	conn, _, err := websocket.DefaultDialer.Dial(fullURL, nil)
+	dialer := &websocket.Dialer{
+		HandshakeTimeout: 10 * time.Second,
+	}
+
+	conn, _, err := dialer.Dial(fullURL, nil)
 	if err != nil {
 		return nil, err
 	}
-	ws := &WSTransport{conn: conn, clientId: clientId}
+
+	ws := &WSTransport{
+		conn:        conn,
+		clientId:    clientId,
+		fullURL:     fullURL,
+		dialer:      dialer,
+		stopCh:      make(chan struct{}),
+		heartbeatCh: make(chan struct{}),
+	}
 	go ws.readLoop()
+	go ws.heartbeat(20 * time.Second)
 	return ws, nil
 }
 
@@ -58,6 +79,15 @@ func (ws *WSTransport) readLoop() {
 		msgType, data, err := ws.conn.ReadMessage()
 		if err != nil {
 			log.Printf("[WS] 读取错误: %v", err)
+
+			ws.reconnectMu.Lock()
+			stopping := ws.stopping
+			ws.reconnectMu.Unlock()
+
+			if stopping {
+				return
+			}
+			go ws.tryReconnect()
 			return
 		}
 		if msgType == websocket.TextMessage {
@@ -76,6 +106,64 @@ func (ws *WSTransport) readLoop() {
 	}
 }
 
+// ★ 新增：重连逻辑，10 次指数退避，参考 Android 端
+func (ws *WSTransport) tryReconnect() {
+	ws.reconnectMu.Lock()
+	defer ws.reconnectMu.Unlock()
+	if ws.stopping {
+		return
+	}
+
+	delays := []time.Duration{1, 2, 5, 10, 30, 60, 60, 60, 60, 60}
+	for i, d := range delays {
+		select {
+		case <-ws.stopCh:
+			return
+		case <-time.After(d * time.Second):
+		}
+		log.Printf("[WS] 重连 (%d/10)...", i+1)
+
+		conn, _, err := ws.dialer.Dial(ws.fullURL, nil)
+		if err != nil {
+			log.Printf("[WS] 重连失败: %v", err)
+			continue
+		}
+		ws.mu.Lock()
+		ws.conn = conn
+		ws.mu.Unlock()
+		log.Printf("[WS] ✅ 重连成功")
+
+		go ws.readLoop()
+		go ws.heartbeat(20 * time.Second)
+
+		// 通知上层：重连成功，需要重新上报元数据
+		if ws.onMessage != nil {
+			ws.onMessage(map[string]interface{}{"type": "_reconnected"})
+		}
+		return
+	}
+
+	log.Printf("[WS] 重连 10 次全部失败，放弃")
+}
+
+func (ws *WSTransport) heartbeat(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if err := ws.Send(map[string]interface{}{
+				"type": "ping",
+				"ts":   time.Now().Unix(),
+			}); err != nil {
+				return
+			}
+		case <-ws.stopCh:
+			return
+		}
+	}
+}
+
 func (ws *WSTransport) Send(msg map[string]interface{}) error {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
@@ -89,18 +177,22 @@ func (ws *WSTransport) SendBinary(data []byte) error {
 	return ws.conn.WriteMessage(websocket.BinaryMessage, data)
 }
 
+// StartHeartbeat 保留兼容旧调用方（新代码已在 NewWSTransport 里自动启动）
 func (ws *WSTransport) StartHeartbeat(interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	go func() {
-		for range ticker.C {
-			_ = ws.Send(map[string]interface{}{
-				"type": "ping",
-				"ts":   time.Now().Unix(),
-			})
-		}
-	}()
+	// 已在构造里启动，这里不再重复启动
 }
 
 func (ws *WSTransport) Close() error {
+	ws.reconnectMu.Lock()
+	ws.stopping = true
+	select {
+	case <-ws.stopCh:
+	default:
+		close(ws.stopCh)
+	}
+	ws.reconnectMu.Unlock()
+
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
 	return ws.conn.Close()
 }
