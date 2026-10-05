@@ -61,7 +61,7 @@ func (rm *RelayManager) MarkFallback(peerId string) {
 	log.Printf("[连接] %s → WS 中继 (TURN 未就绪，最后兜底)", peerId)
 }
 
-// ★ 修复：TURN 就绪后，把所有仍走 WS relay 的 peer 升级到 TURN
+// UpgradeRelaysToTURN TURN 就绪后，把所有仍走 WS relay 的 peer 升级到 TURN
 func (rm *RelayManager) UpgradeRelaysToTURN() {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
@@ -139,6 +139,10 @@ func (rm *RelayManager) SendViaRelay(data []byte) error {
 }
 
 // SendToPeer 三级降级：P2P → TURN → WS
+//
+// ★ 修复：ConnP2P 分支 UDP 失败时，立即走 WS 兜底，而不是返回 false 让上层丢弃
+//   - 原逻辑：UDP 失败 → MarkFallback → return false（当前帧丢）
+//   - 新逻辑：UDP 失败 → 立即 WS 兜底 → 同时 MarkFallback（后续帧降级）
 func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo) bool {
 	state := rm.GetState(peerId)
 
@@ -149,10 +153,14 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 			if err == nil {
 				return true
 			}
-			log.Printf("[P2P] 发送到 %s 失败: %v", peerId, err)
+			log.Printf("[P2P] UDP 发送到 %s 失败: %v，降级到 WS", peerId, err)
+			rm.MarkFallback(peerId)
+		} else {
+			// 没有对端 UDP 地址，也降级
 			rm.MarkFallback(peerId)
 		}
-		return false
+		// ★ 关键：立即用 WS 兜底当前帧
+		return rm.ws.SendBinary(data) == nil
 
 	case ConnTURN:
 		if target != nil && target.TurnRelayAddr != "" && rm.turnClient != nil {
@@ -160,13 +168,13 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 			if err == nil {
 				if err := rm.turnClient.Send(data, relayAddr); err == nil {
 					return true
-				} else {
-					log.Printf("[TURN] 发送到 %s 失败: %v", peerId, err)
 				}
+				log.Printf("[TURN] 发送到 %s 失败: %v", peerId, err)
 			}
 		}
 		rm.DowngradeToWS(peerId, "send failed")
-		return false
+		// ★ 兜底：WS 发当前帧
+		return rm.ws.SendBinary(data) == nil
 
 	case ConnRelay:
 		err := rm.ws.SendBinary(data)
@@ -187,7 +195,7 @@ func (rm *RelayManager) Report(interval time.Duration) {
 			}
 			rm.mu.RUnlock()
 
-			// ★ 修复：空 map 不上报，否则服务端会清空已有连接状态
+			// ★ 空 map 不上报，否则服务端会清空已有连接状态
 			if len(conns) == 0 {
 				continue
 			}
