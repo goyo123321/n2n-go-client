@@ -41,10 +41,7 @@ type TURNClient struct {
 	edge         *Edge
 	onMessage    func([]byte, net.Addr)
 	stopCh       chan struct{}
-
-	// TURN 协议（RFC 5766）要求向某个对端发送数据前必须先
-	// CreatePermission。缓存已授权的对端 IP，避免重复调用。
-	permissions map[string]bool
+	permissions  map[string]bool
 }
 
 // ============ 构造 ============
@@ -133,8 +130,19 @@ func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 
 	log.Printf("[TURN] 连接 TURN 服务器: %s (user=%s)", turnAddr, srv.Username)
 
+	// ★ 修复：pion/turn v4 要求调用方提供底层 UDP conn，不再自动创建。
+	// 之前没设 cfg.Conn，导致 turn.NewClient 报 "turn: conn cannot not be nil"。
+	//
+	// 这个 conn 会被 turn.Client 接管，turnClient.Close() 时会一并关闭。
+	// 只在创建失败路径上需要手动关。
+	conn, err := net.ListenPacket("udp4", "0.0.0.0:0")
+	if err != nil {
+		return fmt.Errorf("listen for TURN: %w", err)
+	}
+
 	cfg := &turn.ClientConfig{
 		TURNServerAddr: turnAddr,
+		Conn:           conn, // ★ 关键：把 conn 交给 turn.Client
 		Username:       srv.Username,
 		Password:       srv.Password,
 	}
@@ -145,6 +153,7 @@ func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 
 	turnClient, err := turn.NewClient(cfg)
 	if err != nil {
+		conn.Close() // ★ 创建失败，需要手动释放
 		return fmt.Errorf("create TURN client: %w", err)
 	}
 
@@ -222,7 +231,7 @@ func (tc *TURNClient) Send(data []byte, remoteAddr net.Addr) error {
 
 // ensurePermission 确保向 remoteAddr 的发送已被 TURN 服务器授权。
 //
-// TURN 协议（RFC 5766）要求：客户端向某个对端地址发送数据前，必须先
+// TURN 协议（RFC 5766）要求客户端向某个对端地址发送数据前，必须先
 // 用 CreatePermission 在服务器上建立对该 IP 的权限。pion/turn 的 Client
 // 不会自动处理这一步，漏掉的话 WriteTo 会被服务器静默丢弃。
 //
