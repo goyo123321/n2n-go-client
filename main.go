@@ -26,11 +26,13 @@ type PeerInfo struct {
 	VirtualIP     string
 	PubIP         string
 	PubPort       int
-	SharePort     int
 	TurnRelayAddr string
 	UDPAddr       *net.UDPAddr
 	lastRecvAt    int64
 	loggedReady   bool
+	// hasRealData 记录是否从这个 peer 收到过真实数据帧（非探测包）。
+	// 只有收到真实数据帧才能升级为 P2P——收到探测包只说明对方在打洞。
+	hasRealData bool
 }
 
 type Edge struct {
@@ -39,12 +41,10 @@ type Edge struct {
 	virtualIP string
 	roomId    string
 
-	ws          *WSTransport
-	relayMgr    *RelayManager
-	turnClient  *TURNClient
-	tun         *TUNDevice
-	shareServer *ShareServer
-	registry    *ShareRegistry
+	ws         *WSTransport
+	relayMgr   *RelayManager
+	turnClient *TURNClient
+	tun        *TUNDevice
 
 	udpConn *net.UDPConn
 	udpPort int
@@ -58,15 +58,13 @@ type Edge struct {
 }
 
 func main() {
-	initShareServerPort()
-
 	signalingURL := getEnv("SIGNALING_URL", DefaultSignalingURL)
 	roomId := getEnv("ROOM_ID", "default-room")
 	clientId := getEnv("CLIENT_ID", "")
 	nodeName := getEnv("NODE_NAME", "")
-	shareDir := getEnv("SHARE_DIR", "./shared")
 	tunName := getEnv("TUN_NAME", "n2n0")
-	udpPort := getEnvInt("UDP_PORT", 50001)
+	// ★ UDP_PORT 默认 0：让内核分配端口，避免同机多实例冲突
+	udpPort := getEnvInt("UDP_PORT", 0)
 	stunServers := getEnv("STUN_SERVERS", "")
 	connectToken := getEnv("CONNECT_TOKEN", "")
 
@@ -74,7 +72,7 @@ func main() {
 		log.Fatal("请设置 SIGNALING_URL")
 	}
 
-	// ★ 修复：CLIENT_ID 持久化到文件，重启复用，避免虚拟 IP 漂移
+	// CLIENT_ID 持久化到文件
 	if clientId == "" {
 		installDir := getEnv("INSTALL_DIR", filepath.Join(os.Getenv("HOME"), ".n2n-go"))
 		idFile := filepath.Join(installDir, "client_id")
@@ -99,7 +97,6 @@ func main() {
 		hostname, _ := os.Hostname()
 		nodeName = hostname
 	}
-	_ = shareDir
 	_ = tunName
 
 	log.Printf("n2n-go-client %s 启动", BuildVersion)
@@ -118,20 +115,27 @@ func main() {
 		udpPort:    udpPort,
 	}
 
+	// ★ UDP_PORT=0 时内核分配；显式端口被占用时回退到内核分配
 	udpAddr := &net.UDPAddr{IP: net.IPv4zero, Port: udpPort}
 	udpConn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil && udpPort != 0 {
+		log.Printf("[P2P] 端口 %d 被占用，回退到内核分配", udpPort)
+		udpConn, err = net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	}
 	if err != nil {
-		log.Fatalf("绑定 UDP %d 失败: %v", udpPort, err)
+		log.Fatalf("绑定 UDP 失败: %v", err)
 	}
 	edge.udpConn = udpConn
 	defer udpConn.Close()
-	log.Printf("[P2P] UDP 监听端口 %d", udpPort)
+
+	actualPort := udpConn.LocalAddr().(*net.UDPAddr).Port
+	log.Printf("[P2P] UDP 监听端口 %d", actualPort)
 
 	servers := []string{}
 	if stunServers != "" {
 		servers = splitCSV(stunServers)
 	}
-	edge.natMeta = probeNAT(udpPort, servers)
+	edge.natMeta = probeNAT(actualPort, servers)
 
 	ws, err := NewWSTransport(signalingURL, roomId, clientId, connectToken)
 	if err != nil {
@@ -142,6 +146,28 @@ func main() {
 	log.Printf("已连接信令，Client ID: %s，节点名: %s", clientId, nodeName)
 	ws.StartHeartbeat(20 * time.Second)
 
+	// ★ 断线重连后重新上报 metadata
+	ws.onReconnect = func() {
+		if edge.virtualIP != "" && edge.natMeta != nil {
+			metaPayload := map[string]interface{}{
+				"name":               edge.nodeName,
+				"natType":            edge.natMeta.NATType,
+				"portsDifference":    edge.natMeta.PortsDifference,
+				"regularPortsChange": edge.natMeta.RegularPortsChange,
+				"behavior":           edge.natMeta.Behavior,
+				"assistedSockets":    edge.natMeta.AssistedSockets,
+				"p2pEndpoint":        edge.natMeta.P2PEndpoint,
+			}
+			if edge.natMeta.PublicEndpoint != "" {
+				metaPayload["publicEndpoint"] = edge.natMeta.PublicEndpoint
+			}
+			_ = ws.Send(map[string]interface{}{
+				"type":    "p2p_metadata",
+				"payload": metaPayload,
+			})
+		}
+	}
+
 	edge.turnClient = NewTURNClient(signalingURL, connectToken, edge)
 	edge.turnClient.onMessage = func(data []byte, addr net.Addr) {
 		edge.enqueueTUN(data)
@@ -149,14 +175,6 @@ func main() {
 
 	edge.relayMgr = NewRelayManager(ws, edge.turnClient, edge)
 	edge.relayMgr.Report(10 * time.Second)
-
-	edge.registry = NewShareRegistry()
-	go func() {
-		mux := http.NewServeMux()
-		mux.Handle("/", edge.registry)
-		log.Printf("[发现] 本地面板: http://localhost:9091/api/nodes")
-		_ = http.ListenAndServe("127.0.0.1:9091", mux)
-	}()
 
 	ws.onMessage = edge.handleSignaling
 
@@ -175,10 +193,12 @@ func main() {
 				continue
 			}
 			if buf[0] == 'N' && buf[1] == '2' && buf[2] == 'N' && buf[3] == 'P' {
-				edge.notePeerTraffic(addr)
+				// ★ 探测包：只刷新 lastRecvAt，不标记 hasRealData
+				edge.notePeerProbe(addr)
 				continue
 			}
 			if buf[0]>>4 == 4 {
+				// ★ 真实数据帧：标记 hasRealData
 				edge.notePeerTraffic(addr)
 				edge.enqueueTUN(buf[:n])
 			}
@@ -202,7 +222,6 @@ func main() {
 			log.Printf("[TURN] 初始化失败: %v（将使用 WS 中继兜底）", err)
 		} else {
 			log.Printf("[TURN] TURN 中继就绪: %s", edge.turnClient.GetRelayAddr())
-			// ★ 修复：TURN 就绪后，把仍然走 WS 中继的 peer 升级到 TURN
 			edge.relayMgr.UpgradeRelaysToTURN()
 			_ = edge.ws.Send(map[string]interface{}{
 				"type":      "turn_relay_info",
@@ -219,33 +238,18 @@ func main() {
 	if edge.turnClient != nil {
 		edge.turnClient.Close()
 	}
-	if edge.shareServer != nil {
-		_ = edge.shareServer.Stop()
-	}
 	if edge.tun != nil {
 		_ = edge.tun.Close()
 	}
-	_ = ws.Send(map[string]interface{}{
-		"type":    "share_withdraw",
-		"payload": map[string]interface{}{"virtualIp": edge.virtualIP},
-	})
 }
 
 func (e *Edge) printNodeSummary() {
-	addr := fmt.Sprintf("http://%s:%d/", e.virtualIP, ShareServerPort)
-	webdav := fmt.Sprintf("http://%s:%d/webdav/", e.virtualIP, ShareServerPort)
-	shareDir := getEnv("SHARE_DIR", "./shared")
-
 	log.Println("")
 	log.Println("================= 本机信息 =================")
 	log.Printf("  Client ID   : %s", e.clientId)
 	log.Printf("  节点名       : %s", e.nodeName)
 	log.Printf("  虚拟 IP     : %s", e.virtualIP)
 	log.Printf("  P2P 端口    : %d", e.udpPort)
-	log.Printf("  共享盘端口   : %d", ShareServerPort)
-	log.Printf("  共享盘地址   : %s", addr)
-	log.Printf("  WebDAV      : %s", webdav)
-	log.Printf("  共享目录     : %s", shareDir)
 	log.Println("==========================================")
 	log.Println("")
 }
@@ -256,7 +260,7 @@ func (e *Edge) logPeerReady(peerID string) {
 	}
 	e.peersMu.Lock()
 	p, ok := e.peers[peerID]
-	if !ok || p.loggedReady || p.SharePort <= 0 {
+	if !ok || p.loggedReady {
 		e.peersMu.Unlock()
 		return
 	}
@@ -264,7 +268,6 @@ func (e *Edge) logPeerReady(peerID string) {
 	vip := p.VirtualIP
 	pubIP := p.PubIP
 	pubPort := p.PubPort
-	sharePort := p.SharePort
 	clientID := p.ClientID
 	e.peersMu.Unlock()
 
@@ -274,9 +277,6 @@ func (e *Edge) logPeerReady(peerID string) {
 	if pubIP != "" && pubPort > 0 {
 		log.Printf("  公网地址  : %s:%d", pubIP, pubPort)
 	}
-	log.Printf("  共享盘端口 : %d", sharePort)
-	log.Printf("  共享盘地址 : http://%s:%d/", vip, sharePort)
-	log.Printf("  WebDAV    : http://%s:%d/webdav/", vip, sharePort)
 	log.Println("==========================================")
 	log.Println("")
 }
@@ -299,22 +299,13 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			go e.tunReadLoop()
 		}
 
-		e.shareServer = NewShareServer(
-			getEnv("SHARE_DIR", "./shared"),
-			e.virtualIP,
-			e.nodeName,
-		)
-		if err := e.shareServer.Start(); err != nil {
-			log.Printf("[共享盘] 启动失败: %v", err)
-		}
-
 		metaPayload := map[string]interface{}{
+			"name":               e.nodeName, // ★ name 从 share_announce 迁移到这里
 			"natType":            e.natMeta.NATType,
 			"portsDifference":    e.natMeta.PortsDifference,
 			"regularPortsChange": e.natMeta.RegularPortsChange,
 			"behavior":           e.natMeta.Behavior,
 			"assistedSockets":    e.natMeta.AssistedSockets,
-			"sharePort":          ShareServerPort,
 			"p2pEndpoint":        e.natMeta.P2PEndpoint,
 		}
 		if e.natMeta.PublicEndpoint != "" {
@@ -324,32 +315,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			"type":    "p2p_metadata",
 			"payload": metaPayload,
 		})
-
-		_ = e.ws.Send(map[string]interface{}{
-			"type": "share_announce",
-			"payload": map[string]interface{}{
-				"name":      e.nodeName,
-				"virtualIp": e.virtualIP,
-				"port":      ShareServerPort,
-			},
-		})
-
-		if shares, ok := payload["shares"].([]interface{}); ok {
-			for _, s := range shares {
-				sm, ok := s.(map[string]interface{})
-				if !ok {
-					continue
-				}
-				sid, _ := sm["id"].(string)
-				sname, _ := sm["name"].(string)
-				svip, _ := sm["virtualIp"].(string)
-				sport := ShareServerPort
-				if p, ok := sm["port"].(float64); ok {
-					sport = int(p)
-				}
-				e.registry.Register(sid, sname, svip, sport)
-			}
-		}
 
 		if peers, ok := payload["peers"].([]interface{}); ok {
 			for _, p := range peers {
@@ -364,16 +329,11 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 				if f, ok := pm["publicPort"].(float64); ok {
 					pubPort = int(f)
 				}
-				sharePort := 0
-				if f, ok := pm["sharePort"].(float64); ok {
-					sharePort = int(f)
-				}
-				relayAddr, _ := pm["turnRelayAddr"].(string) // ★ 修复
+				relayAddr, _ := pm["turnRelayAddr"].(string)
 				if pid == "" || pip == "" {
 					continue
 				}
-				e.registerPeer(pid, pip, pubIP, pubPort, sharePort)
-				// ★ 修复：记录对端的 TURN 中继地址
+				e.registerPeer(pid, pip, pubIP, pubPort)
 				if relayAddr != "" {
 					e.peersMu.Lock()
 					if pi, ok := e.peers[pid]; ok {
@@ -382,7 +342,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 					e.peersMu.Unlock()
 				}
 				e.logPeerReady(pid)
-				go e.discoverPeer(pid, pip, sharePort)
 			}
 		}
 
@@ -399,19 +358,14 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		if f, ok := payload["publicPort"].(float64); ok {
 			pubPort = int(f)
 		}
-		sharePort := 0
-		if f, ok := payload["sharePort"].(float64); ok {
-			sharePort = int(f)
-		}
-		relayAddr, _ := payload["turnRelayAddr"].(string) // ★ 修复
+		relayAddr, _ := payload["turnRelayAddr"].(string)
 		if from != "" && pip != "" {
 			e.peersMu.RLock()
 			p, exists := e.peers[from]
 			alreadyReady := exists && p.loggedReady
 			e.peersMu.RUnlock()
 
-			e.registerPeer(from, pip, pubIP, pubPort, sharePort)
-			// ★ 修复：记录对端 TURN 中继地址
+			e.registerPeer(from, pip, pubIP, pubPort)
 			if relayAddr != "" {
 				e.peersMu.Lock()
 				if pi, ok := e.peers[from]; ok {
@@ -420,14 +374,11 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 				e.peersMu.Unlock()
 			}
 
-			if !alreadyReady && sharePort <= 0 {
+			if !alreadyReady {
 				log.Printf("[信令] 节点上线: %s (vip=%s)", from, pip)
 			}
 
 			e.logPeerReady(from)
-			if sharePort > 0 {
-				go e.discoverPeer(from, pip, sharePort)
-			}
 		}
 
 	case "nat_hole_instruction":
@@ -440,22 +391,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		e.ensureTargetPeer(&instr)
 		go e.runNatHole(&instr)
 
-	case "share_announce":
-		payload, _ := msg["payload"].(map[string]interface{})
-		name, _ := payload["name"].(string)
-		vip, _ := payload["virtualIp"].(string)
-		port := ShareServerPort
-		if p, ok := payload["port"].(float64); ok {
-			port = int(p)
-		}
-		e.registry.Register(from, name, vip, port)
-		e.registerPeer(from, vip, "", 0, port)
-		e.logPeerReady(from)
-		if from != "" && vip != "" {
-			go e.discoverPeer(from, vip, port)
-		}
-
-	// 收到其他 Peer 的 TURN 中继地址
 	case "turn_peer_info":
 		edgeMac, _ := msg["edgeMac"].(string)
 		relayAddr, _ := msg["relayAddr"].(string)
@@ -469,22 +404,17 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		}
 
 	case "pong":
-		// ★ 修复：接收服务端 pong（当前仅忽略）
 		return
 
 	case "left":
 		log.Printf("[信令] 节点离开: %s", from)
-		e.registry.Unregister(from)
 		e.peersMu.Lock()
 		delete(e.peers, from)
 		e.peersMu.Unlock()
-
-	case "share_withdraw":
-		e.registry.Unregister(from)
 	}
 }
 
-func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort, sharePort int) {
+func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int) {
 	var udpAddr *net.UDPAddr
 	if pubIP != "" && pubPort > 0 {
 		udpAddr = &net.UDPAddr{IP: net.ParseIP(pubIP), Port: pubPort}
@@ -501,9 +431,6 @@ func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort, sharePort 
 		if pubPort > 0 {
 			existing.PubPort = pubPort
 		}
-		if sharePort > 0 {
-			existing.SharePort = sharePort
-		}
 		if udpAddr != nil {
 			existing.UDPAddr = udpAddr
 		}
@@ -513,7 +440,6 @@ func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort, sharePort 
 			VirtualIP: virtualIP,
 			PubIP:     pubIP,
 			PubPort:   pubPort,
-			SharePort: sharePort,
 			UDPAddr:   udpAddr,
 		}
 	}
@@ -565,47 +491,7 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 	if res.State == PunchStateSucceeded {
 		e.relayMgr.MarkP2P(instr.TargetMac)
 	} else {
-		// 打洞失败：优先 TURN，TURN 不可用则 WS
 		e.relayMgr.MarkFallback(instr.TargetMac)
-	}
-}
-
-func (e *Edge) discoverPeer(peerID, virtualIP string, sharePort int) {
-	e.peersMu.Lock()
-	if p, ok := e.peers[peerID]; ok {
-		if sharePort > 0 {
-			p.SharePort = sharePort
-		} else {
-			sharePort = p.SharePort
-		}
-	} else {
-		e.peers[peerID] = &PeerInfo{
-			ClientID:  peerID,
-			VirtualIP: virtualIP,
-			SharePort: sharePort,
-		}
-	}
-	e.peersMu.Unlock()
-
-	port := sharePort
-	if port <= 0 {
-		port = e.registry.GetPort(peerID)
-	}
-	if port <= 0 {
-		port = ShareServerPort
-	}
-
-	for i := 0; i < 3; i++ {
-		node, err := DiscoverRemoteNode(virtualIP, port)
-		if err == nil {
-			e.registry.Register(peerID, node.NodeName, virtualIP, node.Port)
-			break
-		}
-		time.Sleep(2 * time.Second)
-	}
-
-	if e.relayMgr.GetState(peerID) == ConnUnknown {
-		e.relayMgr.MarkFallback(peerID)
 	}
 }
 
@@ -641,7 +527,6 @@ func (e *Edge) tunReadLoop() {
 			continue
 		}
 
-		// 三级降级：P2P → TURN → WS
 		ok := e.relayMgr.SendToPeer(target.ClientID, buf[:n], target)
 		if !ok {
 			_ = e.ws.SendBinary(buf[:n])
@@ -659,8 +544,19 @@ func (e *Edge) enqueueTUN(data []byte) {
 	}
 }
 
-// ★ 修复：合并双次加锁解锁为单次评分遍历，可读性更好
+// ★ 拆分：探测包和真实数据帧走不同路径
+func (e *Edge) notePeerProbe(addr *net.UDPAddr) {
+	e.notePeerCommon(addr, false)
+}
+
 func (e *Edge) notePeerTraffic(addr *net.UDPAddr) {
+	e.notePeerCommon(addr, true)
+}
+
+// ★ P0-7：区分探测包和真实数据帧。
+// IP 相同但端口不同的宽松匹配只在 isRealData=true 时使用——因为
+// 只有真实数据帧才值得更新 UDPAddr。
+func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool) {
 	now := time.Now().UnixMilli()
 
 	e.peersMu.Lock()
@@ -684,19 +580,26 @@ func (e *Edge) notePeerTraffic(addr *net.UDPAddr) {
 		return
 	}
 	best.lastRecvAt = now
-	if bestScore == 1 {
-		best.UDPAddr = &net.UDPAddr{IP: addr.IP, Port: addr.Port}
+	if isRealData {
+		best.hasRealData = true
+		if bestScore == 1 {
+			best.UDPAddr = &net.UDPAddr{IP: addr.IP, Port: addr.Port}
+		}
 	}
 	clientID := best.ClientID
 	ip := addr.IP.String()
+	realData := best.hasRealData
 	e.peersMu.Unlock()
 
-	e.maybeUpgradeToP2P(clientID, ip)
+	// ★ P0-7：只有真实数据帧才触发 P2P 升级
+	if realData && isRealData {
+		e.maybeUpgradeToP2P(clientID, ip)
+	}
 }
 
 func (e *Edge) maybeUpgradeToP2P(clientID, ip string) {
 	if e.relayMgr.ShouldRelay(clientID) {
-		log.Printf("[P2P] 从 %s (%s) 收到 UDP 包，自动升级为 P2P", clientID, ip)
+		log.Printf("[P2P] 从 %s (%s) 收到真实数据帧，升级为 P2P", clientID, ip)
 		e.relayMgr.MarkP2P(clientID)
 	}
 }
