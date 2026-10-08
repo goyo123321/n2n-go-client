@@ -14,8 +14,6 @@ import (
 	"github.com/pion/turn/v4"
 )
 
-// ============ 数据结构 ============
-
 type TURNServerInfo struct {
 	URL      string `json:"url"`
 	Username string `json:"username"`
@@ -41,9 +39,11 @@ type TURNClient struct {
 	edge         *Edge
 	onMessage    func([]byte, net.Addr)
 	stopCh       chan struct{}
-}
 
-// ============ 构造 ============
+	// ★ P0-12：TURN 协议要求向某个对端发送数据前必须先 CreatePermission。
+	// 缓存已授权的对端 IP，避免重复调用。
+	permissions map[string]bool
+}
 
 func NewTURNClient(signalingURL string, connectToken string, edge *Edge) *TURNClient {
 	return &TURNClient{
@@ -51,13 +51,11 @@ func NewTURNClient(signalingURL string, connectToken string, edge *Edge) *TURNCl
 		connectToken: connectToken,
 		edge:         edge,
 		stopCh:       make(chan struct{}),
+		permissions:  make(map[string]bool),
 	}
 }
 
-// ============ 请求凭证并建立分配 ============
-
 func (tc *TURNClient) FetchAndSetup(ctx context.Context) error {
-	// wss:// → https://, ws:// → http://
 	httpBase := tc.signalingURL
 	if strings.HasPrefix(httpBase, "wss://") {
 		httpBase = "https://" + httpBase[len("wss://"):]
@@ -77,7 +75,6 @@ func (tc *TURNClient) FetchAndSetup(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
-	// ★ 修复：删除无用 X-Admin-Token header（服务端 /api/turn-credentials 不读它）
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -109,8 +106,6 @@ func (tc *TURNClient) FetchAndSetup(ctx context.Context) error {
 	return tc.setupAllocation(ctx)
 }
 
-// ============ 建立 TURN Allocation ============
-
 func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 	tc.mu.RLock()
 	srv := tc.server
@@ -119,7 +114,6 @@ func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 		return fmt.Errorf("TURN server not set")
 	}
 
-	// pion/turn 的 TURNServerAddr 只接受 "host:port" 格式
 	turnAddr := srv.URL
 	turnAddr = strings.TrimPrefix(turnAddr, "turn://")
 	turnAddr = strings.TrimPrefix(turnAddr, "turns://")
@@ -134,7 +128,6 @@ func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 		Username:       srv.Username,
 		Password:       srv.Password,
 	}
-	// Cloudflare 官方 TURN 使用 realm=cloudflare；自建 coturn 一般交给服务端下发
 	if strings.Contains(strings.ToLower(srv.URL), "cloudflare") {
 		cfg.Realm = "cloudflare"
 	}
@@ -165,8 +158,6 @@ func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 	go tc.readLoop()
 	return nil
 }
-
-// ============ 收发 ============
 
 func (tc *TURNClient) readLoop() {
 	buf := make([]byte, 65535)
@@ -209,11 +200,46 @@ func (tc *TURNClient) Send(data []byte, remoteAddr net.Addr) error {
 	if conn == nil {
 		return fmt.Errorf("TURN 未就绪")
 	}
+	// ★ P0-12：发送前确保已授权
+	if err := tc.ensurePermission(remoteAddr); err != nil {
+		return fmt.Errorf("CreatePermission 失败: %w", err)
+	}
 	_, err := conn.WriteTo(data, remoteAddr)
 	return err
 }
 
-// ============ 状态查询 ============
+// ensurePermission 确保向 remoteAddr 的发送已被 TURN 服务器授权。
+// TURN 协议（RFC 5766）要求客户端向某个对端地址发送数据前，必须先
+// 用 CreatePermission 在服务器上建立对该 IP 的权限。pion/turn 的 Client
+// 不会自动处理这一步，漏掉的话 WriteTo 会被服务器静默丢弃。
+func (tc *TURNClient) ensurePermission(remoteAddr net.Addr) error {
+	udpAddr, ok := remoteAddr.(*net.UDPAddr)
+	if !ok {
+		return fmt.Errorf("remoteAddr 不是 UDPAddr: %T", remoteAddr)
+	}
+	key := udpAddr.IP.String()
+
+	tc.mu.RLock()
+	client := tc.client
+	already := tc.permissions[key]
+	tc.mu.RUnlock()
+
+	if already {
+		return nil
+	}
+	if client == nil {
+		return fmt.Errorf("TURN client 未就绪")
+	}
+
+	if err := client.CreatePermission(udpAddr.IP); err != nil {
+		return err
+	}
+
+	tc.mu.Lock()
+	tc.permissions[key] = true
+	tc.mu.Unlock()
+	return nil
+}
 
 func (tc *TURNClient) GetRelayAddr() string {
 	tc.mu.RLock()
@@ -229,8 +255,6 @@ func (tc *TURNClient) IsReady() bool {
 	defer tc.mu.RUnlock()
 	return tc.relayConn != nil
 }
-
-// ============ 关闭 ============
 
 func (tc *TURNClient) Close() {
 	select {
@@ -249,9 +273,8 @@ func (tc *TURNClient) Close() {
 		tc.relayConn.Close()
 		tc.relayConn = nil
 	}
+	tc.permissions = make(map[string]bool)
 }
-
-// ============ 辅助 ============
 
 func redactToken(raw string) string {
 	u, err := url.Parse(raw)
