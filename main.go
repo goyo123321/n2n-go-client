@@ -62,7 +62,7 @@ func main() {
 	clientId := getEnv("CLIENT_ID", "")
 	nodeName := getEnv("NODE_NAME", "")
 	tunName := getEnv("TUN_NAME", "n2n0")
-	// ★ UDP_PORT 默认 0：让内核分配端口，避免同机多实例冲突
+	// UDP_PORT 默认 0：让内核分配端口，避免同机多实例冲突
 	udpPort := getEnvInt("UDP_PORT", 0)
 	stunServers := getEnv("STUN_SERVERS", "")
 	connectToken := getEnv("CONNECT_TOKEN", "")
@@ -114,7 +114,7 @@ func main() {
 		udpPort:    udpPort,
 	}
 
-	// ★ UDP_PORT=0 时内核分配；显式端口被占用时回退到内核分配
+	// UDP_PORT=0 时内核分配；显式端口被占用时回退到内核分配
 	udpAddr := &net.UDPAddr{IP: net.IPv4zero, Port: udpPort}
 	udpConn, err := net.ListenUDP("udp", udpAddr)
 	if err != nil && udpPort != 0 {
@@ -145,7 +145,7 @@ func main() {
 	log.Printf("已连接信令，Client ID: %s，节点名: %s", clientId, nodeName)
 	ws.StartHeartbeat(20 * time.Second)
 
-	// ★ 断线重连后重新上报 metadata
+	// 断线重连后重新上报 metadata
 	ws.onReconnect = func() {
 		if edge.virtualIP != "" && edge.natMeta != nil {
 			metaPayload := map[string]interface{}{
@@ -192,12 +192,12 @@ func main() {
 				continue
 			}
 			if buf[0] == 'N' && buf[1] == '2' && buf[2] == 'N' && buf[3] == 'P' {
-				// ★ 探测包：只刷新 lastRecvAt，不标记 hasRealData
+				// 探测包：只刷新 lastRecvAt，不标记 hasRealData
 				edge.notePeerProbe(addr)
 				continue
 			}
 			if buf[0]>>4 == 4 {
-				// ★ 真实数据帧：标记 hasRealData
+				// 真实数据帧：标记 hasRealData
 				edge.notePeerTraffic(addr)
 				edge.enqueueTUN(buf[:n])
 			}
@@ -299,7 +299,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		}
 
 		metaPayload := map[string]interface{}{
-			"name":               e.nodeName, // ★ name 从 share_announce 迁移到这里
+			"name":               e.nodeName,
 			"natType":            e.natMeta.NATType,
 			"portsDifference":    e.natMeta.PortsDifference,
 			"regularPortsChange": e.natMeta.RegularPortsChange,
@@ -470,8 +470,15 @@ func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 	}
 }
 
+// ★ 方案 2：executeNatHole 返回 nil 表示这条指令是重复的，
+// 原指令还在执行中，会发真实结果。这里跳过上报，避免污染
+// 服务端的 failCounts 和 analyzer 分数。
 func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 	res := e.executeNatHole(instr)
+
+	if res == nil {
+		return
+	}
 
 	_ = e.ws.Send(map[string]interface{}{
 		"type": "p2p_state_info",
@@ -543,18 +550,21 @@ func (e *Edge) enqueueTUN(data []byte) {
 	}
 }
 
-// ★ 拆分：探测包和真实数据帧走不同路径
+// 探测包：只刷新活动时间，不升级 P2P
 func (e *Edge) notePeerProbe(addr *net.UDPAddr) {
 	e.notePeerCommon(addr, false)
 }
 
+// 真实数据帧：刷新活动时间，并标记 hasRealData
 func (e *Edge) notePeerTraffic(addr *net.UDPAddr) {
 	e.notePeerCommon(addr, true)
 }
 
-// ★ P0-7：区分探测包和真实数据帧。
-// IP 相同但端口不同的宽松匹配只在 isRealData=true 时使用——因为
-// 只有真实数据帧才值得更新 UDPAddr。
+// 定位发起该 UDP 包的 peer 并刷新其状态。
+//
+// 匹配策略：先按 (IP, Port) 精确匹配，再回退到只按 IP 匹配。
+// IP 匹配只在 isRealData=true 时用于升级 P2P——即必须是真实数据帧
+// 才能触发"IP 相同但端口不同也算这个 peer"的宽松匹配。
 func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool) {
 	now := time.Now().UnixMilli()
 
@@ -590,7 +600,7 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool) {
 	realData := best.hasRealData
 	e.peersMu.Unlock()
 
-	// ★ P0-7：只有真实数据帧才触发 P2P 升级
+	// 只有真实数据帧才能触发 P2P 升级
 	if realData && isRealData {
 		e.maybeUpgradeToP2P(clientID, ip)
 	}
