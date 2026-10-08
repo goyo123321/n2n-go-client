@@ -36,11 +36,11 @@ type PeerInfo struct {
 }
 
 type Edge struct {
-	clientId  string
-	nodeName  string
-	virtualIP string
-	virtualCIDR string // ★ 从 ready 消息收到的虚拟网段
-	roomId    string
+	clientId    string
+	nodeName    string
+	virtualIP   string
+	virtualCIDR string
+	roomId      string
 
 	ws         *WSTransport
 	relayMgr   *RelayManager
@@ -143,14 +143,13 @@ func main() {
 	}
 
 	edge := &Edge{
-		clientId:   clientId,
-		nodeName:   nodeName,
-		roomId:     roomId,
-		// 默认值，ready 消息到达后会被覆盖
+		clientId:    clientId,
+		nodeName:    nodeName,
+		roomId:      roomId,
 		virtualCIDR: DefaultVirtualCIDR,
-		peers:      make(map[string]*PeerInfo),
-		tunWriteCh: make(chan []byte, 1024),
-		udpPort:    udpPort,
+		peers:       make(map[string]*PeerInfo),
+		tunWriteCh:  make(chan []byte, 1024),
+		udpPort:     udpPort,
 	}
 
 	udpAddr := &net.UDPAddr{IP: net.IPv4zero, Port: udpPort}
@@ -166,6 +165,7 @@ func main() {
 	defer udpConn.Close()
 
 	actualPort := udpConn.LocalAddr().(*net.UDPAddr).Port
+	edge.udpPort = actualPort // ★ 修复：把内核分配的实际端口写回 Edge
 	log.Printf("[P2P] UDP 监听端口 %d", actualPort)
 
 	servers := []string{}
@@ -324,7 +324,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		payload, _ := msg["payload"].(map[string]interface{})
 		e.virtualIP, _ = payload["virtualIp"].(string)
 
-		// ★ 从 ready 消息读虚拟网段
 		if cidr, ok := payload["virtualNetwork"].(string); ok && cidr != "" {
 			e.virtualCIDR = cidr
 		}
