@@ -48,11 +48,6 @@ on:
         required: false
         type: string
         default: 'CI E2E'
-      share_dir:
-        description: '【E2E 共享目录】SHARE_DIR'
-        required: false
-        type: string
-        default: '/tmp/shared'
       client_id_mode:
         description: '【E2E 客户端ID模式】auto=ci-test-<run_id>（并发安全，推荐）；fixed=固定 ci-test；custom=用下面 client_id 填的值'
         required: false
@@ -84,7 +79,6 @@ jobs:
       room: ${{ steps.resolve.outputs.room }}
       room_mode: ${{ steps.resolve.outputs.room_mode }}
       node_name: ${{ steps.resolve.outputs.node_name }}
-      share_dir: ${{ steps.resolve.outputs.share_dir }}
       client_id: ${{ steps.resolve.outputs.client_id }}
     steps:
       - name: Resolve inputs
@@ -99,7 +93,6 @@ jobs:
           SKIP_E2E: ${{ inputs.skip_e2e }}
           USE_FIXED_ROOM: ${{ inputs.use_fixed_room }}
           NODE_NAME_IN: ${{ inputs.node_name }}
-          SHARE_DIR_IN: ${{ inputs.share_dir }}
           CLIENT_ID_MODE: ${{ inputs.client_id_mode }}
           CLIENT_ID_IN: ${{ inputs.client_id }}
         run: |
@@ -215,7 +208,6 @@ jobs:
           fi
 
           NODE_NAME="${NODE_NAME_IN:-CI E2E}"
-          SHARE_DIR="${SHARE_DIR_IN:-/tmp/shared}"
 
           case "$CLIENT_ID_MODE" in
             fixed)
@@ -245,7 +237,6 @@ jobs:
           echo "room=$ROOM" >> $GITHUB_OUTPUT
           echo "room_mode=$ROOM_MODE" >> $GITHUB_OUTPUT
           echo "node_name=$NODE_NAME" >> $GITHUB_OUTPUT
-          echo "share_dir=$SHARE_DIR" >> $GITHUB_OUTPUT
           echo "client_id=$FINAL_CLIENT_ID" >> $GITHUB_OUTPUT
 
           echo "::notice::WSS 来源: $WSS_SOURCE, 地址: $WSS"
@@ -421,7 +412,6 @@ jobs:
           echo "房间名: ${{ needs.prepare.outputs.room }}"
           echo "房间模式: ${{ needs.prepare.outputs.room_mode }}"
           echo "设备名: ${{ needs.prepare.outputs.node_name }}"
-          echo "共享目录: ${{ needs.prepare.outputs.share_dir }}"
           echo "客户端 ID: ${{ needs.prepare.outputs.client_id }}"
           if [ -n "${{ needs.prepare.outputs.connect_token }}" ]; then
             echo "CONNECT_TOKEN: 已设置"
@@ -446,14 +436,11 @@ jobs:
           CONNECT_TOKEN: ${{ needs.prepare.outputs.connect_token }}
           ROOM: ${{ needs.prepare.outputs.room }}
           NODE_NAME: ${{ needs.prepare.outputs.node_name }}
-          SHARE_DIR: ${{ needs.prepare.outputs.share_dir }}
           CID: ${{ needs.prepare.outputs.client_id }}
         run: |
           echo "::notice::使用 CLIENT_ID: $CID"
           echo "cid=$CID" >> $GITHUB_OUTPUT
           echo "room=$ROOM" >> $GITHUB_OUTPUT
-
-          mkdir -p "$SHARE_DIR"
 
           sudo timeout --signal=KILL 120 \
             env SIGNALING_URL="$SIGNALING_URL" \
@@ -461,7 +448,6 @@ jobs:
                 ROOM_ID="$ROOM" \
                 CLIENT_ID="$CID" \
                 NODE_NAME="$NODE_NAME" \
-                SHARE_DIR="$SHARE_DIR" \
                 ./dist/n2n-client-linux-amd64 \
             > /tmp/client.log 2>&1 &
           echo "started=true" >> $GITHUB_OUTPUT
@@ -540,6 +526,7 @@ jobs:
           echo "$LOG" | grep -q "已连接信令" && echo "已连接信令" || echo "无 '已连接信令'"
           echo "$LOG" | grep -q "分配虚拟 IP" && echo "分配虚拟 IP" || echo "无 '分配虚拟 IP'"
           echo "$LOG" | grep -q "\[TUN\]" && echo "有 TUN 日志" || echo "无 TUN 日志"
+          echo "$LOG" | grep -q "共享盘" && echo "⚠️ 残留共享盘日志" || echo "✅ 无共享盘日志"
 
       - name: Cleanup
         if: always()
@@ -558,7 +545,6 @@ jobs:
           echo "- Token 来源: \`${{ needs.prepare.outputs.token_source }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- 房间名: \`${{ needs.prepare.outputs.room }}\` (${{ needs.prepare.outputs.room_mode }})" >> $GITHUB_STEP_SUMMARY
           echo "- 设备名: \`${{ needs.prepare.outputs.node_name }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- 共享目录: \`${{ needs.prepare.outputs.share_dir }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- 客户端 ID: \`${{ needs.prepare.outputs.client_id }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- 结果: \`${{ steps.verify.outputs.result }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- NAT 类型: \`${{ steps.verify.outputs.nat_type }}\`" >> $GITHUB_STEP_SUMMARY
