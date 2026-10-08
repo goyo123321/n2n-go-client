@@ -86,7 +86,7 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		natHoleActiveMu.Unlock()
 	}()
 
-	// ★ 方案 1：立即上报 InProgress。
+	// 立即上报 InProgress。
 	//
 	// 服务端的 in-flight 窗口默认 10s。ladder 的 rung 7/9 带
 	// sendDelayMs=10000，客户端会 sleep 10s 后才发第一个探测包——
@@ -97,8 +97,7 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 	//   3. analyzer 错误惩罚该 rung
 	//
 	// 上报 InProgress 让服务端刷新 in-flight 时间戳，覆盖
-	// sendDelayMs 期间。服务端的 shouldHoldForInProgress 也会因此
-	// 生效（之前是死代码）。
+	// sendDelayMs 期间。
 	e.reportInProgress(instr)
 
 	startAt := time.Now().UnixMilli()
@@ -116,7 +115,11 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		return res
 	}
 
-	// TTL 是 socket 的 IP TTL，不是轮次数。
+	// TTL 是 socket 的 IP TTL，不是轮次数。设置 TTL 让探测包在特定
+	// 跳数后消亡：
+	//   TTL=7  → 探测包走 7 跳即死，用于让 NAT 在近处分配映射（短路径）
+	//   TTL=4  → 更短
+	//   ttl=0  → 不改 TTL，全路径发送（长路径唯一能用的档位）
 	var prevTTL int = -1
 	if instr.TTL > 0 && e.udpConn != nil {
 		p := ipv4.NewPacketConn(e.udpConn)
@@ -220,7 +223,7 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 	return res
 }
 
-// ★ 方案 1：向服务端上报 InProgress。
+// 向服务端上报 InProgress。
 //
 // 放在 executeNatHole 开头而不是中途，是因为服务端的 in-flight 窗口
 // 是从"派发时刻"开始计时的，而客户端从"收到指令"到"发出第一个探测包"
@@ -289,6 +292,8 @@ func buildPunchProbe(virtualIP string) []byte {
 	return buf
 }
 
+// 判断候选 IP 中是否有过"真实数据帧"到达。
+// 探测包不算——它是打洞本身产生的。
 func (e *Edge) hasRealTrafficFromAny(ips []net.IP, since int64) bool {
 	if len(ips) == 0 {
 		return false
