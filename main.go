@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -20,6 +21,8 @@ var (
 	DefaultSignalingURL = ""
 )
 
+const DefaultVirtualCIDR = "10.64.0.0/24"
+
 type PeerInfo struct {
 	ClientID      string
 	VirtualIP     string
@@ -29,15 +32,14 @@ type PeerInfo struct {
 	UDPAddr       *net.UDPAddr
 	lastRecvAt    int64
 	loggedReady   bool
-	// hasRealData 记录是否从这个 peer 收到过真实数据帧（非探测包）。
-	// 只有收到真实数据帧才能升级为 P2P——收到探测包只说明对方在打洞。
-	hasRealData bool
+	hasRealData   bool
 }
 
 type Edge struct {
 	clientId  string
 	nodeName  string
 	virtualIP string
+	virtualCIDR string // ★ 从 ready 消息收到的虚拟网段
 	roomId    string
 
 	ws         *WSTransport
@@ -56,13 +58,49 @@ type Edge struct {
 	natMeta *NATMetadata
 }
 
+// cidrToNetmask 把 "10.64.0.0/24" 这种 CIDR 转成 "255.255.255.0"
+// 用于 Windows 的 netsh 和 macOS 的 ifconfig
+func cidrToNetmask(cidr string) string {
+	parts := strings.Split(cidr, "/")
+	if len(parts) != 2 {
+		return "255.255.255.0"
+	}
+	prefix, err := strconv.Atoi(parts[1])
+	if err != nil || prefix < 0 || prefix > 32 {
+		return "255.255.255.0"
+	}
+	var mask uint32
+	if prefix > 0 {
+		mask = ^uint32(0) << (32 - prefix)
+	}
+	return fmt.Sprintf("%d.%d.%d.%d",
+		(mask>>24)&255, (mask>>16)&255, (mask>>8)&255, mask&255)
+}
+
+// cidrNetworkAddr 返回 CIDR 的网络地址部分，例如 "10.64.0.0/24" → "10.64.0.0"
+func cidrNetworkAddr(cidr string) string {
+	parts := strings.Split(cidr, "/")
+	if len(parts) != 2 {
+		return cidr
+	}
+	return parts[0]
+}
+
+// cidrPrefix 返回前缀长度字符串，例如 "10.64.0.0/24" → "24"
+func cidrPrefix(cidr string) string {
+	parts := strings.Split(cidr, "/")
+	if len(parts) != 2 {
+		return "24"
+	}
+	return parts[1]
+}
+
 func main() {
 	signalingURL := getEnv("SIGNALING_URL", DefaultSignalingURL)
 	roomId := getEnv("ROOM_ID", "default-room")
 	clientId := getEnv("CLIENT_ID", "")
 	nodeName := getEnv("NODE_NAME", "")
 	tunName := getEnv("TUN_NAME", "n2n0")
-	// UDP_PORT 默认 0：让内核分配端口，避免同机多实例冲突
 	udpPort := getEnvInt("UDP_PORT", 0)
 	stunServers := getEnv("STUN_SERVERS", "")
 	connectToken := getEnv("CONNECT_TOKEN", "")
@@ -71,7 +109,6 @@ func main() {
 		log.Fatal("请设置 SIGNALING_URL")
 	}
 
-	// CLIENT_ID 持久化到文件
 	if clientId == "" {
 		installDir := getEnv("INSTALL_DIR", filepath.Join(os.Getenv("HOME"), ".n2n-go"))
 		idFile := filepath.Join(installDir, "client_id")
@@ -109,12 +146,13 @@ func main() {
 		clientId:   clientId,
 		nodeName:   nodeName,
 		roomId:     roomId,
+		// 默认值，ready 消息到达后会被覆盖
+		virtualCIDR: DefaultVirtualCIDR,
 		peers:      make(map[string]*PeerInfo),
 		tunWriteCh: make(chan []byte, 1024),
 		udpPort:    udpPort,
 	}
 
-	// UDP_PORT=0 时内核分配；显式端口被占用时回退到内核分配
 	udpAddr := &net.UDPAddr{IP: net.IPv4zero, Port: udpPort}
 	udpConn, err := net.ListenUDP("udp", udpAddr)
 	if err != nil && udpPort != 0 {
@@ -145,7 +183,6 @@ func main() {
 	log.Printf("已连接信令，Client ID: %s，节点名: %s", clientId, nodeName)
 	ws.StartHeartbeat(20 * time.Second)
 
-	// 断线重连后重新上报 metadata
 	ws.onReconnect = func() {
 		if edge.virtualIP != "" && edge.natMeta != nil {
 			metaPayload := map[string]interface{}{
@@ -192,12 +229,10 @@ func main() {
 				continue
 			}
 			if buf[0] == 'N' && buf[1] == '2' && buf[2] == 'N' && buf[3] == 'P' {
-				// 探测包：只刷新 lastRecvAt，不标记 hasRealData
 				edge.notePeerProbe(addr)
 				continue
 			}
 			if buf[0]>>4 == 4 {
-				// 真实数据帧：标记 hasRealData
 				edge.notePeerTraffic(addr)
 				edge.enqueueTUN(buf[:n])
 			}
@@ -212,7 +247,6 @@ func main() {
 		}
 	}()
 
-	// TURN 异步初始化
 	go func() {
 		time.Sleep(2 * time.Second)
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -248,6 +282,7 @@ func (e *Edge) printNodeSummary() {
 	log.Printf("  Client ID   : %s", e.clientId)
 	log.Printf("  节点名       : %s", e.nodeName)
 	log.Printf("  虚拟 IP     : %s", e.virtualIP)
+	log.Printf("  虚拟网段    : %s", e.virtualCIDR)
 	log.Printf("  P2P 端口    : %d", e.udpPort)
 	log.Println("==========================================")
 	log.Println("")
@@ -288,10 +323,15 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 	case "ready":
 		payload, _ := msg["payload"].(map[string]interface{})
 		e.virtualIP, _ = payload["virtualIp"].(string)
-		log.Printf("分配虚拟 IP: %s", e.virtualIP)
+
+		// ★ 从 ready 消息读虚拟网段
+		if cidr, ok := payload["virtualNetwork"].(string); ok && cidr != "" {
+			e.virtualCIDR = cidr
+		}
+		log.Printf("分配虚拟 IP: %s（网段 %s）", e.virtualIP, e.virtualCIDR)
 
 		var err error
-		e.tun, err = setupTUN(e.virtualIP, getEnv("TUN_NAME", "n2n0"))
+		e.tun, err = setupTUN(e.virtualIP, e.virtualCIDR, getEnv("TUN_NAME", "n2n0"))
 		if err != nil {
 			log.Printf("[TUN] 启动失败: %v", err)
 		} else {
@@ -470,12 +510,6 @@ func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 	}
 }
 
-// executeNatHole 返回 nil 表示这条指令是重复的，原指令还在执行中，
-// 会发真实结果。这里跳过上报，避免污染服务端的 failCounts 和
-// analyzer 分数。
-//
-// 成功/失败时，先更新本地 relayMgr 状态，再读取，最后连同自报的
-// p2pStatus 一起上报——服务端首次成功时会做一次交叉校验。
 func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 	res := e.executeNatHole(instr)
 
@@ -483,14 +517,12 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 		return
 	}
 
-	// 先更新连接状态，再读取——顺序很重要
 	if res.State == PunchStateSucceeded {
 		e.relayMgr.MarkP2P(instr.TargetMac)
 	} else if res.State == PunchStateFailed {
 		e.relayMgr.MarkFallback(instr.TargetMac)
 	}
 
-	// 读客户端当前的连接状态
 	p2pStatus := 0
 	switch e.relayMgr.GetState(instr.TargetMac) {
 	case ConnP2P:
@@ -564,21 +596,14 @@ func (e *Edge) enqueueTUN(data []byte) {
 	}
 }
 
-// 探测包：只刷新活动时间，不升级 P2P
 func (e *Edge) notePeerProbe(addr *net.UDPAddr) {
 	e.notePeerCommon(addr, false)
 }
 
-// 真实数据帧：刷新活动时间，并标记 hasRealData
 func (e *Edge) notePeerTraffic(addr *net.UDPAddr) {
 	e.notePeerCommon(addr, true)
 }
 
-// 定位发起该 UDP 包的 peer 并刷新其状态。
-//
-// 匹配策略：先按 (IP, Port) 精确匹配，再回退到只按 IP 匹配。
-// IP 匹配只在 isRealData=true 时用于升级 P2P——即必须是真实数据帧
-// 才能触发"IP 相同但端口不同也算这个 peer"的宽松匹配。
 func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool) {
 	now := time.Now().UnixMilli()
 
@@ -614,7 +639,6 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool) {
 	realData := best.hasRealData
 	e.peersMu.Unlock()
 
-	// 只有真实数据帧才能触发 P2P 升级
 	if realData && isRealData {
 		e.maybeUpgradeToP2P(clientID, ip)
 	}
