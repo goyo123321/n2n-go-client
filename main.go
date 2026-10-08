@@ -470,14 +470,33 @@ func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 	}
 }
 
-// ★ 方案 2：executeNatHole 返回 nil 表示这条指令是重复的，
-// 原指令还在执行中，会发真实结果。这里跳过上报，避免污染
-// 服务端的 failCounts 和 analyzer 分数。
+// executeNatHole 返回 nil 表示这条指令是重复的，原指令还在执行中，
+// 会发真实结果。这里跳过上报，避免污染服务端的 failCounts 和
+// analyzer 分数。
+//
+// 成功/失败时，先更新本地 relayMgr 状态，再读取，最后连同自报的
+// p2pStatus 一起上报——服务端首次成功时会做一次交叉校验。
 func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 	res := e.executeNatHole(instr)
 
 	if res == nil {
 		return
+	}
+
+	// 先更新连接状态，再读取——顺序很重要
+	if res.State == PunchStateSucceeded {
+		e.relayMgr.MarkP2P(instr.TargetMac)
+	} else if res.State == PunchStateFailed {
+		e.relayMgr.MarkFallback(instr.TargetMac)
+	}
+
+	// 读客户端当前的连接状态
+	p2pStatus := 0
+	switch e.relayMgr.GetState(instr.TargetMac) {
+	case ConnP2P:
+		p2pStatus = 3
+	case ConnTURN, ConnRelay:
+		p2pStatus = 2
 	}
 
 	_ = e.ws.Send(map[string]interface{}{
@@ -489,16 +508,11 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 					"observedRaddr":      "",
 					"punchResult":        res,
 					"punchResultPeerMac": instr.TargetMac,
+					"p2pStatus":          p2pStatus,
 				},
 			},
 		},
 	})
-
-	if res.State == PunchStateSucceeded {
-		e.relayMgr.MarkP2P(instr.TargetMac)
-	} else {
-		e.relayMgr.MarkFallback(instr.TargetMac)
-	}
 }
 
 func (e *Edge) tunReadLoop() {
