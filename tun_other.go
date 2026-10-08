@@ -6,8 +6,8 @@ import "errors"
 
 type TUNDevice struct{}
 
-func setupTUN(virtualIP, name string) (*TUNDevice, error) {
-    return nil, errors.New("当前平台不支持 TUN")
+func setupTUN(virtualIP, cidr, name string) (*TUNDevice, error) {
+	return nil, errors.New("当前平台不支持 TUN")
 }
 
 func (t *TUNDevice) Read(buf []byte) (int, error)  { return 0, errors.New("not supported") }
