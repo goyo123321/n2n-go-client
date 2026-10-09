@@ -12,8 +12,9 @@ import (
 )
 
 type WSTransport struct {
-	mu       sync.Mutex
-	conn     *websocket.Conn
+	mu      sync.Mutex
+	writeMu sync.Mutex // ★ 串行化所有写操作，gorilla/websocket 禁止并发写
+	conn    *websocket.Conn
 	clientId string
 
 	signalingURL string
@@ -23,6 +24,11 @@ type WSTransport struct {
 	onMessage   func(map[string]interface{})
 	onBinary    func([]byte)
 	onReconnect func()
+
+	// ★ 早期消息缓冲：SetHandlers 调用前收到的消息暂存
+	earlyText   []map[string]interface{}
+	earlyBinary [][]byte
+	handlersSet bool
 
 	closed chan struct{}
 	once   sync.Once
@@ -41,6 +47,44 @@ func NewWSTransport(signalingURL, roomId, clientId, connectToken string) (*WSTra
 	}
 	go ws.readLoop()
 	return ws, nil
+}
+
+// SetHandlers 设置 onMessage / onBinary 回调，并重放缓冲消息。
+//
+// ★ 替换直接赋值 ws.onMessage = xxx 的写法。
+//   修复 "ready 消息在 handler 设置前到达被丢弃" —— 之前的代码在
+//   NewWSTransport 之后隔了 TURN 初始化、RelayManager 初始化才设置
+//   onMessage，中间几十毫秒 ready 消息被丢。
+func (ws *WSTransport) SetHandlers(
+	onMessage func(map[string]interface{}),
+	onBinary func([]byte),
+) {
+	ws.mu.Lock()
+	ws.onMessage = onMessage
+	ws.onBinary = onBinary
+	ws.handlersSet = true
+	textBuf := ws.earlyText
+	binBuf := ws.earlyBinary
+	ws.earlyText = nil
+	ws.earlyBinary = nil
+	ws.mu.Unlock()
+
+	if len(textBuf) > 0 {
+		log.Printf("[WS] 重放 %d 条早期文本消息", len(textBuf))
+		for _, msg := range textBuf {
+			if onMessage != nil {
+				onMessage(msg)
+			}
+		}
+	}
+	if len(binBuf) > 0 {
+		log.Printf("[WS] 重放 %d 条早期二进制消息", len(binBuf))
+		for _, data := range binBuf {
+			if onBinary != nil {
+				onBinary(data)
+			}
+		}
+	}
 }
 
 func (ws *WSTransport) dial() error {
@@ -74,9 +118,8 @@ func maskToken(u string) string {
 	return parts[0] + "token=***"
 }
 
-// ★ P0-8：断线自动重连。
-// 早期版本在读到 error 后直接 return，主 goroutine 不会因此退出，
-// 进程变成"活着但失联"的状态。
+// readLoop 断线自动重连（指数退避，最长 30s）。
+// ★ 未设 handler 时把消息暂存到 earlyText/earlyBinary。
 func (ws *WSTransport) readLoop() {
 	backoff := 1 * time.Second
 	const maxBackoff = 30 * time.Second
@@ -135,34 +178,58 @@ func (ws *WSTransport) readLoop() {
 			if err := json.Unmarshal(data, &msg); err != nil {
 				continue
 			}
-			if ws.onMessage != nil {
-				ws.onMessage(msg)
+			ws.mu.Lock()
+			if ws.handlersSet && ws.onMessage != nil {
+				h := ws.onMessage
+				ws.mu.Unlock()
+				h(msg)
+			} else {
+				ws.earlyText = append(ws.earlyText, msg)
+				ws.mu.Unlock()
 			}
 		} else if msgType == websocket.BinaryMessage {
-			if ws.onBinary != nil {
-				ws.onBinary(data)
+			ws.mu.Lock()
+			if ws.handlersSet && ws.onBinary != nil {
+				h := ws.onBinary
+				ws.mu.Unlock()
+				h(data)
+			} else {
+				cp := make([]byte, len(data))
+				copy(cp, data)
+				ws.earlyBinary = append(ws.earlyBinary, cp)
+				ws.mu.Unlock()
 			}
 		}
 	}
 }
 
+// Send 发文本消息。writeMu 串行化，避免与 StartHeartbeat 并发写。
 func (ws *WSTransport) Send(msg map[string]interface{}) error {
 	data, _ := json.Marshal(msg)
+
+	ws.writeMu.Lock()
+	defer ws.writeMu.Unlock()
+
 	ws.mu.Lock()
-	defer ws.mu.Unlock()
-	if ws.conn == nil {
+	conn := ws.conn
+	ws.mu.Unlock()
+	if conn == nil {
 		return nil // 断线期间静默丢弃；重连后由 onReconnect 重新上报
 	}
-	return ws.conn.WriteMessage(websocket.TextMessage, data)
+	return conn.WriteMessage(websocket.TextMessage, data)
 }
 
 func (ws *WSTransport) SendBinary(data []byte) error {
+	ws.writeMu.Lock()
+	defer ws.writeMu.Unlock()
+
 	ws.mu.Lock()
-	defer ws.mu.Unlock()
-	if ws.conn == nil {
+	conn := ws.conn
+	ws.mu.Unlock()
+	if conn == nil {
 		return nil
 	}
-	return ws.conn.WriteMessage(websocket.BinaryMessage, data)
+	return conn.WriteMessage(websocket.BinaryMessage, data)
 }
 
 func (ws *WSTransport) StartHeartbeat(interval time.Duration) {
