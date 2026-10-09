@@ -103,10 +103,11 @@ func (tc *TURNClient) markDead(reason string) {
 	}
 	log.Printf("[TURN] 标记失效（%s），等待重建", reason)
 
-	// pion/turn 的 Client.Close() 会关闭内部 conn 和 allocation，
-	// relayConn 是其一部分，会自动关闭。conn.Close() 是幂等保护。
+	// ★ pion/turn v4 的 Client.Close() 无返回值，不能 _ = 接收。
+	//   它会关闭内部 conn 和 allocation，relayConn 是其一部分，
+	//   会自动关闭。conn.Close() 是幂等保护。
 	if client != nil {
-		_ = client.Close()
+		client.Close()
 	}
 	if conn != nil {
 		_ = conn.Close()
@@ -192,6 +193,7 @@ func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 
 	log.Printf("[TURN] 连接 TURN 服务器: %s (user=%s)", turnAddr, srv.Username)
 
+	// ★ pion/turn v4 要求调用方提供底层 UDP conn
 	conn, err := net.ListenPacket("udp4", "0.0.0.0:0")
 	if err != nil {
 		return fmt.Errorf("listen for TURN: %w", err)
@@ -209,7 +211,7 @@ func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 
 	turnClient, err := turn.NewClient(cfg)
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return fmt.Errorf("create TURN client: %w", err)
 	}
 
@@ -299,6 +301,9 @@ func (tc *TURNClient) Send(data []byte, remoteAddr net.Addr) error {
 }
 
 // ensurePermission 确保向 remoteAddr 的发送已被 TURN 服务器授权。
+//
+// TURN 协议（RFC 5766）要求客户端向某个对端地址发送数据前，必须先
+// 用 CreatePermission 在服务器上建立对该 IP 的权限。
 func (tc *TURNClient) ensurePermission(remoteAddr net.Addr) error {
 	udpAddr, ok := remoteAddr.(*net.UDPAddr)
 	if !ok {
@@ -399,12 +404,15 @@ func (tc *TURNClient) Close() {
 
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
+
+	// ★ pion/turn v4 的 Client.Close() 无返回值
 	if tc.client != nil {
 		tc.client.Close()
 		tc.client = nil
 	}
+	// ★ relayConn 是 net.PacketConn，Close() 返回 error
 	if tc.relayConn != nil {
-		tc.relayConn.Close()
+		_ = tc.relayConn.Close()
 		tc.relayConn = nil
 	}
 	tc.alive = false
