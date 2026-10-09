@@ -65,9 +65,13 @@ type Edge struct {
 	fallbackTimers   map[string]*time.Timer
 	fallbackTimersMu sync.Mutex
 
-	// ★ 日志节流
+	// ★ 日志节流：同一 dstIP 每 5 秒最多打一次"无匹配 peer"
 	lastNoPeerLog   map[string]int64
 	lastNoPeerLogMu sync.Mutex
+
+	// ★ 状态变化日志：同一 peer 状态不变时不打 TUN 转发日志
+	tunStateLog   map[string]ConnType
+	tunStateLogMu sync.Mutex
 
 	doneCh  chan struct{}
 	closeMu sync.Mutex
@@ -103,9 +107,7 @@ func buildSTUNBindingRequest() []byte {
 	return buf
 }
 
-// startKeepalive 启动 UDP 保活协程。
-//
-// ★ 条件触发：只有在 e.peers 非空时才发 STUN binding request。
+// startKeepalive 启动 UDP 保活协程（条件触发：仅在有 peer 时发）。
 func (e *Edge) startKeepalive() {
 	if e.udpConn == nil {
 		return
@@ -175,6 +177,27 @@ func (e *Edge) logNoPeerThrottled(dstIP string, n int) {
 	log.Printf("[TUN] 无匹配 peer，dst=%s len=%d", dstIP, n)
 }
 
+// logTunForward 状态变化才打日志：同一 peer 状态不变时静默。
+func (e *Edge) logTunForward(peerID, dstIP string, n, proto int, sent bool, state ConnType) {
+	e.tunStateLogMu.Lock()
+	prev, existed := e.tunStateLog[peerID]
+	if existed && prev == state {
+		e.tunStateLogMu.Unlock()
+		return
+	}
+	e.tunStateLog[peerID] = state
+	e.tunStateLogMu.Unlock()
+
+	log.Printf("[TUN] → %s dst=%s len=%d proto=%d sent=%v state=%s",
+		peerID, dstIP, n, proto, sent, state)
+}
+
+func (e *Edge) forgetTunState(peerID string) {
+	e.tunStateLogMu.Lock()
+	delete(e.tunStateLog, peerID)
+	e.tunStateLogMu.Unlock()
+}
+
 // ============ 超时降级 ============
 
 func (e *Edge) scheduleFallbackTimer(peerID string) {
@@ -202,7 +225,10 @@ func (e *Edge) scheduleFallbackTimer(peerID string) {
 		}
 		state := e.relayMgr.GetState(peerID)
 		if state != ConnUnknown {
-			log.Printf("[fallback-timer] %s 已有状态 %s，跳过降级", peerID, state)
+			// ★ P2P 状态不打日志（正常流程）
+			if state != ConnP2P {
+				log.Printf("[fallback-timer] %s 已有状态 %s，跳过降级", peerID, state)
+			}
 			return
 		}
 		log.Printf("[fallback-timer] %s 8s 内未收到打洞指令，主动降级", peerID)
@@ -315,6 +341,7 @@ func main() {
 		udpPort:        udpPort,
 		fallbackTimers: make(map[string]*time.Timer),
 		lastNoPeerLog:  make(map[string]int64),
+		tunStateLog:    make(map[string]ConnType),
 		doneCh:         make(chan struct{}),
 	}
 
@@ -373,6 +400,7 @@ func main() {
 		},
 	)
 
+	// UDP 读循环
 	go func() {
 		buf := make([]byte, 65535)
 		for {
@@ -408,8 +436,10 @@ func main() {
 		}
 	}()
 
+	// ★ 启动 UDP 保活
 	edge.startKeepalive()
 
+	// TURN 初始化
 	go func() {
 		time.Sleep(2 * time.Second)
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -425,6 +455,9 @@ func main() {
 			})
 		}
 	}()
+
+	// ★ 启动 TURN 后台重连循环（网络切换后自动重建）
+	edge.turnClient.StartReconnectLoop()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -712,10 +745,12 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		delete(e.peers, from)
 		e.peersMu.Unlock()
 		e.cancelFallbackTimer(from)
-		// ★ 清理日志节流
+		// ★ 清理日志节流记录
 		e.lastNoPeerLogMu.Lock()
 		delete(e.lastNoPeerLog, from)
 		e.lastNoPeerLogMu.Unlock()
+		// ★ 清理 TUN 转发日志状态
+		e.forgetTunState(from)
 	}
 }
 
@@ -869,8 +904,8 @@ func (e *Edge) tunReadLoop() {
 		}
 		ok := e.relayMgr.SendToPeer(target.ClientID, buf[:n], target)
 		if n >= 10 {
-			log.Printf("[TUN] → %s dst=%s len=%d proto=%d sent=%v state=%s",
-				target.ClientID, dstIP, n, buf[9], ok, state)
+			// ★ 状态变化才打
+			e.logTunForward(target.ClientID, dstIP, n, int(buf[9]), ok, state)
 		}
 		if !ok {
 			_ = e.ws.SendBinary(buf[:n])
