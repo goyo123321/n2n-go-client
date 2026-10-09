@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"net"
+	"runtime/debug"
 	"sync"
 	"time"
 )
@@ -15,6 +16,18 @@ const (
 	ConnRelay   ConnType = "relay"
 	ConnUnknown ConnType = "unknown"
 )
+
+// safeGo 包 goroutine，panic 时不带走进程。
+func safeGo(name string, fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[panic] %s: %v\n%s", name, r, debug.Stack())
+			}
+		}()
+		fn()
+	}()
+}
 
 type RelayManager struct {
 	mu         sync.RWMutex
@@ -33,35 +46,94 @@ func NewRelayManager(ws *WSTransport, turnClient *TURNClient, edge *Edge) *Relay
 	}
 }
 
+// MarkP2P 升级到 P2P。★ 打印 prev 状态便于追踪。
 func (rm *RelayManager) MarkP2P(peerId string) {
 	rm.mu.Lock()
-	defer rm.mu.Unlock()
-	if rm.states[peerId] != ConnP2P {
-		log.Printf("[连接] %s → P2P 直连", peerId)
-		rm.states[peerId] = ConnP2P
+	if rm.states[peerId] == ConnP2P {
+		rm.mu.Unlock()
+		return
 	}
+	prev := rm.states[peerId]
+	rm.states[peerId] = ConnP2P
+	rm.mu.Unlock()
+
+	log.Printf("[连接] %s → P2P 直连（prev=%s）", peerId, prev)
+	rm.cancelFallbackTimer(peerId)
 }
 
-// MarkFallback 打洞失败降级：优先 TURN，TURN 不可用则 WS
+// MarkFallback 打洞失败降级。
+//
+// ★ P2P 已建立 → 不降级（避免状态抖动）
+// ★ 最近 3 秒收到过对端 UDP 包 → 跳过降级（时序问题）
+// 优先 TURN，TURN 不可用则 WS。
 func (rm *RelayManager) MarkFallback(peerId string) {
+	rm.mu.Lock()
+
+	if rm.states[peerId] == ConnP2P {
+		rm.mu.Unlock()
+		rm.cancelFallbackTimer(peerId)
+		log.Printf("[连接] %s 已 P2P，忽略 MarkFallback", peerId)
+		return
+	}
+	if rm.states[peerId] == ConnTURN || rm.states[peerId] == ConnRelay {
+		rm.mu.Unlock()
+		rm.cancelFallbackTimer(peerId)
+		return
+	}
+	rm.mu.Unlock()
+
+	// ★ 检查最近是否收到过对端 UDP 包
+	if rm.edge != nil {
+		rm.edge.peersMu.RLock()
+		p, ok := rm.edge.peers[peerId]
+		var lastRecv int64 = 0
+		if ok {
+			lastRecv = p.lastRecvAt
+		}
+		rm.edge.peersMu.RUnlock()
+
+		if lastRecv > 0 {
+			idleMs := time.Now().UnixMilli() - lastRecv
+			if idleMs < 3000 {
+				log.Printf("[连接] %s 最近 %dms 收到过 UDP 包，跳过降级", peerId, idleMs)
+				return
+			}
+		}
+	}
+
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 
+	// 再次检查
+	if rm.states[peerId] == ConnP2P {
+		rm.cancelFallbackTimer(peerId)
+		return
+	}
 	if rm.states[peerId] == ConnTURN || rm.states[peerId] == ConnRelay {
+		rm.cancelFallbackTimer(peerId)
 		return
 	}
 
 	if rm.turnClient != nil && rm.turnClient.IsReady() {
 		rm.states[peerId] = ConnTURN
 		log.Printf("[连接] %s → TURN 中继 (%s)", peerId, rm.turnClient.GetRelayAddr())
+		rm.cancelFallbackTimer(peerId)
 		return
 	}
 
 	rm.states[peerId] = ConnRelay
 	log.Printf("[连接] %s → WS 中继 (TURN 未就绪，最后兜底)", peerId)
+	rm.cancelFallbackTimer(peerId)
 }
 
-// UpgradeRelaysToTURN TURN 就绪后，把所有仍走 WS relay 的 peer 升级到 TURN
+// cancelFallbackTimer 取消 edge 上的超时降级定时器。
+func (rm *RelayManager) cancelFallbackTimer(peerID string) {
+	if rm.edge == nil {
+		return
+	}
+	rm.edge.cancelFallbackTimer(peerID)
+}
+
 func (rm *RelayManager) UpgradeRelaysToTURN() {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
@@ -82,17 +154,18 @@ func (rm *RelayManager) UpgradeRelaysToTURN() {
 	}
 }
 
-// DowngradeToWS TURN 发送失败，降级到 WS
 func (rm *RelayManager) DowngradeToWS(peerId string, reason string) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
+	if rm.states[peerId] == ConnP2P {
+		return
+	}
 	if rm.states[peerId] != ConnRelay {
 		log.Printf("[连接] %s → WS 中继 (TURN 失败: %s)", peerId, reason)
 		rm.states[peerId] = ConnRelay
 	}
 }
 
-// MarkRelay 兼容旧代码
 func (rm *RelayManager) MarkRelay(peerId string) {
 	rm.MarkFallback(peerId)
 }
@@ -138,11 +211,8 @@ func (rm *RelayManager) SendViaRelay(data []byte) error {
 	return rm.ws.SendBinary(data)
 }
 
-// SendToPeer 三级降级：P2P → TURN → WS
-//
-// ★ 修复：ConnP2P 分支 UDP 失败时，立即走 WS 兜底，而不是返回 false 让上层丢弃
-//   - 原逻辑：UDP 失败 → MarkFallback → return false（当前帧丢）
-//   - 新逻辑：UDP 失败 → 立即 WS 兜底 → 同时 MarkFallback（后续帧降级）
+// SendToPeer 三级降级：P2P → TURN → WS。
+// P2P 失败时立即 WS 兜底当前帧，并 MarkFallback 让后续帧走 TURN/WS。
 func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo) bool {
 	state := rm.GetState(peerId)
 
@@ -156,10 +226,8 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 			log.Printf("[P2P] UDP 发送到 %s 失败: %v，降级到 WS", peerId, err)
 			rm.MarkFallback(peerId)
 		} else {
-			// 没有对端 UDP 地址，也降级
 			rm.MarkFallback(peerId)
 		}
-		// ★ 关键：立即用 WS 兜底当前帧
 		return rm.ws.SendBinary(data) == nil
 
 	case ConnTURN:
@@ -173,7 +241,6 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 			}
 		}
 		rm.DowngradeToWS(peerId, "send failed")
-		// ★ 兜底：WS 发当前帧
 		return rm.ws.SendBinary(data) == nil
 
 	case ConnRelay:
@@ -185,24 +252,32 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 }
 
 func (rm *RelayManager) Report(interval time.Duration) {
-	go func() {
+	if rm.edge == nil {
+		return
+	}
+	safeGo("relay-report", func() {
 		ticker := time.NewTicker(interval)
-		for range ticker.C {
-			rm.mu.RLock()
-			conns := make(map[string]string)
-			for peerId, t := range rm.states {
-				conns[peerId] = string(t)
-			}
-			rm.mu.RUnlock()
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				rm.mu.RLock()
+				conns := make(map[string]string)
+				for peerId, t := range rm.states {
+					conns[peerId] = string(t)
+				}
+				rm.mu.RUnlock()
 
-			// ★ 空 map 不上报，否则服务端会清空已有连接状态
-			if len(conns) == 0 {
-				continue
+				if len(conns) == 0 {
+					continue
+				}
+				_ = rm.ws.Send(map[string]interface{}{
+					"type":    "connection_status",
+					"payload": map[string]interface{}{"connections": conns},
+				})
+			case <-rm.edge.Done():
+				return
 			}
-			_ = rm.ws.Send(map[string]interface{}{
-				"type":    "connection_status",
-				"payload": map[string]interface{}{"connections": conns},
-			})
 		}
-	}()
+	})
 }
