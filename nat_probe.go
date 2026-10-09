@@ -17,11 +17,11 @@ type NATMetadata struct {
     RegularPortsChange bool
     Behavior           string
     AssistedSockets    []string
+    MultiExit          bool // ★ 新增
 }
 
 func probeNAT(localUDPPort int, stunServers []string) *NATMetadata {
     meta := &NATMetadata{
-        // P2PEndpoint 不再预设 0.0.0.0，STUN 成功后才填
         P2PEndpoint:     "",
         NATType:         "unknown",
         Behavior:        "BehaviorPortChanged",
@@ -29,7 +29,12 @@ func probeNAT(localUDPPort int, stunServers []string) *NATMetadata {
     }
 
     if len(stunServers) == 0 {
-        stunServers = []string{"stun.l.google.com:19302", "stun.cloudflare.com:3478"}
+        stunServers = []string{
+            "74.125.250.129:19302",
+            "162.159.207.0:3478",
+            "stun.l.google.com:19302",
+            "stun.cloudflare.com:3478",
+        }
     }
 
     type result struct {
@@ -38,17 +43,20 @@ func probeNAT(localUDPPort int, stunServers []string) *NATMetadata {
     }
     var results []result
 
+    // 每个 STUN 加 2s 超时，拿到 2 个样本就提前退出
     for _, server := range stunServers {
+        if len(results) >= 2 {
+            break
+        }
+
         c, err := stun.Dial("udp", server)
         if err != nil {
             continue
         }
 
-        // stun.TransactionID 是 Setter，AddTo() 每次会生成随机 ID
         msg := stun.MustBuild(stun.TransactionID, stun.BindingRequest)
         var xorAddr stun.XORMappedAddress
 
-        // 给每个 STUN 服务器加 3 秒超时
         done := make(chan struct{})
         go func() {
             defer close(done)
@@ -61,15 +69,20 @@ func probeNAT(localUDPPort int, stunServers []string) *NATMetadata {
         }()
         select {
         case <-done:
-        case <-time.After(3 * time.Second):
+        case <-time.After(2 * time.Second):
             log.Printf("[NAT] STUN %s 超时", server)
         }
         _ = c.Close()
+
         if xorAddr.Port == 0 {
             continue
         }
-
-        results = append(results, result{ip: xorAddr.IP.String(), port: xorAddr.Port})
+        ip4 := xorAddr.IP.To4()
+        if ip4 == nil {
+            continue
+        }
+        results = append(results, result{ip: ip4.String(), port: xorAddr.Port})
+        log.Printf("[NAT] STUN %s → %s:%d", server, ip4.String(), xorAddr.Port)
     }
 
     if len(results) == 0 {
@@ -78,7 +91,6 @@ func probeNAT(localUDPPort int, stunServers []string) *NATMetadata {
     }
 
     meta.PublicEndpoint = net.JoinHostPort(results[0].ip, strconv.Itoa(results[0].port))
-    // 用 STUN 结果作为 P2PEndpoint，而不是 0.0.0.0
     meta.P2PEndpoint = meta.PublicEndpoint
 
     firstPort := results[0].port
@@ -101,9 +113,11 @@ func probeNAT(localUDPPort int, stunServers []string) *NATMetadata {
         meta.RegularPortsChange = true
         log.Printf("[NAT] HardNAT（对称），ports_diff=%d pub=%s", meta.PortsDifference, meta.PublicEndpoint)
     } else {
-        meta.NATType = "EasyNAT"
-        meta.Behavior = "BehaviorNoChange"
-        log.Printf("[NAT] 单 STUN 结果，保守判为 EasyNAT，pub=%s", meta.PublicEndpoint)
+        // ★ 单样本 → unknown，不猜 EasyNAT
+        //   猜错会让服务端按错误模式派发指令，且两端判定不一致
+        meta.NATType = "unknown"
+        meta.Behavior = "BehaviorPortChanged"
+        log.Printf("[NAT] 单 STUN 结果，NAT 类型未知，pub=%s", meta.PublicEndpoint)
     }
 
     return meta
@@ -131,6 +145,33 @@ func localLANAddrs(port int) []string {
             }
             out = append(out, net.JoinHostPort(ip4.String(), strconv.Itoa(port)))
         }
+    }
+    return out
+}
+
+// extractLanIPs 从 AssistedSockets（"IP:Port"）提取纯 IP 列表。
+func extractLanIPs(sockets []string) []string {
+    var out []string
+    seen := make(map[string]bool)
+    for _, s := range sockets {
+        host, _, err := net.SplitHostPort(s)
+        if err != nil {
+            continue
+        }
+        ip := net.ParseIP(host)
+        if ip == nil {
+            continue
+        }
+        ip4 := ip.To4()
+        if ip4 == nil {
+            continue
+        }
+        ipStr := ip4.String()
+        if seen[ipStr] {
+            continue
+        }
+        seen[ipStr] = true
+        out = append(out, ipStr)
     }
     return out
 }
