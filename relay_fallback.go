@@ -18,9 +18,6 @@ const (
 )
 
 // safeGo 包 goroutine，panic 时不带走进程。
-//
-// 用在 RelayManager.Report 及其他后台协程。main.go 里的 keepalive、
-// nat-probe、turn-init 也复用这个函数。
 func safeGo(name string, fn func()) {
 	go func() {
 		defer func() {
@@ -213,7 +210,8 @@ func (rm *RelayManager) SendViaRelay(data []byte) error {
 
 // SendToPeer 三级降级：P2P → TURN → WS。
 //
-// ★ 修复：TURN 发送失败时，日志打的是内层 err，而不是外层的 nil。
+// ★ TURN 失败时不降级状态：单帧用 WS 兜底，状态保持 ConnTURN。
+//   TURN 30 秒后恢复后，下一帧自动走 TURN，无需手动回切。
 func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo) bool {
 	state := rm.GetState(peerId)
 
@@ -235,28 +233,25 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 		if target != nil && target.TurnRelayAddr != "" && rm.turnClient != nil {
 			relayAddr, err := net.ResolveUDPAddr("udp", target.TurnRelayAddr)
 			if err == nil {
-				// ★ 内层 err 用独立变量名，避免 log 打 nil
 				if sendErr := rm.turnClient.Send(data, relayAddr); sendErr == nil {
 					return true
 				} else {
-					log.Printf("[TURN] 发送到 %s 失败: %v", peerId, sendErr)
+					// ★ 只是这一帧失败，不降级状态。TURN 30 秒后可能恢复。
+					log.Printf("[TURN] 发送到 %s 失败（临时）: %v", peerId, sendErr)
+					if rm.ws != nil {
+						_ = rm.ws.SendBinary(data)
+					}
+					return false
 				}
 			} else {
 				log.Printf("[TURN] 解析中继地址 %q 失败: %v", target.TurnRelayAddr, err)
 			}
-		} else {
-			log.Printf("[TURN] 前置条件不满足 peer=%s target=%v relay=%q client=%v",
-				peerId, target != nil,
-				func() string {
-					if target != nil {
-						return target.TurnRelayAddr
-					}
-					return ""
-				}(),
-				rm.turnClient != nil)
 		}
-		rm.DowngradeToWS(peerId, "send failed")
-		return rm.ws.SendBinary(data) == nil
+		// 兜底：WS 发当前帧，状态保持 ConnTURN
+		if rm.ws != nil {
+			return rm.ws.SendBinary(data) == nil
+		}
+		return false
 
 	case ConnRelay:
 		err := rm.ws.SendBinary(data)
