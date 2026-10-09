@@ -65,6 +65,10 @@ type Edge struct {
 	fallbackTimers   map[string]*time.Timer
 	fallbackTimersMu sync.Mutex
 
+	// ★ 日志节流
+	lastNoPeerLog   map[string]int64
+	lastNoPeerLogMu sync.Mutex
+
 	doneCh  chan struct{}
 	closeMu sync.Mutex
 	closed  bool
@@ -86,7 +90,7 @@ var keepaliveServers = []string{
 func buildSTUNBindingRequest() []byte {
 	buf := make([]byte, 20)
 	buf[0] = 0x00
-	buf[1] = 0x01 // Binding Request
+	buf[1] = 0x01
 	buf[2] = 0x00
 	buf[3] = 0x00
 	buf[4] = 0x21
@@ -99,6 +103,9 @@ func buildSTUNBindingRequest() []byte {
 	return buf
 }
 
+// startKeepalive 启动 UDP 保活协程。
+//
+// ★ 条件触发：只有在 e.peers 非空时才发 STUN binding request。
 func (e *Edge) startKeepalive() {
 	if e.udpConn == nil {
 		return
@@ -115,12 +122,25 @@ func (e *Edge) startKeepalive() {
 		return
 	}
 
-	log.Printf("[Keepalive] 启动，每 %v 刷新 %d 个 STUN 服务器", keepaliveInterval, len(addrs))
+	log.Printf("[Keepalive] 启动（条件触发），每 %v 刷新 %d 个 STUN 服务器（仅在有 peer 时）",
+		keepaliveInterval, len(addrs))
 
 	safeGo("keepalive", func() {
-		for _, addr := range addrs {
-			probe := buildSTUNBindingRequest()
-			_, _ = e.udpConn.WriteToUDP(probe, addr)
+		sendOnce := func() {
+			for _, addr := range addrs {
+				probe := buildSTUNBindingRequest()
+				_, _ = e.udpConn.WriteToUDP(probe, addr)
+			}
+		}
+
+		hasPeers := func() bool {
+			e.peersMu.RLock()
+			defer e.peersMu.RUnlock()
+			return len(e.peers) > 0
+		}
+
+		if hasPeers() {
+			sendOnce()
 		}
 
 		ticker := time.NewTicker(keepaliveInterval)
@@ -131,15 +151,28 @@ func (e *Edge) startKeepalive() {
 				log.Printf("[Keepalive] 已停止")
 				return
 			case <-ticker.C:
-				for _, addr := range addrs {
-					probe := buildSTUNBindingRequest()
-					if _, err := e.udpConn.WriteToUDP(probe, addr); err != nil {
-						continue
-					}
+				if !hasPeers() {
+					continue
 				}
+				sendOnce()
 			}
 		}
 	})
+}
+
+// ============ 日志节流 ============
+
+func (e *Edge) logNoPeerThrottled(dstIP string, n int) {
+	now := time.Now().UnixMilli()
+	e.lastNoPeerLogMu.Lock()
+	last := e.lastNoPeerLog[dstIP]
+	if now-last < 5000 {
+		e.lastNoPeerLogMu.Unlock()
+		return
+	}
+	e.lastNoPeerLog[dstIP] = now
+	e.lastNoPeerLogMu.Unlock()
+	log.Printf("[TUN] 无匹配 peer，dst=%s len=%d", dstIP, n)
 }
 
 // ============ 超时降级 ============
@@ -281,6 +314,7 @@ func main() {
 		tunWriteCh:     make(chan []byte, 1024),
 		udpPort:        udpPort,
 		fallbackTimers: make(map[string]*time.Timer),
+		lastNoPeerLog:  make(map[string]int64),
 		doneCh:         make(chan struct{}),
 	}
 
@@ -339,7 +373,6 @@ func main() {
 		},
 	)
 
-	// UDP 读循环
 	go func() {
 		buf := make([]byte, 65535)
 		for {
@@ -364,7 +397,6 @@ func main() {
 				edge.notePeerTraffic(addr)
 				edge.enqueueTUN(buf[:n])
 			}
-			// STUN Binding Response（0x01 开头）静默丢弃
 		}
 	}()
 
@@ -376,7 +408,6 @@ func main() {
 		}
 	}()
 
-	// ★ 启动 UDP 保活
 	edge.startKeepalive()
 
 	go func() {
@@ -625,6 +656,11 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			log.Printf("[NAT-HOLE] 指令解析失败: %v", err)
 			return
 		}
+		// ★ 检查 target 是否还在线
+		if !e.peerExists(instr.TargetMac) {
+			log.Printf("[NAT-HOLE] 忽略指令 target=%s（peer 不在线）", instr.TargetMac)
+			return
+		}
 		e.ensureTargetPeer(&instr)
 		e.scheduleFallbackTimer(instr.TargetMac)
 		instrCopy := instr
@@ -676,7 +712,21 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		delete(e.peers, from)
 		e.peersMu.Unlock()
 		e.cancelFallbackTimer(from)
+		// ★ 清理日志节流
+		e.lastNoPeerLogMu.Lock()
+		delete(e.lastNoPeerLog, from)
+		e.lastNoPeerLogMu.Unlock()
 	}
+}
+
+func (e *Edge) peerExists(peerID string) bool {
+	if peerID == "" {
+		return false
+	}
+	e.peersMu.RLock()
+	defer e.peersMu.RUnlock()
+	_, ok := e.peers[peerID]
+	return ok
 }
 
 func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int) {
@@ -808,6 +858,7 @@ func (e *Edge) tunReadLoop() {
 		e.peersMu.RUnlock()
 
 		if target == nil {
+			e.logNoPeerThrottled(dstIP, n)
 			_ = e.ws.SendBinary(buf[:n])
 			continue
 		}
