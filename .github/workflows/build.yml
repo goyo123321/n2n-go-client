@@ -7,7 +7,7 @@ on:
         description: '【版本号】必须以 v 开头。示例: v1.0.1'
         required: true
         type: string
-        default: 'v1.0.1'
+        default: 'latest'
       publish:
         description: '【是否发布】勾=创建 GitHub Release（用户可下载）；不勾=只构建，产物在 Actions 页保留30天'
         required: false
