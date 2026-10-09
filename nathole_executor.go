@@ -20,6 +20,7 @@ type NatHoleInstruction struct {
 	TargetVirtualIp         string   `json:"targetVirtualIp"`
 	TargetPubSocket         string   `json:"targetPubSocket"`
 	TargetAssistedEndpoints []string `json:"targetAssistedEndpoints"`
+	TargetLanEndpoints      []string `json:"targetLanEndpoints"` // ★ 新增
 	SenderMac               string   `json:"senderMac"`
 	SenderP2PEndpoint       string   `json:"senderP2pEndpoint"`
 	SenderPubSocket         string   `json:"senderPubSocket"`
@@ -53,10 +54,6 @@ const (
 
 var probePrefix = []byte{0x4E, 0x32, 0x4E, 0x50} // "N2NP"
 
-// 同一时刻只允许一个 executeNatHole 在跑。
-// TTL 是 socket 级别的选项（ipv4.PacketConn.SetTTL），并发执行时
-// 各自的 SetTTL 会互相覆盖，导致部分轮次用错 TTL。打洞不是热路径，
-// 串行化代价可以忽略。
 var (
 	natHoleActiveMu sync.Mutex
 	natHoleActive   map[string]bool
@@ -67,11 +64,11 @@ func init() {
 }
 
 func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
-	// 同一 target 已有执行中的指令，直接返回 nil。
-	//
-	// 返回 nil 而不是 Failed 的原因：原指令还在执行，它会发真实结果。
-	// 如果这里返回 Failed，服务端会多记一次假失败，污染 failCounts
-	// 和 analyzer 分数。调用方 runNatHole 看到 nil 时跳过上报。
+	if e.relayMgr != nil && e.relayMgr.GetState(instr.TargetMac) == ConnP2P {
+		log.Printf("[NAT-HOLE] 跳过指令 target=%s（已 P2P）", instr.TargetMac)
+		return nil
+	}
+
 	natHoleActiveMu.Lock()
 	if natHoleActive[instr.TargetMac] {
 		natHoleActiveMu.Unlock()
@@ -86,18 +83,6 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		natHoleActiveMu.Unlock()
 	}()
 
-	// 立即上报 InProgress。
-	//
-	// 服务端的 in-flight 窗口默认 10s。ladder 的 rung 7/9 带
-	// sendDelayMs=10000，客户端会 sleep 10s 后才发第一个探测包——
-	// 恰好卡在窗口边界上。不主动上报的话，服务端会在客户端开始
-	// 打洞前就误判为"没有回应"并重新派发指令，导致：
-	//   1. 服务端记录一次假失败
-	//   2. failCounts 增加，下次 backoff 更久
-	//   3. analyzer 错误惩罚该 rung
-	//
-	// 上报 InProgress 让服务端刷新 in-flight 时间戳，覆盖
-	// sendDelayMs 期间。
 	e.reportInProgress(instr)
 
 	startAt := time.Now().UnixMilli()
@@ -115,11 +100,7 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		return res
 	}
 
-	// TTL 是 socket 的 IP TTL，不是轮次数。设置 TTL 让探测包在特定
-	// 跳数后消亡：
-	//   TTL=7  → 探测包走 7 跳即死，用于让 NAT 在近处分配映射（短路径）
-	//   TTL=4  → 更短
-	//   ttl=0  → 不改 TTL，全路径发送（长路径唯一能用的档位）
+	// TTL 设置
 	var prevTTL int = -1
 	if instr.TTL > 0 && e.udpConn != nil {
 		p := ipv4.NewPacketConn(e.udpConn)
@@ -137,37 +118,53 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 	}
 
 	log.Printf(
-		"[NAT-HOLE] 开始打洞 role=%d target=%s:%d rung=%d mode=%d ttl=%d assisted=%d",
+		"[NAT-HOLE] 开始打洞 role=%d target=%s:%d rung=%d mode=%d ttl=%d assisted=%d lan=%d",
 		instr.Role, targetAddr.IP, targetAddr.Port,
 		instr.BehaviorIndex, instr.Mode, instr.TTL,
 		len(instr.TargetAssistedEndpoints),
+		len(instr.TargetLanEndpoints),
 	)
 
-	var targets []*net.UDPAddr
-	var candidateIPs []net.IP
+	// ★ 分类目标
+	var lanTargets []*net.UDPAddr
+	var publicTargets []*net.UDPAddr
+	var lanIPs []net.IP
+	var publicIPs []net.IP
 
-	for _, ep := range instr.TargetAssistedEndpoints {
+	for _, ep := range instr.TargetLanEndpoints {
 		if addr := parseSockAddr(ep); addr != nil {
-			targets = append(targets, addr)
-			candidateIPs = append(candidateIPs, addr.IP)
+			lanTargets = append(lanTargets, addr)
+			lanIPs = append(lanIPs, addr.IP)
 		}
 	}
-
+	for _, ep := range instr.TargetAssistedEndpoints {
+		if addr := parseSockAddr(ep); addr != nil {
+			publicTargets = append(publicTargets, addr)
+			publicIPs = append(publicIPs, addr.IP)
+		}
+	}
 	if instr.PortsRangeFrom > 0 && instr.PortsRangeTo >= instr.PortsRangeFrom {
 		count := int(instr.PortsRangeTo - instr.PortsRangeFrom + 1)
 		if count > 100 {
 			count = 100
 		}
 		for i := 0; i < count; i++ {
-			targets = append(targets, &net.UDPAddr{
+			publicTargets = append(publicTargets, &net.UDPAddr{
 				IP:   targetAddr.IP,
 				Port: int(instr.PortsRangeFrom) + i,
 			})
 		}
 	} else {
-		targets = append(targets, targetAddr)
+		publicTargets = append(publicTargets, targetAddr)
 	}
-	candidateIPs = append(candidateIPs, targetAddr.IP)
+	publicIPs = append(publicIPs, targetAddr.IP)
+
+	if len(lanTargets) > 0 {
+		log.Printf("[NAT-HOLE] LAN 候选 %d 个（阶段 1）", len(lanTargets))
+	}
+	if len(publicTargets) > 0 {
+		log.Printf("[NAT-HOLE] 公网候选 %d 个（阶段 2）", len(publicTargets))
+	}
 
 	if instr.Role == 0 && instr.SendDelayMs > 0 {
 		time.Sleep(time.Duration(instr.SendDelayMs) * time.Millisecond)
@@ -176,59 +173,73 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 	probe := buildPunchProbe(e.virtualIP)
 	var attempts uint32
 
-	const rounds = 5
-	const roundInterval = 200 * time.Millisecond
-
-	for round := 0; round < rounds; round++ {
-		for _, t := range targets {
-			if _, err := e.udpConn.WriteToUDP(probe, t); err == nil {
-				attempts++
-			}
-		}
-		if e.hasRealTrafficFromAny(candidateIPs, startAt) {
-			res.State = PunchStateSucceeded
-			res.Attempts = attempts
-			res.Detail = "收到对端真实数据帧"
-
-			e.peersMu.Lock()
-			if p, ok := e.peers[instr.TargetMac]; ok {
-				p.UDPAddr = targetAddr
-				p.lastRecvAt = time.Now().UnixMilli()
-			} else {
-				e.peers[instr.TargetMac] = &PeerInfo{
-					ClientID:   instr.TargetMac,
-					VirtualIP:  instr.TargetVirtualIp,
-					UDPAddr:    targetAddr,
-					lastRecvAt: time.Now().UnixMilli(),
+	// 阶段 1：LAN 优先（100ms × 3 轮）
+	if len(lanTargets) > 0 {
+		for i := 0; i < 3; i++ {
+			for _, t := range lanTargets {
+				if _, err := e.udpConn.WriteToUDP(probe, t); err == nil {
+					attempts++
 				}
 			}
-			e.peersMu.Unlock()
-
-			log.Printf(
-				"[NAT-HOLE] ✅ 成功 role=%d target=%s attempts=%d",
-				instr.Role, targetAddr.IP, attempts,
-			)
-			return res
+			if e.hasTrafficFromAny(lanIPs, startAt) {
+				res.State = PunchStateSucceeded
+				res.Attempts = attempts
+				res.Detail = "LAN 直连成功"
+				e.recordP2PSuccess(instr, targetAddr)
+				log.Printf("[NAT-HOLE] ✅ 成功 (LAN) role=%d target=%s attempts=%d",
+					instr.Role, targetAddr.IP, attempts)
+				return res
+			}
+			time.Sleep(100 * time.Millisecond)
 		}
-		time.Sleep(roundInterval)
+	}
+
+	// 阶段 2：公网端口扫描（200ms × 5 轮）
+	if len(publicTargets) > 0 {
+		for round := 0; round < 5; round++ {
+			for _, t := range publicTargets {
+				if _, err := e.udpConn.WriteToUDP(probe, t); err == nil {
+					attempts++
+				}
+			}
+			if e.hasTrafficFromAny(publicIPs, startAt) {
+				res.State = PunchStateSucceeded
+				res.Attempts = attempts
+				res.Detail = "公网端口扫描成功"
+				e.recordP2PSuccess(instr, targetAddr)
+				log.Printf("[NAT-HOLE] ✅ 成功 (公网) role=%d target=%s attempts=%d",
+					instr.Role, targetAddr.IP, attempts)
+				return res
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
 	}
 
 	res.State = PunchStateFailed
 	res.Attempts = attempts
 	res.Detail = "无响应"
-	log.Printf(
-		"[NAT-HOLE] ❌ 失败 role=%d target=%s attempts=%d",
-		instr.Role, targetAddr.IP, attempts,
-	)
+	log.Printf("[NAT-HOLE] ❌ 失败 role=%d target=%s attempts=%d",
+		instr.Role, targetAddr.IP, attempts)
 	return res
 }
 
-// 向服务端上报 InProgress。
-//
-// 放在 executeNatHole 开头而不是中途，是因为服务端的 in-flight 窗口
-// 是从"派发时刻"开始计时的，而客户端从"收到指令"到"发出第一个探测包"
-// 之间可能有 sendDelayMs（最长 10s）的延迟。只有客户端一收到就上报，
-// 才能让服务端的窗口跟着延迟重新计时。
+// recordP2PSuccess 打洞成功后记录 peer 的 UDP 地址。
+func (e *Edge) recordP2PSuccess(instr *NatHoleInstruction, targetAddr *net.UDPAddr) {
+	e.peersMu.Lock()
+	if p, ok := e.peers[instr.TargetMac]; ok {
+		p.UDPAddr = targetAddr
+		p.lastRecvAt = time.Now().UnixMilli()
+	} else {
+		e.peers[instr.TargetMac] = &PeerInfo{
+			ClientID:   instr.TargetMac,
+			VirtualIP:  instr.TargetVirtualIp,
+			UDPAddr:    targetAddr,
+			lastRecvAt: time.Now().UnixMilli(),
+		}
+	}
+	e.peersMu.Unlock()
+}
+
 func (e *Edge) reportInProgress(instr *NatHoleInstruction) {
 	if e.ws == nil {
 		return
@@ -292,9 +303,9 @@ func buildPunchProbe(virtualIP string) []byte {
 	return buf
 }
 
-// 判断候选 IP 中是否有过"真实数据帧"到达。
-// 探测包不算——它是打洞本身产生的。
-func (e *Edge) hasRealTrafficFromAny(ips []net.IP, since int64) bool {
+// hasTrafficFromAny 判断候选 IP 中是否有过 UDP 包到达。
+// ★ 不再要求 hasRealData：收到 probe 也算通道可用。
+func (e *Edge) hasTrafficFromAny(ips []net.IP, since int64) bool {
 	if len(ips) == 0 {
 		return false
 	}
@@ -302,9 +313,6 @@ func (e *Edge) hasRealTrafficFromAny(ips []net.IP, since int64) bool {
 	defer e.peersMu.RUnlock()
 	for _, p := range e.peers {
 		if p.UDPAddr == nil || p.lastRecvAt < since {
-			continue
-		}
-		if !p.hasRealData {
 			continue
 		}
 		for _, ip := range ips {
