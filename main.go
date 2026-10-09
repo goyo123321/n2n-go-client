@@ -42,6 +42,9 @@ type Edge struct {
 	virtualCIDR string
 	roomId      string
 
+	myLanIPs     []string // ★ 本机 LAN IP（从 AssistedSockets 提取）
+	serverSeenIP string   // ★ WS/TCP 出口 IP
+
 	ws         *WSTransport
 	relayMgr   *RelayManager
 	turnClient *TURNClient
@@ -56,10 +59,64 @@ type Edge struct {
 	tunWriteCh chan []byte
 
 	natMeta *NATMetadata
+
+	// ★ 超时降级定时器
+	fallbackTimers   map[string]*time.Timer
+	fallbackTimersMu sync.Mutex
+
+	doneCh  chan struct{}
+	closeMu sync.Mutex
+	closed  bool
+	mu      sync.Mutex
 }
 
-// cidrToNetmask 把 "10.64.0.0/24" 这种 CIDR 转成 "255.255.255.0"
-// 用于 Windows 的 netsh 和 macOS 的 ifconfig
+func (e *Edge) Done() <-chan struct{} { return e.doneCh }
+
+// scheduleFallbackTimer 8 秒后如果 peer 仍是 ConnUnknown，主动降级。
+func (e *Edge) scheduleFallbackTimer(peerID string) {
+	if e.relayMgr == nil || peerID == "" {
+		return
+	}
+
+	e.fallbackTimersMu.Lock()
+	if t, ok := e.fallbackTimers[peerID]; ok {
+		t.Stop()
+	}
+	t := time.AfterFunc(8*time.Second, func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[fallback-timer] panic: %v", r)
+			}
+		}()
+
+		e.fallbackTimersMu.Lock()
+		delete(e.fallbackTimers, peerID)
+		e.fallbackTimersMu.Unlock()
+
+		if e.relayMgr == nil {
+			return
+		}
+		state := e.relayMgr.GetState(peerID)
+		if state != ConnUnknown {
+			log.Printf("[fallback-timer] %s 已有状态 %s，跳过降级", peerID, state)
+			return
+		}
+		log.Printf("[fallback-timer] %s 8s 内未收到打洞指令，主动降级", peerID)
+		e.relayMgr.MarkFallback(peerID)
+	})
+	e.fallbackTimers[peerID] = t
+	e.fallbackTimersMu.Unlock()
+}
+
+func (e *Edge) cancelFallbackTimer(peerID string) {
+	e.fallbackTimersMu.Lock()
+	defer e.fallbackTimersMu.Unlock()
+	if t, ok := e.fallbackTimers[peerID]; ok {
+		t.Stop()
+		delete(e.fallbackTimers, peerID)
+	}
+}
+
 func cidrToNetmask(cidr string) string {
 	parts := strings.Split(cidr, "/")
 	if len(parts) != 2 {
@@ -77,7 +134,6 @@ func cidrToNetmask(cidr string) string {
 		(mask>>24)&255, (mask>>16)&255, (mask>>8)&255, mask&255)
 }
 
-// cidrNetworkAddr 返回 CIDR 的网络地址部分，例如 "10.64.0.0/24" → "10.64.0.0"
 func cidrNetworkAddr(cidr string) string {
 	parts := strings.Split(cidr, "/")
 	if len(parts) != 2 {
@@ -86,7 +142,6 @@ func cidrNetworkAddr(cidr string) string {
 	return parts[0]
 }
 
-// cidrPrefix 返回前缀长度字符串，例如 "10.64.0.0/24" → "24"
 func cidrPrefix(cidr string) string {
 	parts := strings.Split(cidr, "/")
 	if len(parts) != 2 {
@@ -143,13 +198,15 @@ func main() {
 	}
 
 	edge := &Edge{
-		clientId:    clientId,
-		nodeName:    nodeName,
-		roomId:      roomId,
-		virtualCIDR: DefaultVirtualCIDR,
-		peers:       make(map[string]*PeerInfo),
-		tunWriteCh:  make(chan []byte, 1024),
-		udpPort:     udpPort,
+		clientId:       clientId,
+		nodeName:       nodeName,
+		roomId:         roomId,
+		virtualCIDR:    DefaultVirtualCIDR,
+		peers:          make(map[string]*PeerInfo),
+		tunWriteCh:     make(chan []byte, 1024),
+		udpPort:        udpPort,
+		fallbackTimers: make(map[string]*time.Timer),
+		doneCh:         make(chan struct{}),
 	}
 
 	udpAddr := &net.UDPAddr{IP: net.IPv4zero, Port: udpPort}
@@ -165,7 +222,7 @@ func main() {
 	defer udpConn.Close()
 
 	actualPort := udpConn.LocalAddr().(*net.UDPAddr).Port
-	edge.udpPort = actualPort // ★ 修复：把内核分配的实际端口写回 Edge
+	edge.udpPort = actualPort
 	log.Printf("[P2P] UDP 监听端口 %d", actualPort)
 
 	servers := []string{}
@@ -173,6 +230,10 @@ func main() {
 		servers = splitCSV(stunServers)
 	}
 	edge.natMeta = probeNAT(actualPort, servers)
+
+	// ★ 从 AssistedSockets 提取本机 LAN IP
+	edge.myLanIPs = extractLanIPs(edge.natMeta.AssistedSockets)
+	log.Printf("[LAN] 本机局域网 IP: %v", edge.myLanIPs)
 
 	ws, err := NewWSTransport(signalingURL, roomId, clientId, connectToken)
 	if err != nil {
@@ -184,23 +245,8 @@ func main() {
 	ws.StartHeartbeat(20 * time.Second)
 
 	ws.onReconnect = func() {
-		if edge.virtualIP != "" && edge.natMeta != nil {
-			metaPayload := map[string]interface{}{
-				"name":               edge.nodeName,
-				"natType":            edge.natMeta.NATType,
-				"portsDifference":    edge.natMeta.PortsDifference,
-				"regularPortsChange": edge.natMeta.RegularPortsChange,
-				"behavior":           edge.natMeta.Behavior,
-				"assistedSockets":    edge.natMeta.AssistedSockets,
-				"p2pEndpoint":        edge.natMeta.P2PEndpoint,
-			}
-			if edge.natMeta.PublicEndpoint != "" {
-				metaPayload["publicEndpoint"] = edge.natMeta.PublicEndpoint
-			}
-			_ = ws.Send(map[string]interface{}{
-				"type":    "p2p_metadata",
-				"payload": metaPayload,
-			})
+		if edge.virtualIP != "" {
+			edge.reportMetadata()
 		}
 	}
 
@@ -212,17 +258,26 @@ func main() {
 	edge.relayMgr = NewRelayManager(ws, edge.turnClient, edge)
 	edge.relayMgr.Report(10 * time.Second)
 
-	ws.onMessage = edge.handleSignaling
+	// ★ 用 SetHandlers（会重放早期消息），而非直接赋值
+	ws.SetHandlers(
+		edge.handleSignaling,
+		func(data []byte) {
+			edge.enqueueTUN(data)
+		},
+	)
 
-	ws.onBinary = func(data []byte) {
-		edge.enqueueTUN(data)
-	}
-
+	// UDP 读循环
 	go func() {
 		buf := make([]byte, 65535)
 		for {
 			n, addr, err := udpConn.ReadFromUDP(buf)
 			if err != nil {
+				select {
+				case <-edge.doneCh:
+					return
+				default:
+				}
+				log.Printf("[P2P] UDP 读错误: %v", err)
 				return
 			}
 			if n < 4 {
@@ -268,12 +323,91 @@ func main() {
 	<-sigCh
 
 	log.Println("正在退出...")
-	if edge.turnClient != nil {
-		edge.turnClient.Close()
+	edge.Stop()
+}
+
+func (e *Edge) Stop() {
+	e.closeMu.Lock()
+	if e.closed {
+		e.closeMu.Unlock()
+		return
 	}
-	if edge.tun != nil {
-		_ = edge.tun.Close()
+	e.closed = true
+	close(e.doneCh)
+	e.closeMu.Unlock()
+
+	// 清理所有 fallback 定时器
+	e.fallbackTimersMu.Lock()
+	for _, t := range e.fallbackTimers {
+		t.Stop()
 	}
+	e.fallbackTimers = make(map[string]*time.Timer)
+	e.fallbackTimersMu.Unlock()
+
+	if e.turnClient != nil {
+		e.turnClient.Close()
+	}
+	if e.tun != nil {
+		_ = e.tun.Close()
+	}
+}
+
+// reportMetadata 上报 p2p_metadata（含 LAN IP、CGNAT 检测）。
+func (e *Edge) reportMetadata() {
+	if e.ws == nil || e.natMeta == nil {
+		return
+	}
+
+	e.mu.Lock()
+	nm := e.natMeta
+	serverSeenIP := e.serverSeenIP
+	e.mu.Unlock()
+
+	// 实时判 CGNAT 池化
+	if serverSeenIP != "" && nm.PublicEndpoint != "" {
+		stunIP := extractIPFromEndpoint(nm.PublicEndpoint)
+		if stunIP != "" && stunIP != serverSeenIP {
+			nm.MultiExit = true
+			nm.NATType = "HardNAT"
+			nm.Behavior = "BehaviorPortChanged"
+		}
+	}
+
+	metaPayload := map[string]interface{}{
+		"name":               e.nodeName,
+		"natType":            nm.NATType,
+		"portsDifference":    nm.PortsDifference,
+		"regularPortsChange": nm.RegularPortsChange,
+		"behavior":           nm.Behavior,
+		"assistedSockets":    nm.AssistedSockets,
+		"p2pEndpoint":        nm.P2PEndpoint,
+		"lanIps":             e.myLanIPs,
+		"udpPort":            e.udpPort,
+		"multiExit":          nm.MultiExit,
+		"wsPublicIp":         serverSeenIP,
+	}
+	if nm.PublicEndpoint != "" {
+		metaPayload["publicEndpoint"] = nm.PublicEndpoint
+	}
+
+	log.Printf("[信令] 上报 p2p_metadata: natType=%s publicEndpoint=%q wsPublicIp=%q lanIps=%v udpPort=%d multiExit=%v",
+		nm.NATType, nm.PublicEndpoint, serverSeenIP, e.myLanIPs, e.udpPort, nm.MultiExit)
+
+	_ = e.ws.Send(map[string]interface{}{
+		"type":    "p2p_metadata",
+		"payload": metaPayload,
+	})
+}
+
+func extractIPFromEndpoint(ep string) string {
+	if ep == "" {
+		return ""
+	}
+	i := strings.LastIndex(ep, ":")
+	if i < 0 {
+		return ep
+	}
+	return ep[:i]
 }
 
 func (e *Edge) printNodeSummary() {
@@ -329,6 +463,14 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		}
 		log.Printf("分配虚拟 IP: %s（网段 %s）", e.virtualIP, e.virtualCIDR)
 
+		// ★ 记录 WS/TCP 出口 IP（CGNAT 池化判断用）
+		if serverIP, ok := payload["yourPublicIp"].(string); ok && serverIP != "" {
+			e.mu.Lock()
+			e.serverSeenIP = serverIP
+			e.mu.Unlock()
+			log.Printf("[信令] 服务端看到的本机出口 IP: %s（WS/TCP 出口，仅参考）", serverIP)
+		}
+
 		var err error
 		e.tun, err = setupTUN(e.virtualIP, e.virtualCIDR, getEnv("TUN_NAME", "n2n0"))
 		if err != nil {
@@ -337,22 +479,8 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			go e.tunReadLoop()
 		}
 
-		metaPayload := map[string]interface{}{
-			"name":               e.nodeName,
-			"natType":            e.natMeta.NATType,
-			"portsDifference":    e.natMeta.PortsDifference,
-			"regularPortsChange": e.natMeta.RegularPortsChange,
-			"behavior":           e.natMeta.Behavior,
-			"assistedSockets":    e.natMeta.AssistedSockets,
-			"p2pEndpoint":        e.natMeta.P2PEndpoint,
-		}
-		if e.natMeta.PublicEndpoint != "" {
-			metaPayload["publicEndpoint"] = e.natMeta.PublicEndpoint
-		}
-		_ = e.ws.Send(map[string]interface{}{
-			"type":    "p2p_metadata",
-			"payload": metaPayload,
-		})
+		// ★ 用统一的 reportMetadata
+		e.reportMetadata()
 
 		if peers, ok := payload["peers"].([]interface{}); ok {
 			for _, p := range peers {
@@ -415,7 +543,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			if !alreadyReady {
 				log.Printf("[信令] 节点上线: %s (vip=%s)", from, pip)
 			}
-
 			e.logPeerReady(from)
 		}
 
@@ -427,7 +554,35 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			return
 		}
 		e.ensureTargetPeer(&instr)
-		go e.runNatHole(&instr)
+		// ★ 兜底启动 fallback timer
+		e.scheduleFallbackTimer(instr.TargetMac)
+		instrCopy := instr
+		safeGo("nat-hole", func() { e.runNatHole(&instrCopy) })
+
+	case "force_fallback":
+		payload, _ := msg["payload"].(map[string]interface{})
+		if payload == nil {
+			return
+		}
+		peersRaw, _ := payload["peers"].([]interface{})
+		reason, _ := payload["reason"].(string)
+		if reason == "" {
+			reason = "server-forced"
+		}
+		log.Printf("[信令] 收到 force_fallback: %d 个 peer, reason=%s", len(peersRaw), reason)
+		for _, pRaw := range peersRaw {
+			peerID, _ := pRaw.(string)
+			if peerID == "" {
+				continue
+			}
+			if e.relayMgr == nil {
+				continue
+			}
+			if e.relayMgr.GetState(peerID) == ConnP2P {
+				continue
+			}
+			e.relayMgr.MarkFallback(peerID)
+		}
 
 	case "turn_peer_info":
 		edgeMac, _ := msg["edgeMac"].(string)
@@ -449,6 +604,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		e.peersMu.Lock()
 		delete(e.peers, from)
 		e.peersMu.Unlock()
+		e.cancelFallbackTimer(from)
 	}
 }
 
@@ -458,19 +614,20 @@ func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int) {
 		udpAddr = &net.UDPAddr{IP: net.ParseIP(pubIP), Port: pubPort}
 	}
 	e.peersMu.Lock()
-	defer e.peersMu.Unlock()
-	if existing, ok := e.peers[peerID]; ok {
+	_, existed := e.peers[peerID]
+	if existed {
+		p := e.peers[peerID]
 		if virtualIP != "" {
-			existing.VirtualIP = virtualIP
+			p.VirtualIP = virtualIP
 		}
 		if pubIP != "" {
-			existing.PubIP = pubIP
+			p.PubIP = pubIP
 		}
 		if pubPort > 0 {
-			existing.PubPort = pubPort
+			p.PubPort = pubPort
 		}
 		if udpAddr != nil {
-			existing.UDPAddr = udpAddr
+			p.UDPAddr = udpAddr
 		}
 	} else {
 		e.peers[peerID] = &PeerInfo{
@@ -480,6 +637,12 @@ func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int) {
 			PubPort:   pubPort,
 			UDPAddr:   udpAddr,
 		}
+	}
+	e.peersMu.Unlock()
+
+	// ★ 新 peer 启动超时降级定时器
+	if !existed {
+		e.scheduleFallbackTimer(peerID)
 	}
 }
 
@@ -511,7 +674,6 @@ func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 
 func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 	res := e.executeNatHole(instr)
-
 	if res == nil {
 		return
 	}
@@ -551,13 +713,15 @@ func (e *Edge) tunReadLoop() {
 	for {
 		n, err := e.tun.Read(buf)
 		if err != nil {
+			select {
+			case <-e.doneCh:
+				return
+			default:
+			}
 			log.Printf("[TUN] 读取错误: %v", err)
 			return
 		}
-		if n < 20 {
-			continue
-		}
-		if buf[0]>>4 != 4 {
+		if n < 20 || buf[0]>>4 != 4 {
 			continue
 		}
 
@@ -578,7 +742,15 @@ func (e *Edge) tunReadLoop() {
 			continue
 		}
 
+		state := ConnUnknown
+		if e.relayMgr != nil {
+			state = e.relayMgr.GetState(target.ClientID)
+		}
 		ok := e.relayMgr.SendToPeer(target.ClientID, buf[:n], target)
+		if n >= 10 {
+			log.Printf("[TUN] → %s dst=%s len=%d proto=%d sent=%v state=%s",
+				target.ClientID, dstIP, n, buf[9], ok, state)
+		}
 		if !ok {
 			_ = e.ws.SendBinary(buf[:n])
 		}
@@ -603,6 +775,10 @@ func (e *Edge) notePeerTraffic(addr *net.UDPAddr) {
 	e.notePeerCommon(addr, true)
 }
 
+// notePeerCommon 记录 peer 收到 UDP 包的时间。
+//
+// ★ probe 到达也升级 P2P；用实际源地址更新 UDPAddr；
+//   probe 触发回发（连发 5 次）。
 func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool) {
 	now := time.Now().UnixMilli()
 
@@ -629,25 +805,58 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool) {
 	best.lastRecvAt = now
 	if isRealData {
 		best.hasRealData = true
-		if bestScore == 1 {
-			best.UDPAddr = &net.UDPAddr{IP: addr.IP, Port: addr.Port}
-		}
 	}
+	// 用对端 probe 的实际源地址更新
+	best.UDPAddr = &net.UDPAddr{IP: addr.IP, Port: addr.Port}
 	clientID := best.ClientID
 	ip := addr.IP.String()
-	realData := best.hasRealData
 	e.peersMu.Unlock()
 
-	if realData && isRealData {
-		e.maybeUpgradeToP2P(clientID, ip)
+	if e.relayMgr == nil {
+		return
+	}
+
+	// probe 回发（连发 5 次）
+	if !isRealData {
+		e.sendProbeTo(addr)
+	}
+
+	state := e.relayMgr.GetState(clientID)
+	if isRealData {
+		if state != ConnP2P {
+			log.Printf("[P2P] 从 %s (%s) 收到真实数据帧，升级为 P2P", clientID, ip)
+			e.relayMgr.MarkP2P(clientID)
+		}
+		return
+	}
+	if state != ConnP2P {
+		log.Printf("[P2P] 从 %s (%s) 收到打洞探测，UDP 通道可用，升级为 P2P", clientID, ip)
+		e.relayMgr.MarkP2P(clientID)
 	}
 }
 
-func (e *Edge) maybeUpgradeToP2P(clientID, ip string) {
-	if e.relayMgr.ShouldRelay(clientID) {
-		log.Printf("[P2P] 从 %s (%s) 收到真实数据帧，升级为 P2P", clientID, ip)
-		e.relayMgr.MarkP2P(clientID)
+// sendProbeTo 向指定地址连发 5 次打洞探测包（100ms 间隔），覆盖丢包。
+func (e *Edge) sendProbeTo(addr *net.UDPAddr) {
+	if e.udpConn == nil || addr == nil {
+		return
 	}
+	target := &net.UDPAddr{IP: addr.IP, Port: addr.Port}
+	vip := e.virtualIP
+
+	safeGo("probe-reply", func() {
+		probe := buildPunchProbe(vip)
+		for i := 0; i < 5; i++ {
+			select {
+			case <-e.doneCh:
+				return
+			default:
+			}
+			if _, err := e.udpConn.WriteToUDP(probe, target); err != nil {
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	})
 }
 
 func getEnv(k, fb string) string {
