@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"net"
+	"runtime/debug"
 	"sync"
 	"time"
 )
@@ -15,6 +16,21 @@ const (
 	ConnRelay   ConnType = "relay"
 	ConnUnknown ConnType = "unknown"
 )
+
+// safeGo 包 goroutine，panic 时不带走进程。
+//
+// 用在 RelayManager.Report 及其他后台协程。main.go 里的 keepalive、
+// nat-probe、turn-init 也复用这个函数。
+func safeGo(name string, fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[panic] %s: %v\n%s", name, r, debug.Stack())
+			}
+		}()
+		fn()
+	}()
+}
 
 type RelayManager struct {
 	mu         sync.RWMutex
@@ -33,6 +49,7 @@ func NewRelayManager(ws *WSTransport, turnClient *TURNClient, edge *Edge) *Relay
 	}
 }
 
+// MarkP2P 升级到 P2P。
 func (rm *RelayManager) MarkP2P(peerId string) {
 	rm.mu.Lock()
 	if rm.states[peerId] == ConnP2P {
@@ -47,6 +64,11 @@ func (rm *RelayManager) MarkP2P(peerId string) {
 	rm.cancelFallbackTimer(peerId)
 }
 
+// MarkFallback P2P 失败时降级。
+//
+// ★ P2P 已建立 → 不降级（避免状态抖动）
+// ★ 最近 3 秒收到过对端 UDP 包 → 跳过降级（时序问题）
+// 优先 TURN，TURN 不可用则 WS。
 func (rm *RelayManager) MarkFallback(peerId string) {
 	rm.mu.Lock()
 
@@ -213,7 +235,7 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 		if target != nil && target.TurnRelayAddr != "" && rm.turnClient != nil {
 			relayAddr, err := net.ResolveUDPAddr("udp", target.TurnRelayAddr)
 			if err == nil {
-				// ★ 内层 err 用独立变量名
+				// ★ 内层 err 用独立变量名，避免 log 打 nil
 				if sendErr := rm.turnClient.Send(data, relayAddr); sendErr == nil {
 					return true
 				} else {
