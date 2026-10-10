@@ -17,7 +17,6 @@ const (
 	ConnUnknown ConnType = "unknown"
 )
 
-// safeGo 包 goroutine，panic 时不带走进程。
 func safeGo(name string, fn func()) {
 	go func() {
 		defer func() {
@@ -46,7 +45,6 @@ func NewRelayManager(ws *WSTransport, turnClient *TURNClient, edge *Edge) *Relay
 	}
 }
 
-// MarkP2P 升级到 P2P。
 func (rm *RelayManager) MarkP2P(peerId string) {
 	rm.mu.Lock()
 	if rm.states[peerId] == ConnP2P {
@@ -61,11 +59,6 @@ func (rm *RelayManager) MarkP2P(peerId string) {
 	rm.cancelFallbackTimer(peerId)
 }
 
-// MarkFallback P2P 失败时降级。
-//
-// ★ P2P 已建立 → 不降级（避免状态抖动）
-// ★ 最近 3 秒收到过对端 UDP 包 → 跳过降级（时序问题）
-// 优先 TURN，TURN 不可用则 WS。
 func (rm *RelayManager) MarkFallback(peerId string) {
 	rm.mu.Lock()
 
@@ -122,6 +115,28 @@ func (rm *RelayManager) MarkFallback(peerId string) {
 	rm.states[peerId] = ConnRelay
 	log.Printf("[连接] %s → WS 中继 (TURN 未就绪，最后兜底)", peerId)
 	rm.cancelFallbackTimer(peerId)
+}
+
+// ClearPeer 清空某个 peer 的连接状态。
+//
+// 对端离线时调用。避免新会话继承旧状态（如 TURN）导致
+// MarkFallback 被跳过。
+func (rm *RelayManager) ClearPeer(peerID string) {
+	if peerID == "" {
+		return
+	}
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	delete(rm.states, peerID)
+}
+
+// ClearAll 清空所有 peer 的连接状态。
+//
+// WS 重连时调用（服务端会清所有 pair，客户端对应清）。
+func (rm *RelayManager) ClearAll() {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	rm.states = make(map[string]ConnType)
 }
 
 func (rm *RelayManager) cancelFallbackTimer(peerID string) {
@@ -208,10 +223,6 @@ func (rm *RelayManager) SendViaRelay(data []byte) error {
 	return rm.ws.SendBinary(data)
 }
 
-// SendToPeer 三级降级：P2P → TURN → WS。
-//
-// ★ TURN 失败时不降级状态：单帧用 WS 兜底，状态保持 ConnTURN。
-//   TURN 30 秒后恢复后，下一帧自动走 TURN，无需手动回切。
 func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo) bool {
 	state := rm.GetState(peerId)
 
@@ -236,7 +247,6 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 				if sendErr := rm.turnClient.Send(data, relayAddr); sendErr == nil {
 					return true
 				} else {
-					// ★ 只是这一帧失败，不降级状态。TURN 30 秒后可能恢复。
 					log.Printf("[TURN] 发送到 %s 失败（临时）: %v", peerId, sendErr)
 					if rm.ws != nil {
 						_ = rm.ws.SendBinary(data)
@@ -247,7 +257,6 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 				log.Printf("[TURN] 解析中继地址 %q 失败: %v", target.TurnRelayAddr, err)
 			}
 		}
-		// 兜底：WS 发当前帧，状态保持 ConnTURN
 		if rm.ws != nil {
 			return rm.ws.SendBinary(data) == nil
 		}
