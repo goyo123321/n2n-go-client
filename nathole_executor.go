@@ -99,7 +99,7 @@ func extractPortFromEndpoint(ep string) int {
 }
 
 // lastIndexByte 从字节串尾部查找指定字节。
-// 注意：如果 main.go 里已有同名函数，需要删掉此处定义。
+// ★ 注意：如果 main.go 里已有同名函数，把这里的删掉。
 func lastIndexByte(s string, c byte) int {
 	for i := len(s) - 1; i >= 0; i-- {
 		if s[i] == c {
@@ -396,4 +396,27 @@ func buildPunchProbe(virtualIP string) []byte {
 		copy(buf[4:8], ip.To4())
 	}
 	return buf
+}
+
+// ★ 新增：判断候选 IP 中是否有过 UDP 包到达。
+//
+// Android 端这个方法定义在 edge.go，PC 端没有等价文件，
+// 所以放在 nathole_executor.go 里（唯一使用它的地方）。
+func (e *Edge) hasTrafficFromAny(ips []net.IP, since int64) bool {
+	if len(ips) == 0 {
+		return false
+	}
+	e.peersMu.RLock()
+	defer e.peersMu.RUnlock()
+	for _, p := range e.peers {
+		if p.UDPAddr == nil || p.lastRecvAt < since {
+			continue
+		}
+		for _, ip := range ips {
+			if p.UDPAddr.IP.Equal(ip) {
+				return true
+			}
+		}
+	}
+	return false
 }
