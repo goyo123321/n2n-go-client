@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -42,19 +43,13 @@ type TURNClient struct {
 	edge         *Edge
 	onMessage    func([]byte, net.Addr)
 	stopCh       chan struct{}
+	stopOnce     sync.Once // ★ 新增：stopCh 只关一次
 	permissions  map[string]bool
-
-	// ★ 存活标志：网络切换后 socket 失效 → 置 false → 重连循环重建
-	alive bool
+	alive        bool
 }
 
 // ============ 辅助函数 ============
 
-// isNetworkUnreachable 检测网络不可达错误。
-//
-// 网络接口切换（WiFi ↔ 4G / 换了网段）后，已绑定旧 IP 的
-// connected socket 会永远返回 network is unreachable。
-// 遇到这种情况应该主动标记失效，让上层重建。
 func isNetworkUnreachable(err error) bool {
 	if err == nil {
 		return false
@@ -77,19 +72,12 @@ func NewTURNClient(signalingURL string, connectToken string, edge *Edge) *TURNCl
 	}
 }
 
-// IsReady 检测 TURN 是否可用。
-//
-// ★ 用 alive 标志而不是 relayConn != nil。
-//   网络切换后 markDead 把 alive 置 false，即使 relayConn 指针还在。
 func (tc *TURNClient) IsReady() bool {
 	tc.mu.RLock()
 	defer tc.mu.RUnlock()
 	return tc.alive && tc.relayConn != nil
 }
 
-// markDead 标记 TURN 失效，关闭底层连接。
-//
-// 幂等：多次调用只生效一次。
 func (tc *TURNClient) markDead(reason string) {
 	tc.mu.Lock()
 	wasAlive := tc.alive
@@ -103,9 +91,6 @@ func (tc *TURNClient) markDead(reason string) {
 	}
 	log.Printf("[TURN] 标记失效（%s），等待重建", reason)
 
-	// ★ pion/turn v4 的 Client.Close() 无返回值，不能 _ = 接收。
-	//   它会关闭内部 conn 和 allocation，relayConn 是其一部分，
-	//   会自动关闭。conn.Close() 是幂等保护。
 	if client != nil {
 		client.Close()
 	}
@@ -116,13 +101,20 @@ func (tc *TURNClient) markDead(reason string) {
 
 // ============ 请求凭证并建立分配 ============
 
-func (tc *TURNClient) FetchAndSetup(ctx context.Context) error {
-	// ★ 已有活着的分配就不重复建
+func (tc *TURNClient) FetchAndSetup(ctx context.Context) (err error) {
+	// ★ 加 recover：从 StartReconnectLoop / turn-init 两处调用，
+	//   任一路径的 panic 都不该崩穿进程
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[TURN] FetchAndSetup panic: %v\n%s", r, debug.Stack())
+			err = fmt.Errorf("panic: %v", r)
+		}
+	}()
+
 	if tc.IsReady() {
 		return nil
 	}
 
-	// wss:// → https://, ws:// → http://
 	httpBase := tc.signalingURL
 	if strings.HasPrefix(httpBase, "wss://") {
 		httpBase = "https://" + httpBase[len("wss://"):]
@@ -183,7 +175,6 @@ func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 		return fmt.Errorf("TURN server not set")
 	}
 
-	// pion/turn 的 TURNServerAddr 只接受 "host:port" 格式
 	turnAddr := srv.URL
 	turnAddr = strings.TrimPrefix(turnAddr, "turn://")
 	turnAddr = strings.TrimPrefix(turnAddr, "turns://")
@@ -193,7 +184,6 @@ func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 
 	log.Printf("[TURN] 连接 TURN 服务器: %s (user=%s)", turnAddr, srv.Username)
 
-	// ★ pion/turn v4 要求调用方提供底层 UDP conn
 	conn, err := net.ListenPacket("udp4", "0.0.0.0:0")
 	if err != nil {
 		return fmt.Errorf("listen for TURN: %w", err)
@@ -234,13 +224,22 @@ func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 	tc.mu.Unlock()
 
 	log.Printf("[TURN] 中继地址: %s", tc.relayAddr)
-	go tc.readLoop()
+
+	// ★ 用 safeGo 起 readLoop：panic 时标记失效，让重连循环重建
+	safeGo("turn-readLoop", tc.readLoop)
 	return nil
 }
 
 // ============ 收发 ============
 
 func (tc *TURNClient) readLoop() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[TURN] readLoop panic: %v\n%s", r, debug.Stack())
+			tc.markDead("readLoop panic")
+		}
+	}()
+
 	buf := make([]byte, 65535)
 	for {
 		select {
@@ -263,7 +262,6 @@ func (tc *TURNClient) readLoop() {
 				return
 			default:
 			}
-			// ★ 网络切换 → 标记失效
 			if isNetworkUnreachable(err) {
 				tc.markDead("read failed: network unreachable")
 				return
@@ -274,7 +272,15 @@ func (tc *TURNClient) readLoop() {
 		if tc.onMessage != nil && n > 0 {
 			data := make([]byte, n)
 			copy(data, buf[:n])
-			tc.onMessage(data, addr)
+			// ★ 独立 recover：即使调用方没包 recover，也不会崩穿 readLoop
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("[TURN] onMessage panic: %v\n%s", r, debug.Stack())
+					}
+				}()
+				tc.onMessage(data, addr)
+			}()
 		}
 	}
 }
@@ -287,7 +293,6 @@ func (tc *TURNClient) Send(data []byte, remoteAddr net.Addr) error {
 		return fmt.Errorf("TURN 未就绪")
 	}
 	if err := tc.ensurePermission(remoteAddr); err != nil {
-		// ★ 网络不可达 → 标记失效，触发重建
 		if isNetworkUnreachable(err) {
 			tc.markDead("CreatePermission failed: network unreachable")
 		}
@@ -300,10 +305,6 @@ func (tc *TURNClient) Send(data []byte, remoteAddr net.Addr) error {
 	return err
 }
 
-// ensurePermission 确保向 remoteAddr 的发送已被 TURN 服务器授权。
-//
-// TURN 协议（RFC 5766）要求客户端向某个对端地址发送数据前，必须先
-// 用 CreatePermission 在服务器上建立对该 IP 的权限。
 func (tc *TURNClient) ensurePermission(remoteAddr net.Addr) error {
 	udpAddr, ok := remoteAddr.(*net.UDPAddr)
 	if !ok {
@@ -335,13 +336,6 @@ func (tc *TURNClient) ensurePermission(remoteAddr net.Addr) error {
 
 // ============ 后台重连循环 ============
 
-// StartReconnectLoop 后台重连：每 30 秒检查 TURN 是否还在，不在就重建。
-//
-// 触发场景：
-//   - 网络接口切换（WiFi ↔ 4G）→ 旧 socket 绑定失效 → markDead()
-//   - TURN 服务器重启 → Send/Read 失败 → markDead()
-//
-// 重建成功后重新上报 relayAddr，让服务端广播给对端。
 func (tc *TURNClient) StartReconnectLoop() {
 	safeGo("turn-reconnect", func() {
 		ticker := time.NewTicker(30 * time.Second)
@@ -351,7 +345,6 @@ func (tc *TURNClient) StartReconnectLoop() {
 			case <-tc.stopCh:
 				return
 			case <-ticker.C:
-				// 已就绪就跳过
 				if tc.IsReady() {
 					continue
 				}
@@ -396,21 +389,19 @@ func (tc *TURNClient) GetRelayAddr() string {
 // ============ 关闭 ============
 
 func (tc *TURNClient) Close() {
-	select {
-	case <-tc.stopCh:
-	default:
+	// ★ sync.Once 保证 stopCh 只关一次：
+	//   多个 goroutine 同时调 Close 不会 panic: close of closed channel
+	tc.stopOnce.Do(func() {
 		close(tc.stopCh)
-	}
+	})
 
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 
-	// ★ pion/turn v4 的 Client.Close() 无返回值
 	if tc.client != nil {
 		tc.client.Close()
 		tc.client = nil
 	}
-	// ★ relayConn 是 net.PacketConn，Close() 返回 error
 	if tc.relayConn != nil {
 		_ = tc.relayConn.Close()
 		tc.relayConn = nil
