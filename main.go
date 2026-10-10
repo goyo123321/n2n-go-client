@@ -44,7 +44,6 @@ type Edge struct {
 	virtualCIDR string
 	roomId      string
 
-	myLanIPs     []string
 	serverSeenIP string
 
 	ws         *WSTransport
@@ -65,11 +64,11 @@ type Edge struct {
 	fallbackTimers   map[string]*time.Timer
 	fallbackTimersMu sync.Mutex
 
-	// ★ 日志节流：同一 dstIP 每 5 秒最多打一次"无匹配 peer"
+	// 日志节流：同一 dstIP 每 5 秒最多打一次"无匹配 peer"
 	lastNoPeerLog   map[string]int64
 	lastNoPeerLogMu sync.Mutex
 
-	// ★ 状态变化日志：同一 peer 状态不变时不打 TUN 转发日志
+	// 状态变化日志：同一 peer 状态不变时不打 TUN 转发日志
 	tunStateLog   map[string]ConnType
 	tunStateLogMu sync.Mutex
 
@@ -177,7 +176,6 @@ func (e *Edge) logNoPeerThrottled(dstIP string, n int) {
 	log.Printf("[TUN] 无匹配 peer，dst=%s len=%d", dstIP, n)
 }
 
-// logTunForward 状态变化才打日志：同一 peer 状态不变时静默。
 func (e *Edge) logTunForward(peerID, dstIP string, n, proto int, sent bool, state ConnType) {
 	e.tunStateLogMu.Lock()
 	prev, existed := e.tunStateLog[peerID]
@@ -225,7 +223,6 @@ func (e *Edge) scheduleFallbackTimer(peerID string) {
 		}
 		state := e.relayMgr.GetState(peerID)
 		if state != ConnUnknown {
-			// ★ P2P 状态不打日志（正常流程）
 			if state != ConnP2P {
 				log.Printf("[fallback-timer] %s 已有状态 %s，跳过降级", peerID, state)
 			}
@@ -367,9 +364,6 @@ func main() {
 	}
 	edge.natMeta = probeNAT(actualPort, servers)
 
-	edge.myLanIPs = extractLanIPs(edge.natMeta.AssistedSockets)
-	log.Printf("[LAN] 本机局域网 IP: %v", edge.myLanIPs)
-
 	ws, err := NewWSTransport(signalingURL, roomId, clientId, connectToken)
 	if err != nil {
 		log.Fatalf("连接信令失败: %v", err)
@@ -436,7 +430,7 @@ func main() {
 		}
 	}()
 
-	// ★ 启动 UDP 保活
+	// 启动 UDP 保活
 	edge.startKeepalive()
 
 	// TURN 初始化
@@ -456,7 +450,7 @@ func main() {
 		}
 	}()
 
-	// ★ 启动 TURN 后台重连循环（网络切换后自动重建）
+	// 启动 TURN 后台重连循环
 	edge.turnClient.StartReconnectLoop()
 
 	sigCh := make(chan os.Signal, 1)
@@ -492,6 +486,7 @@ func (e *Edge) Stop() {
 	}
 }
 
+// reportMetadata 上报 p2p_metadata（LAN 字段已删除）。
 func (e *Edge) reportMetadata() {
 	if e.ws == nil || e.natMeta == nil {
 		return
@@ -517,9 +512,7 @@ func (e *Edge) reportMetadata() {
 		"portsDifference":    nm.PortsDifference,
 		"regularPortsChange": nm.RegularPortsChange,
 		"behavior":           nm.Behavior,
-		"assistedSockets":    nm.AssistedSockets,
 		"p2pEndpoint":        nm.P2PEndpoint,
-		"lanIps":             e.myLanIPs,
 		"udpPort":            e.udpPort,
 		"multiExit":          nm.MultiExit,
 		"wsPublicIp":         serverSeenIP,
@@ -528,8 +521,8 @@ func (e *Edge) reportMetadata() {
 		metaPayload["publicEndpoint"] = nm.PublicEndpoint
 	}
 
-	log.Printf("[信令] 上报 p2p_metadata: natType=%s publicEndpoint=%q wsPublicIp=%q lanIps=%v udpPort=%d multiExit=%v",
-		nm.NATType, nm.PublicEndpoint, serverSeenIP, e.myLanIPs, e.udpPort, nm.MultiExit)
+	log.Printf("[信令] 上报 p2p_metadata: natType=%s publicEndpoint=%q wsPublicIp=%q udpPort=%d multiExit=%v",
+		nm.NATType, nm.PublicEndpoint, serverSeenIP, e.udpPort, nm.MultiExit)
 
 	_ = e.ws.Send(map[string]interface{}{
 		"type":    "p2p_metadata",
@@ -689,7 +682,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			log.Printf("[NAT-HOLE] 指令解析失败: %v", err)
 			return
 		}
-		// ★ 检查 target 是否还在线
 		if !e.peerExists(instr.TargetMac) {
 			log.Printf("[NAT-HOLE] 忽略指令 target=%s（peer 不在线）", instr.TargetMac)
 			return
@@ -745,11 +737,9 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		delete(e.peers, from)
 		e.peersMu.Unlock()
 		e.cancelFallbackTimer(from)
-		// ★ 清理日志节流记录
 		e.lastNoPeerLogMu.Lock()
 		delete(e.lastNoPeerLog, from)
 		e.lastNoPeerLogMu.Unlock()
-		// ★ 清理 TUN 转发日志状态
 		e.forgetTunState(from)
 	}
 }
@@ -904,7 +894,6 @@ func (e *Edge) tunReadLoop() {
 		}
 		ok := e.relayMgr.SendToPeer(target.ClientID, buf[:n], target)
 		if n >= 10 {
-			// ★ 状态变化才打
 			e.logTunForward(target.ClientID, dstIP, n, int(buf[9]), ok, state)
 		}
 		if !ok {
