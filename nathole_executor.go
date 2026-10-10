@@ -96,6 +96,9 @@ func extractPortFromEndpoint(ep string) int {
 	return port
 }
 
+// lastIndexByte 从字节串尾部查找指定字节。
+//
+// ★ 如果 main.go 里已经有同名函数，把这里的删掉。
 func lastIndexByte(s string, c byte) int {
 	for i := len(s) - 1; i >= 0; i-- {
 		if s[i] == c {
@@ -105,6 +108,7 @@ func lastIndexByte(s string, c byte) int {
 	return -1
 }
 
+// chooseScanTiers 根据本机 STUN 出口和 target 选择扫描策略。
 func (e *Edge) chooseScanTiers(targetAddr *net.UDPAddr) (tiers []int, sameStun bool, portDiff int, halfWidth int) {
 	e.mu.Lock()
 	ep := ""
@@ -281,7 +285,9 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 				}
 			}
 
-			// ★ 关键修复：只检查目标 peer，而不是同 IP 的所有 peer
+			// ★ 修复：只检查目标 peer，而不是同 IP 的所有 peer。
+			//    同 CGNAT 时，任何来自同出口 IP 的包都会让旧版
+			//    hasTrafficFromAny 误判"打洞成功"。
 			if e.hasTrafficFromTarget(instr.TargetMac, startAt) {
 				success = true
 				break
@@ -417,9 +423,11 @@ func buildPunchProbe(virtualIP string) []byte {
 
 // hasTrafficFromTarget 检查是否从指定 peer 收到过包。
 //
-// ★ 修复：替代 hasTrafficFromAny。
-// hasTrafficFromAny 只比对 IP —— 同 CGNAT 时任何来自同出口 IP 的包
-// 都会误判"打洞成功"。hasTrafficFromTarget 只看目标 peer 的 lastRecvAt。
+// ★ 与 hasTrafficFromAny 的区别：
+//   - hasTrafficFromAny 只比对 IP：同 CGNAT 时任何来自同出口 IP
+//     的包都会误判成功
+//   - hasTrafficFromTarget 只看目标 peer 的 lastRecvAt，该字段仅在
+//     notePeerCommon 匹配到该 peer 时更新
 func (e *Edge) hasTrafficFromTarget(peerID string, since int64) bool {
 	if peerID == "" {
 		return false
