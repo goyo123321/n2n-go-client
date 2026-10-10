@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/url"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -12,9 +13,9 @@ import (
 )
 
 type WSTransport struct {
-	mu      sync.Mutex
-	writeMu sync.Mutex // ★ 串行化所有写操作，gorilla/websocket 禁止并发写
-	conn    *websocket.Conn
+	mu       sync.Mutex
+	writeMu  sync.Mutex
+	conn     *websocket.Conn
 	clientId string
 
 	signalingURL string
@@ -25,7 +26,6 @@ type WSTransport struct {
 	onBinary    func([]byte)
 	onReconnect func()
 
-	// ★ 早期消息缓冲：SetHandlers 调用前收到的消息暂存
 	earlyText   []map[string]interface{}
 	earlyBinary [][]byte
 	handlersSet bool
@@ -45,16 +45,12 @@ func NewWSTransport(signalingURL, roomId, clientId, connectToken string) (*WSTra
 	if err := ws.dial(); err != nil {
 		return nil, err
 	}
-	go ws.readLoop()
+	// ★ 用 safeGo 起 readLoop，防止漏网 panic
+	safeGo("ws-readLoop", ws.readLoop)
 	return ws, nil
 }
 
-// SetHandlers 设置 onMessage / onBinary 回调，并重放缓冲消息。
-//
-// ★ 替换直接赋值 ws.onMessage = xxx 的写法。
-//   修复 "ready 消息在 handler 设置前到达被丢弃" —— 之前的代码在
-//   NewWSTransport 之后隔了 TURN 初始化、RelayManager 初始化才设置
-//   onMessage，中间几十毫秒 ready 消息被丢。
+// SetHandlers 设置回调并重放缓冲消息。
 func (ws *WSTransport) SetHandlers(
 	onMessage func(map[string]interface{}),
 	onBinary func([]byte),
@@ -72,18 +68,54 @@ func (ws *WSTransport) SetHandlers(
 	if len(textBuf) > 0 {
 		log.Printf("[WS] 重放 %d 条早期文本消息", len(textBuf))
 		for _, msg := range textBuf {
-			if onMessage != nil {
-				onMessage(msg)
-			}
+			ws.routeText(msg)
 		}
 	}
 	if len(binBuf) > 0 {
 		log.Printf("[WS] 重放 %d 条早期二进制消息", len(binBuf))
 		for _, data := range binBuf {
-			if onBinary != nil {
-				onBinary(data)
-			}
+			ws.routeBinary(data)
 		}
+	}
+}
+
+// routeText 安全分发文本消息（handler panic 只记日志）。
+func (ws *WSTransport) routeText(msg map[string]interface{}) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[WS] onMessage panic: %v\n%s", r, debug.Stack())
+		}
+	}()
+	ws.mu.Lock()
+	ready := ws.handlersSet && ws.onMessage != nil
+	handler := ws.onMessage
+	if !ready {
+		ws.earlyText = append(ws.earlyText, msg)
+	}
+	ws.mu.Unlock()
+	if ready {
+		handler(msg)
+	}
+}
+
+// routeBinary 安全分发二进制消息。
+func (ws *WSTransport) routeBinary(data []byte) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[WS] onBinary panic: %v\n%s", r, debug.Stack())
+		}
+	}()
+	ws.mu.Lock()
+	ready := ws.handlersSet && ws.onBinary != nil
+	handler := ws.onBinary
+	if !ready {
+		cp := make([]byte, len(data))
+		copy(cp, data)
+		ws.earlyBinary = append(ws.earlyBinary, cp)
+	}
+	ws.mu.Unlock()
+	if ready {
+		handler(data)
 	}
 }
 
@@ -119,8 +151,13 @@ func maskToken(u string) string {
 }
 
 // readLoop 断线自动重连（指数退避，最长 30s）。
-// ★ 未设 handler 时把消息暂存到 earlyText/earlyBinary。
 func (ws *WSTransport) readLoop() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[WS] readLoop panic: %v\n%s", r, debug.Stack())
+		}
+	}()
+
 	backoff := 1 * time.Second
 	const maxBackoff = 30 * time.Second
 
@@ -178,32 +215,13 @@ func (ws *WSTransport) readLoop() {
 			if err := json.Unmarshal(data, &msg); err != nil {
 				continue
 			}
-			ws.mu.Lock()
-			if ws.handlersSet && ws.onMessage != nil {
-				h := ws.onMessage
-				ws.mu.Unlock()
-				h(msg)
-			} else {
-				ws.earlyText = append(ws.earlyText, msg)
-				ws.mu.Unlock()
-			}
+			ws.routeText(msg)
 		} else if msgType == websocket.BinaryMessage {
-			ws.mu.Lock()
-			if ws.handlersSet && ws.onBinary != nil {
-				h := ws.onBinary
-				ws.mu.Unlock()
-				h(data)
-			} else {
-				cp := make([]byte, len(data))
-				copy(cp, data)
-				ws.earlyBinary = append(ws.earlyBinary, cp)
-				ws.mu.Unlock()
-			}
+			ws.routeBinary(data)
 		}
 	}
 }
 
-// Send 发文本消息。writeMu 串行化，避免与 StartHeartbeat 并发写。
 func (ws *WSTransport) Send(msg map[string]interface{}) error {
 	data, _ := json.Marshal(msg)
 
@@ -214,7 +232,7 @@ func (ws *WSTransport) Send(msg map[string]interface{}) error {
 	conn := ws.conn
 	ws.mu.Unlock()
 	if conn == nil {
-		return nil // 断线期间静默丢弃；重连后由 onReconnect 重新上报
+		return nil
 	}
 	return conn.WriteMessage(websocket.TextMessage, data)
 }
@@ -233,15 +251,21 @@ func (ws *WSTransport) SendBinary(data []byte) error {
 }
 
 func (ws *WSTransport) StartHeartbeat(interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	go func() {
-		for range ticker.C {
-			_ = ws.Send(map[string]interface{}{
-				"type": "ping",
-				"ts":   time.Now().Unix(),
-			})
+	safeGo("ws-heartbeat", func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ws.closed:
+				return
+			case <-ticker.C:
+				_ = ws.Send(map[string]interface{}{
+					"type": "ping",
+					"ts":   time.Now().Unix(),
+				})
+			}
 		}
-	}()
+	})
 }
 
 func (ws *WSTransport) Close() error {
