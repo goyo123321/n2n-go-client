@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,12 +30,13 @@ type PeerInfo struct {
 	VirtualIP     string
 	PubIP         string
 	PubPort       int
-	NATType       string // ★ 新增：对端上报的 natType
+	NATType       string
 	TurnRelayAddr string
 	UDPAddr       *net.UDPAddr
 	lastRecvAt    int64
 	loggedReady   bool
 	hasRealData   bool
+	probeReplied  bool
 }
 
 type Edge struct {
@@ -380,7 +380,23 @@ func main() {
 
 	edge.turnClient = NewTURNClient(signalingURL, connectToken, edge)
 	edge.turnClient.onMessage = func(data []byte, addr net.Addr) {
-		edge.enqueueTUN(data)
+		ua, ok := addr.(*net.UDPAddr)
+		if !ok {
+			edge.enqueueTUN(data)
+			return
+		}
+		// probe 判定（首 4 字节 "N2NP"）
+		if len(data) >= 4 &&
+			data[0] == 'N' && data[1] == '2' && data[2] == 'N' && data[3] == 'P' {
+			edge.notePeerProbeTURN(ua)
+			return
+		}
+		// 真实 IPv4 数据帧
+		if len(data) > 0 && data[0]>>4 == 4 {
+			edge.notePeerTrafficTURN(ua)
+			edge.enqueueTUN(data)
+			return
+		}
 	}
 
 	edge.relayMgr = NewRelayManager(ws, edge.turnClient, edge)
@@ -393,7 +409,6 @@ func main() {
 		},
 	)
 
-	// ★ UDP 读循环用 safeGo 包裹
 	safeGo("udpReadLoop", func() {
 		buf := make([]byte, 65535)
 		for {
@@ -421,7 +436,6 @@ func main() {
 		}
 	})
 
-	// ★ TUN 写循环用 safeGo
 	safeGo("tunWriteLoop", func() {
 		for data := range edge.tunWriteCh {
 			if edge.tun != nil {
@@ -430,10 +444,8 @@ func main() {
 		}
 	})
 
-	// 启动 UDP 保活
 	edge.startKeepalive()
 
-	// ★ TURN 初始化用 safeGo
 	safeGo("turn-init", func() {
 		time.Sleep(2 * time.Second)
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -485,9 +497,6 @@ func (e *Edge) Stop() {
 	}
 }
 
-// reportMetadata 上报 p2p_metadata。
-//
-// ★ 改动：删 udpPort / wsPublicIp（服务端不读）。
 func (e *Edge) reportMetadata() {
 	if e.ws == nil || e.natMeta == nil {
 		return
@@ -580,10 +589,9 @@ func (e *Edge) logPeerReady(peerID string) {
 }
 
 func (e *Edge) handleSignaling(msg map[string]interface{}) {
-	// ★ 加 recover：WS 读循环 panic 会顺着 readLoop 炸穿
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("[信令] handleSignaling panic: %v\n%s", r, debug.Stack())
+			log.Printf("[信令] handleSignaling panic: %v", r)
 		}
 	}()
 
@@ -631,11 +639,11 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 					pubPort = int(f)
 				}
 				relayAddr, _ := pm["turnRelayAddr"].(string)
-				natType, _ := pm["natType"].(string) // ★ 新增
+				natType, _ := pm["natType"].(string)
 				if pid == "" || pip == "" {
 					continue
 				}
-				e.registerPeer(pid, pip, pubIP, pubPort, natType) // ★ 加参数
+				e.registerPeer(pid, pip, pubIP, pubPort, natType)
 				if relayAddr != "" {
 					e.peersMu.Lock()
 					if pi, ok := e.peers[pid]; ok {
@@ -661,14 +669,14 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			pubPort = int(f)
 		}
 		relayAddr, _ := payload["turnRelayAddr"].(string)
-		natType, _ := payload["natType"].(string) // ★ 新增
+		natType, _ := payload["natType"].(string)
 		if from != "" && pip != "" {
 			e.peersMu.RLock()
 			p, exists := e.peers[from]
 			alreadyReady := exists && p.loggedReady
 			e.peersMu.RUnlock()
 
-			e.registerPeer(from, pip, pubIP, pubPort, natType) // ★ 加参数
+			e.registerPeer(from, pip, pubIP, pubPort, natType)
 			if relayAddr != "" {
 				e.peersMu.Lock()
 				if pi, ok := e.peers[from]; ok {
@@ -783,7 +791,7 @@ func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natTyp
 		if udpAddr != nil {
 			p.UDPAddr = udpAddr
 		}
-		if natType != "" { // ★ 新增
+		if natType != "" {
 			p.NATType = natType
 		}
 	} else {
@@ -793,7 +801,7 @@ func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natTyp
 			PubIP:     pubIP,
 			PubPort:   pubPort,
 			UDPAddr:   udpAddr,
-			NATType:   natType, // ★ 新增
+			NATType:   natType,
 		}
 	}
 	e.peersMu.Unlock()
@@ -868,7 +876,7 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 func (e *Edge) tunReadLoop() {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("[TUN] tunReadLoop panic: %v\n%s", r, debug.Stack())
+			log.Printf("[TUN] tunReadLoop panic: %v", r)
 		}
 	}()
 
@@ -930,15 +938,36 @@ func (e *Edge) enqueueTUN(data []byte) {
 	}
 }
 
+// ============ peer 探测处理 ============
+
 func (e *Edge) notePeerProbe(addr *net.UDPAddr) {
-	e.notePeerCommon(addr, false)
+	e.notePeerCommon(addr, false, false)
+}
+
+func (e *Edge) notePeerProbeTURN(addr *net.UDPAddr) {
+	e.notePeerCommon(addr, false, true)
 }
 
 func (e *Edge) notePeerTraffic(addr *net.UDPAddr) {
-	e.notePeerCommon(addr, true)
+	e.notePeerCommon(addr, true, false)
 }
 
-func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool) {
+func (e *Edge) notePeerTrafficTURN(addr *net.UDPAddr) {
+	e.notePeerCommon(addr, true, true)
+}
+
+// notePeerCommon 处理来自对端的 UDP 包。
+//
+// viaTURN：
+//   - false：从本地 UDP socket 收到 → 回包走本地 socket
+//   - true：从 TURN 中继收到 → 回包走 TURN（按原路）
+//
+// 首次收到 probe 的处理顺序：
+//   1. 立即上报 P2P（MarkP2P）
+//   2. 并发启动 5 轮 probe 回包（每 100ms 一次）
+//
+// 后续收到的 probe 只刷新 lastRecvAt，不再重复回包。
+func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool) {
 	now := time.Now().UnixMilli()
 
 	e.peersMu.Lock()
@@ -968,51 +997,80 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool) {
 	best.UDPAddr = &net.UDPAddr{IP: addr.IP, Port: addr.Port}
 	clientID := best.ClientID
 	ip := addr.IP.String()
+
+	needReply := false
+	if !isRealData && !best.probeReplied {
+		best.probeReplied = true
+		needReply = true
+	}
 	e.peersMu.Unlock()
 
 	if e.relayMgr == nil {
 		return
 	}
 
-	if !isRealData {
-		e.sendProbeTo(addr)
-	}
-
-	state := e.relayMgr.GetState(clientID)
 	if isRealData {
+		state := e.relayMgr.GetState(clientID)
 		if state != ConnP2P {
 			log.Printf("[P2P] 从 %s (%s) 收到真实数据帧，升级为 P2P", clientID, ip)
 			e.relayMgr.MarkP2P(clientID)
 		}
 		return
 	}
-	if state != ConnP2P {
-		log.Printf("[P2P] 从 %s (%s) 收到打洞探测，UDP 通道可用，升级为 P2P", clientID, ip)
-		e.relayMgr.MarkP2P(clientID)
-	}
-}
 
-func (e *Edge) sendProbeTo(addr *net.UDPAddr) {
-	if e.udpConn == nil || addr == nil {
+	if !needReply {
 		return
 	}
-	target := &net.UDPAddr{IP: addr.IP, Port: addr.Port}
-	vip := e.virtualIP
 
-	safeGo("probe-reply", func() {
-		probe := buildPunchProbe(vip)
+	// ★ 首次收到该 peer 的 probe：
+	//    1. 立即上报 P2P
+	//    2. 并发回 5 轮（每 100ms 一次）
+	if e.relayMgr.GetState(clientID) != ConnP2P {
+		log.Printf("[P2P] 从 %s (%s) 收到打洞探测，上报 P2P 并回 5 轮", clientID, ip)
+		e.relayMgr.MarkP2P(clientID)
+	}
+
+	safeGo("probe-reply-5", func() {
+		probe := buildPunchProbe(e.virtualIP)
 		for i := 0; i < 5; i++ {
 			select {
 			case <-e.doneCh:
 				return
 			default:
 			}
-			if _, err := e.udpConn.WriteToUDP(probe, target); err != nil {
-				return
+			e.writeProbe(addr, probe, viaTURN)
+			if i < 4 {
+				time.Sleep(100 * time.Millisecond)
 			}
-			time.Sleep(100 * time.Millisecond)
 		}
 	})
+}
+
+// writeProbe 按原路写一个 probe 包。
+func (e *Edge) writeProbe(addr *net.UDPAddr, probe []byte, viaTURN bool) {
+	if addr == nil {
+		return
+	}
+	if viaTURN {
+		if e.turnClient == nil || !e.turnClient.IsReady() {
+			return
+		}
+		_ = e.turnClient.Send(probe, addr)
+		return
+	}
+	if e.udpConn == nil {
+		return
+	}
+	_, _ = e.udpConn.WriteToUDP(probe, addr)
+}
+
+// sendProbeTo 保留兼容（当前无调用方）。
+func (e *Edge) sendProbeTo(addr *net.UDPAddr) {
+	if e.udpConn == nil || addr == nil {
+		return
+	}
+	probe := buildPunchProbe(e.virtualIP)
+	e.writeProbe(addr, probe, false)
 }
 
 // ============ 环境变量 / CSV ============
