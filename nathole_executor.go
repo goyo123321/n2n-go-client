@@ -55,7 +55,7 @@ const (
 
 const maxConsecutiveFails = 5
 
-var probePrefix = []byte{0x4E, 0x32, 0x4E, 0x50} // "N2NP"
+var probePrefix = []byte{0x4E, 0x32, 0x4E, 0x50}
 
 var (
 	natHoleActiveMu sync.Mutex
@@ -67,8 +67,6 @@ func init() {
 	natHoleActive = make(map[string]bool)
 	failCounts = make(map[string]int)
 }
-
-// ============ 扫描分级 ============
 
 var fullScanTiers = []int{3, 10, 20, 30, 60, 100, 300, 1000, 3000, 10000}
 
@@ -98,8 +96,6 @@ func extractPortFromEndpoint(ep string) int {
 	return port
 }
 
-// lastIndexByte 从字节串尾部查找指定字节。
-// ★ 注意：如果 main.go 里已有同名函数，把这里的删掉。
 func lastIndexByte(s string, c byte) int {
 	for i := len(s) - 1; i >= 0; i-- {
 		if s[i] == c {
@@ -109,7 +105,6 @@ func lastIndexByte(s string, c byte) int {
 	return -1
 }
 
-// chooseScanTiers 根据本机 STUN 出口和 target 选择扫描策略。
 func (e *Edge) chooseScanTiers(targetAddr *net.UDPAddr) (tiers []int, sameStun bool, portDiff int, halfWidth int) {
 	e.mu.Lock()
 	ep := ""
@@ -210,12 +205,9 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 	)
 
 	var assistedTargets []*net.UDPAddr
-	var publicIPs []net.IP
-	publicIPs = append(publicIPs, targetAddr.IP)
 	for _, ep := range instr.TargetAssistedEndpoints {
 		if addr := parseSockAddr(ep); addr != nil {
 			assistedTargets = append(assistedTargets, addr)
-			publicIPs = append(publicIPs, addr.IP)
 		}
 	}
 
@@ -242,6 +234,14 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 	receiverPort := targetAddr.Port
 
 	for _, half := range tiers {
+		select {
+		case <-e.doneCh:
+			res.State = PunchStateFailed
+			res.Detail = "aborted: edge stopped"
+			return res
+		default:
+		}
+
 		var tierTargets []*net.UDPAddr
 		for port := receiverPort - half; port <= receiverPort+half; port++ {
 			if port < 1 || port > 65535 {
@@ -267,16 +267,33 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 
 		success := false
 		for r := 0; r < rounds; r++ {
+			select {
+			case <-e.doneCh:
+				res.State = PunchStateFailed
+				res.Detail = "aborted: edge stopped"
+				return res
+			default:
+			}
+
 			for _, t := range tierTargets {
 				if _, err := e.udpConn.WriteToUDP(probe, t); err == nil {
 					attempts++
 				}
 			}
-			if e.hasTrafficFromAny(publicIPs, startAt) {
+
+			// ★ 关键修复：只检查目标 peer，而不是同 IP 的所有 peer
+			if e.hasTrafficFromTarget(instr.TargetMac, startAt) {
 				success = true
 				break
 			}
-			time.Sleep(100 * time.Millisecond)
+
+			select {
+			case <-e.doneCh:
+				res.State = PunchStateFailed
+				res.Detail = "aborted: edge stopped"
+				return res
+			case <-time.After(100 * time.Millisecond):
+			}
 		}
 
 		if success {
@@ -398,25 +415,20 @@ func buildPunchProbe(virtualIP string) []byte {
 	return buf
 }
 
-// ★ 新增：判断候选 IP 中是否有过 UDP 包到达。
+// hasTrafficFromTarget 检查是否从指定 peer 收到过包。
 //
-// Android 端这个方法定义在 edge.go，PC 端没有等价文件，
-// 所以放在 nathole_executor.go 里（唯一使用它的地方）。
-func (e *Edge) hasTrafficFromAny(ips []net.IP, since int64) bool {
-	if len(ips) == 0 {
+// ★ 修复：替代 hasTrafficFromAny。
+// hasTrafficFromAny 只比对 IP —— 同 CGNAT 时任何来自同出口 IP 的包
+// 都会误判"打洞成功"。hasTrafficFromTarget 只看目标 peer 的 lastRecvAt。
+func (e *Edge) hasTrafficFromTarget(peerID string, since int64) bool {
+	if peerID == "" {
 		return false
 	}
 	e.peersMu.RLock()
 	defer e.peersMu.RUnlock()
-	for _, p := range e.peers {
-		if p.UDPAddr == nil || p.lastRecvAt < since {
-			continue
-		}
-		for _, ip := range ips {
-			if p.UDPAddr.IP.Equal(ip) {
-				return true
-			}
-		}
+	p := e.peers[peerID]
+	if p == nil || p.UDPAddr == nil {
+		return false
 	}
-	return false
+	return p.lastRecvAt >= since
 }
