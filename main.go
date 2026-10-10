@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -72,6 +73,8 @@ type Edge struct {
 
 	tunStateLog   map[string]ConnType
 	tunStateLogMu sync.Mutex
+
+	lastMetadataReportAt int64
 
 	doneCh  chan struct{}
 	closeMu sync.Mutex
@@ -223,9 +226,6 @@ func (e *Edge) scheduleFallbackTimer(peerID string) {
 		}
 		state := e.relayMgr.GetState(peerID)
 		if state != ConnUnknown {
-			if state != ConnP2P {
-				log.Printf("[fallback-timer] %s 已有状态 %s，跳过降级", peerID, state)
-			}
 			return
 		}
 		log.Printf("[fallback-timer] %s 8s 内未收到打洞指令，主动降级", peerID)
@@ -424,10 +424,22 @@ func main() {
 			if n < 4 {
 				continue
 			}
+
+			// STUN Binding Response
+			if buf[0] == 0x01 && buf[1] == 0x01 {
+				if ip, port, ok := parseSTUNResponse(buf[:n]); ok {
+					edge.addAssistedEndpoint(ip, port)
+				}
+				continue
+			}
+
+			// N2NP probe
 			if buf[0] == 'N' && buf[1] == '2' && buf[2] == 'N' && buf[3] == 'P' {
 				edge.notePeerProbe(addr)
 				continue
 			}
+
+			// IPv4 数据帧
 			if buf[0]>>4 == 4 {
 				edge.notePeerTraffic(addr)
 				edge.enqueueTUN(buf[:n])
@@ -531,8 +543,8 @@ func (e *Edge) reportMetadata() {
 		metaPayload["assistedEndpoints"] = nm.AllEndpoints
 	}
 
-	log.Printf("[信令] 上报 p2p_metadata: natType=%s publicEndpoint=%q endpoints=%d multiExit=%v",
-		nm.NATType, nm.PublicEndpoint, len(nm.AllEndpoints), nm.MultiExit)
+	log.Printf("[信令] 上报 p2p_metadata: natType=%s publicEndpoint=%q multiExit=%v assisted=%d",
+		nm.NATType, nm.PublicEndpoint, nm.MultiExit, len(nm.AllEndpoints))
 
 	_ = e.ws.Send(map[string]interface{}{
 		"type":    "p2p_metadata",
@@ -600,6 +612,27 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 	t, _ := msg["type"].(string)
 	from, _ := msg["from"].(string)
 
+	if t == "_reconnected" {
+		log.Printf("[信令] WebSocket 重连成功，重新上报元数据")
+
+		natHoleActiveMu.Lock()
+		count := len(failCounts)
+		if count > 0 {
+			failCounts = make(map[string]int)
+		}
+		natHoleActiveMu.Unlock()
+		if count > 0 {
+			log.Printf("[NAT-HOLE] WS 重连，清空 %d 个 peer 的失败计数", count)
+		}
+
+		if e.relayMgr != nil {
+			e.relayMgr.ClearAll()
+		}
+
+		e.reportMetadata()
+		return
+	}
+
 	switch t {
 	case "ready":
 		payload, _ := msg["payload"].(map[string]interface{})
@@ -642,6 +675,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 				}
 				relayAddr, _ := pm["turnRelayAddr"].(string)
 				natType, _ := pm["natType"].(string)
+
 				var assisted []string
 				if raw, ok := pm["assistedEndpoints"].([]interface{}); ok {
 					for _, v := range raw {
@@ -650,9 +684,13 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 						}
 					}
 				}
+
 				if pid == "" || pip == "" {
 					continue
 				}
+
+				e.maybeResetFailCountForPeer(pid, pubIP, pubPort)
+
 				e.registerPeer(pid, pip, pubIP, pubPort, natType, assisted)
 				if relayAddr != "" {
 					e.peersMu.Lock()
@@ -680,6 +718,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		}
 		relayAddr, _ := payload["turnRelayAddr"].(string)
 		natType, _ := payload["natType"].(string)
+
 		var assisted []string
 		if raw, ok := payload["assistedEndpoints"].([]interface{}); ok {
 			for _, v := range raw {
@@ -688,11 +727,14 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 				}
 			}
 		}
+
 		if from != "" && pip != "" {
 			e.peersMu.RLock()
 			p, exists := e.peers[from]
 			alreadyReady := exists && p.loggedReady
 			e.peersMu.RUnlock()
+
+			e.maybeResetFailCountForPeer(from, pubIP, pubPort)
 
 			e.registerPeer(from, pip, pubIP, pubPort, natType, assisted)
 			if relayAddr != "" {
@@ -767,15 +809,98 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 
 	case "left":
 		log.Printf("[信令] 节点离开: %s", from)
+
+		if e.relayMgr != nil {
+			e.relayMgr.ClearPeer(from)
+		}
+
+		natHoleActiveMu.Lock()
+		delete(failCounts, from)
+		delete(natHoleActive, from)
+		natHoleActiveMu.Unlock()
+
 		e.peersMu.Lock()
 		delete(e.peers, from)
 		e.peersMu.Unlock()
+
 		e.cancelFallbackTimer(from)
 		e.lastNoPeerLogMu.Lock()
 		delete(e.lastNoPeerLog, from)
 		e.lastNoPeerLogMu.Unlock()
 		e.forgetTunState(from)
 	}
+}
+
+func (e *Edge) maybeResetFailCountForPeer(peerID, newPubIP string, newPubPort int) {
+	if peerID == "" || newPubIP == "" || newPubPort <= 0 {
+		return
+	}
+
+	e.peersMu.RLock()
+	oldPubIP := ""
+	oldPubPort := 0
+	if p, ok := e.peers[peerID]; ok {
+		oldPubIP = p.PubIP
+		oldPubPort = p.PubPort
+	}
+	e.peersMu.RUnlock()
+
+	if oldPubIP == "" || (oldPubIP == newPubIP && oldPubPort == newPubPort) {
+		return
+	}
+
+	natHoleActiveMu.Lock()
+	hadCount := failCounts[peerID]
+	delete(failCounts, peerID)
+	natHoleActiveMu.Unlock()
+
+	if e.relayMgr != nil {
+		e.relayMgr.ClearPeer(peerID)
+	}
+
+	log.Printf("[NAT-HOLE] %s 出口变化 %s:%d → %s:%d，重置失败计数 (was=%d)",
+		peerID, oldPubIP, oldPubPort, newPubIP, newPubPort, hadCount)
+}
+
+func (e *Edge) maybeResetOwnFailCounts(newEndpoint string) {
+	if newEndpoint == "" {
+		return
+	}
+
+	newIP := extractIPFromEndpoint(newEndpoint)
+	if newIP == "" {
+		return
+	}
+
+	e.mu.Lock()
+	oldEndpoint := ""
+	if e.natMeta != nil {
+		oldEndpoint = e.natMeta.PublicEndpoint
+	}
+	e.mu.Unlock()
+
+	oldIP := extractIPFromEndpoint(oldEndpoint)
+
+	if oldIP == "" || oldIP == newIP {
+		return
+	}
+
+	e.mu.Lock()
+	if e.natMeta != nil {
+		e.natMeta.PublicEndpoint = newEndpoint
+		e.natMeta.P2PEndpoint = newEndpoint
+	}
+	e.mu.Unlock()
+
+	natHoleActiveMu.Lock()
+	count := len(failCounts)
+	if count > 0 {
+		failCounts = make(map[string]int)
+	}
+	natHoleActiveMu.Unlock()
+
+	log.Printf("[NAT-HOLE] 本机出口 IP 变化 %s → %s，重置所有失败计数 (count=%d)",
+		oldIP, newIP, count)
 }
 
 func (e *Edge) peerExists(peerID string) bool {
@@ -850,15 +975,11 @@ func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 		if udpAddr != nil {
 			p.UDPAddr = udpAddr
 		}
-		if len(instr.TargetAssistedEndpoints) > 0 {
-			p.AssistedEndpoints = instr.TargetAssistedEndpoints
-		}
 	} else {
 		e.peers[instr.TargetMac] = &PeerInfo{
-			ClientID:          instr.TargetMac,
-			VirtualIP:         instr.TargetVirtualIp,
-			UDPAddr:           udpAddr,
-			AssistedEndpoints: instr.TargetAssistedEndpoints,
+			ClientID:  instr.TargetMac,
+			VirtualIP: instr.TargetVirtualIp,
+			UDPAddr:   udpAddr,
 		}
 	}
 }
@@ -1081,6 +1202,50 @@ func (e *Edge) sendProbeTo(addr *net.UDPAddr) {
 	}
 	probe := buildPunchProbe(e.virtualIP)
 	e.writeProbe(addr, probe, false)
+}
+
+// ============ 多 STUN 端点收集 ============
+
+func (e *Edge) addAssistedEndpoint(ip string, port int) {
+	if ip == "" || port <= 0 {
+		return
+	}
+	ep := net.JoinHostPort(ip, strconv.Itoa(port))
+
+	e.mu.Lock()
+	if e.natMeta == nil {
+		e.mu.Unlock()
+		return
+	}
+	for _, existing := range e.natMeta.AllEndpoints {
+		if existing == ep {
+			e.mu.Unlock()
+			return
+		}
+	}
+	if len(e.natMeta.AllEndpoints) >= 5 {
+		e.natMeta.AllEndpoints = e.natMeta.AllEndpoints[1:]
+	}
+	e.natMeta.AllEndpoints = append(e.natMeta.AllEndpoints, ep)
+	count := len(e.natMeta.AllEndpoints)
+	e.mu.Unlock()
+
+	e.maybeResetOwnFailCounts(ep)
+
+	log.Printf("[NAT] +assisted: %s (total=%d)", ep, count)
+	e.reportMetadataThrottled()
+}
+
+func (e *Edge) reportMetadataThrottled() {
+	now := time.Now().UnixMilli()
+	last := atomic.LoadInt64(&e.lastMetadataReportAt)
+	if now-last < 30000 {
+		return
+	}
+	if !atomic.CompareAndSwapInt64(&e.lastMetadataReportAt, last, now) {
+		return
+	}
+	e.reportMetadata()
 }
 
 // ============ 环境变量 / CSV ============
