@@ -2,14 +2,13 @@
 
 跨平台 P2P VPN 客户端，配合 [edge-signal](https://github.com/goyo123321/edge-signal) 使用。
 
-基于 TUN 虚拟网卡，通过 Cloudflare Workers 信令服务器建立 **LAN 直连 / P2P 直连 / TURN 中继 / WebSocket 中继** 四级降级连接，实现异地组网。
+基于 TUN 虚拟网卡，通过 Cloudflare Workers 信令服务器建立 **P2P 直连 / TURN 中继 / WebSocket 中继** 三级降级连接，实现异地组网。
 
 ## ✨ 特性
 
 - **跨平台** — Linux / macOS / Windows 全支持
 - **TUN 虚拟网卡** — 内核原生 TCP/IP 栈，性能高
-- **四级降级** — `LAN → P2P → TURN → WS`，连接永远可用
-- **同 LAN 直连** — 同子网时用局域网 IP，延迟 < 5ms
+- **三级降级** — `P2P → TURN → WS`，连接永远可用
 - **P2P 直连** — STUN 探测 + NAT 打洞，延迟低至 5ms
 - **CGNAT hairpin** — 同 STUN 出口 IP 时尝试端口扫描 + probe 回发
 - **UDP 保活** — 每 5 秒刷新 STUN 映射，防止 CGNAT 端口漂移
@@ -41,16 +40,14 @@
 └──────────────────────────────────────────┘
 ```
 
-## 📡 四级降级链路
+## 📡 三级降级链路
 
 ```
-优先级 1: LAN 直连        ← 最优，延迟最低（同子网）
-   ↓ 不同子网
-优先级 2: P2P 直连        ← 打洞成功，含 CGNAT hairpin
+优先级 1: P2P 直连        ← 打洞成功，含 CGNAT hairpin
    ↓ 打洞失败
-优先级 3: TURN 中继       ← 专业 UDP 中继，不消耗 Worker
+优先级 2: TURN 中继       ← 专业 UDP 中继，不消耗 Worker
    ↓ TURN 不可用/失败
-优先级 4: WS 中继         ← 最后兜底，走 Worker，消耗配额
+优先级 3: WS 中继         ← 最后兜底，走 Worker，消耗配额
 ```
 
 **每对 peer 独立决策**：A↔B 可能走 P2P，A↔C 走 TURN，A↔D 走 WS，互不影响。
@@ -183,12 +180,11 @@ n2n-go-client v1.2.0 启动
 [P2P] UDP 监听端口 54321
 [NAT] STUN 74.125.250.129:19302 → 120.239.134.13:19190
 [NAT] HardNAT（对称），ports_diff=0 pub=120.239.134.13:19190
-[LAN] 本机局域网 IP: [192.168.10.2]
 已连接信令，Client ID: pc-a-1704067200，节点名: A的电脑
 [WS] 重放 1 条早期文本消息
 分配虚拟 IP: 10.64.0.2（网段 10.64.0.0/24）
 [信令] 服务端看到的本机出口 IP: 120.229.199.61（WS/TCP 出口，仅参考）
-[信令] 上报 p2p_metadata: natType=HardNAT publicEndpoint="120.239.134.13:19190" wsPublicIp="120.229.199.61" lanIps=[192.168.10.2] udpPort=54321 multiExit=true
+[信令] 上报 p2p_metadata: natType=HardNAT publicEndpoint="120.239.134.13:19190" multiExit=true
 [TUN] n2n0 已启动，IP: 10.64.0.2/24，网段: 10.64.0.0/24
 [TURN] 获取到 custom TURN 服务器: turn:xxx:3478
 [TURN] 中继地址: 5.6.7.8:50000
@@ -211,13 +207,12 @@ n2n-go-client v1.2.0 启动
   公网地址  : 1.2.3.4:54322
 ==========================================
 
-[信令] joined: from=mac-b vip=10.64.0.3 pub=1.2.3.4:54322
-[NAT-HOLE] 开始打洞 role=0 target=1.2.3.4:54322 rung=0 mode=0 ttl=7 assisted=0 lan=1
-[NAT-HOLE] LAN 候选 1 个（阶段 1）
-[NAT-HOLE] 公网候选 7 个（阶段 2）
+[信令] joined: from=mac-b vip=10.64.0.3 pub=1.2.3.4:54322 nat=HardNAT
+[NAT-HOLE] 开始打洞 role=0 target=1.2.3.4:54322 rung=0 mode=0 ttl=7
+[NAT-HOLE] 模式：不同 STUN IP，全端口扫描，分级 [3 10 20 30 60 100 300 1000 3000 10000]
 [P2P] 从 mac-b (1.2.3.4) 收到打洞探测，UDP 通道可用，升级为 P2P
 [连接] mac-b → P2P 直连（prev=turn）
-[NAT-HOLE] ✅ 成功 (公网) role=0 target=1.2.3.4 attempts=17
+[NAT-HOLE] ✅ 成功 role=0 target=1.2.3.4 attempts=17
 ```
 
 **打洞失败时**：
@@ -334,7 +329,7 @@ Actions → Build n2n-go Client → Run workflow
 n2n-go-client/
 ├── main.go                       # 主程序（含 UDP 保活 + P2P 通道保活）
 ├── ws_transport.go               # WebSocket 传输层（断线重连 + 早期消息缓冲）
-├── relay_fallback.go             # 四级降级管理器
+├── relay_fallback.go             # 三级降级管理器
 ├── turn_client.go                # TURN 客户端
 ├── nat_probe.go                  # NAT 类型探测
 ├── nathole_executor.go           # 打洞指令执行（分阶段扫描）
@@ -411,7 +406,6 @@ Android 内核**不允许普通 App 创建 TUN 网卡**。Termux 里运行客户
 
 | 连接方式 | 延迟 | 消耗 |
 |:---|:---|:---|
-| 同局域网 | < 5ms | 无 |
 | P2P 直连（跨 NAT） | 10~50ms | 无 |
 | **CGNAT hairpin** | **10~30ms** | **无** |
 | **TURN 中继** | **30~100ms** | **Cloudflare TURN 配额** |
@@ -503,7 +497,7 @@ curl -v --max-time 5 http://10.64.0.3:8080/
 [NAT] ⚠️ WS/STUN 出口不一致：WS=120.229.199.61 STUN=120.239.134.13 —— CGNAT 池化，打洞大概率失败
 ```
 
-**这是网络限制，不是 bug**。客户端会自动按 LAN → hairpin → TURN → WS 降级。
+**这是网络限制，不是 bug**。客户端会自动按 hairpin → TURN → WS 降级。
 
 **保活生效后**，两端 UDP 出口端口保持稳定，hairpin 成功率显著提升。
 
@@ -550,14 +544,16 @@ cat ~/.n2n-go/client_id
 
 **A 的 probe 命中了 B，但 B 回发给 A 的 probe 丢包了**。
 
-**修复**：客户端 `sendProbeTo` 应**连发 5 次**（每次 100ms），覆盖瞬时丢包。检查客户端版本。
+**修复**：
+- 客户端改用 `hasTrafficFromTarget`（只看目标 peer 的回包）
+- 服务端 `coordinator.js` 改用 `bothSucceeded`（双方都 state=3 才认为成功）
 
 ### Q: P2P 建立后过一段时间断了？
 
 **CGNAT 映射或会话被回收**。检查：
 
 1. **日志里 `[Keepalive] 启动` 有没有？**
-   - 没有 → `startKeepalive()` 没被调用（AAR / 二进制太旧）
+   - 没有 → `startKeepalive()` 没被调用（二进制太旧）
 2. **端口是不是又漂移了？**
    - `[信令] 上报 p2p_metadata` 的 `publicEndpoint` 变了 → 保活无效
    - STUN 服务器被封 → 换国内 STUN
