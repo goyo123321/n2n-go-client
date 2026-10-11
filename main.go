@@ -91,7 +91,7 @@ const keepaliveInterval = 5 * time.Second
 var keepaliveServers = []string{
 	"74.125.250.129:19302",
 	"162.159.207.0:3478",
-	"74.125.204.127:19302",
+	"stun.miwifi.com:3478",
 }
 
 func buildSTUNBindingRequest() []byte {
@@ -166,15 +166,19 @@ func (e *Edge) startKeepalive() {
 
 // ============ 日志节流 ============
 
+// logNoPeerThrottled 5 秒内只打一条"无匹配 peer"日志。
+//
+// 使用全局键（__global__）而非按 dstIP 分桶——避免 250 个不同 IP
+// 各打一条日志（网段扫描场景）。
 func (e *Edge) logNoPeerThrottled(dstIP string, n int) {
 	now := time.Now().UnixMilli()
 	e.lastNoPeerLogMu.Lock()
-	last := e.lastNoPeerLog[dstIP]
+	last := e.lastNoPeerLog["__global__"]
 	if now-last < 5000 {
 		e.lastNoPeerLogMu.Unlock()
 		return
 	}
-	e.lastNoPeerLog[dstIP] = now
+	e.lastNoPeerLog["__global__"] = now
 	e.lastNoPeerLogMu.Unlock()
 	log.Printf("[TUN] 无匹配 peer，dst=%s len=%d", dstIP, n)
 }
@@ -425,7 +429,6 @@ func main() {
 				continue
 			}
 
-			// STUN Binding Response
 			if buf[0] == 0x01 && buf[1] == 0x01 {
 				if ip, port, ok := parseSTUNResponse(buf[:n]); ok {
 					edge.addAssistedEndpoint(ip, port)
@@ -433,13 +436,11 @@ func main() {
 				continue
 			}
 
-			// N2NP probe
 			if buf[0] == 'N' && buf[1] == '2' && buf[2] == 'N' && buf[3] == 'P' {
 				edge.notePeerProbe(addr)
 				continue
 			}
 
-			// IPv4 数据帧
 			if buf[0]>>4 == 4 {
 				edge.notePeerTraffic(addr)
 				edge.enqueueTUN(buf[:n])
@@ -474,6 +475,7 @@ func main() {
 	})
 
 	edge.turnClient.StartReconnectLoop()
+	edge.startFailCountResetLoop()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -831,6 +833,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 	}
 }
 
+// maybeResetFailCountForPeer 检测对端 pubSocket 是否变化。
 func (e *Edge) maybeResetFailCountForPeer(peerID, newPubIP string, newPubPort int) {
 	if peerID == "" || newPubIP == "" || newPubPort <= 0 {
 		return
@@ -862,6 +865,7 @@ func (e *Edge) maybeResetFailCountForPeer(peerID, newPubIP string, newPubPort in
 		peerID, oldPubIP, oldPubPort, newPubIP, newPubPort, hadCount)
 }
 
+// maybeResetOwnFailCounts 检测本机出口 IP 是否变化。
 func (e *Edge) maybeResetOwnFailCounts(newEndpoint string) {
 	if newEndpoint == "" {
 		return
@@ -1020,6 +1024,9 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 	})
 }
 
+// tunReadLoop 从 TUN 读 IPv4 包，转发给对应 peer。
+//
+// ★ 优化：短 UDP 包（广播/网段扫描）静默处理，避免日志风暴。
 func (e *Edge) tunReadLoop() {
 	defer func() {
 		if r := recover(); r != nil {
@@ -1056,8 +1063,22 @@ func (e *Edge) tunReadLoop() {
 		e.peersMu.RUnlock()
 
 		if target == nil {
-			e.logNoPeerThrottled(dstIP, n)
-			_ = e.ws.SendBinary(buf[:n])
+			// ★ 短 UDP 包（广播/网段扫描）静默处理
+			//
+			// 场景：某些 App 会扫描 10.64.0.0/24 网段（mDNS / SSDP /
+			// NetBIOS），产生 250+ 条"无匹配 peer"日志。
+			// 判断：len < 200 且 proto=17（UDP）→ 静默。
+			proto := 0
+			if n >= 10 {
+				proto = int(buf[9])
+			}
+			if proto == 17 && n < 200 {
+				if e.ws != nil {
+					_ = e.ws.SendBinary(buf[:n])
+				}
+			} else {
+				e.logNoPeerThrottled(dstIP, n)
+			}
 			continue
 		}
 
@@ -1103,6 +1124,13 @@ func (e *Edge) notePeerTrafficTURN(addr *net.UDPAddr) {
 	e.notePeerCommon(addr, true, true)
 }
 
+// notePeerCommon 处理来自对端的 UDP 包。
+//
+// 首次收到 probe 时：
+//  1. 立即上报 P2P（MarkP2P）
+//  2. 并发启动 5 轮 probe 回包（每 100ms 一次）
+//
+// 后续收到的 probe 只刷新 lastRecvAt。
 func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool) {
 	now := time.Now().UnixMilli()
 
@@ -1179,6 +1207,7 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool) 
 	})
 }
 
+// writeProbe 按原路写一个 probe 包。
 func (e *Edge) writeProbe(addr *net.UDPAddr, probe []byte, viaTURN bool) {
 	if addr == nil {
 		return
