@@ -105,10 +105,6 @@ func lastIndexByte(s string, c byte) int {
 	return -1
 }
 
-// startFailCountResetLoop 定期清空 failCounts。
-//
-// 触发场景：长时间降级到 TURN 后，网络环境可能已变化，应该给一次
-// 重试机会。5 分钟清一次。
 func (e *Edge) startFailCountResetLoop() {
 	safeGo("fail-count-reset", func() {
 		ticker := time.NewTicker(5 * time.Minute)
@@ -156,6 +152,11 @@ func (e *Edge) chooseScanTiers(targetAddr *net.UDPAddr) (tiers []int, sameStun b
 	diff := myPort - targetPort
 	if diff < 0 {
 		diff = -diff
+	}
+
+	// ★ 端口差 > 5000：放弃
+	if diff > 5000 {
+		return nil, true, diff, -1
 	}
 
 	if diff >= 100 {
@@ -247,6 +248,19 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 
 	tiers, sameStun, portDiff, halfWidth := e.chooseScanTiers(targetAddr)
 
+	// ★ 端口差过大，直接放弃
+	if sameStun && halfWidth < 0 {
+		res.State = PunchStateFailed
+		res.Detail = fmt.Sprintf("端口差过大 (%d)，放弃打洞", portDiff)
+		log.Printf("[NAT-HOLE] ❌ 端口差=%d 过大（>5000），放弃打洞（直接走 TURN）", portDiff)
+
+		natHoleActiveMu.Lock()
+		failCounts[instr.TargetMac] = maxConsecutiveFails
+		natHoleActiveMu.Unlock()
+
+		return res
+	}
+
 	if sameStun && halfWidth > 0 {
 		log.Printf("[NAT-HOLE] 模式：同 STUN IP，端口差=%d，精准扫描 targetPort±%d，分级 %v",
 			portDiff, halfWidth, tiers)
@@ -257,7 +271,7 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		log.Printf("[NAT-HOLE] 模式：不同 STUN IP，全端口扫描，分级 %v", tiers)
 	}
 
-	// ★ 优化：先只扫 assisted 端点，命中则跳过整个 tier 扫描
+	// ★ 优先扫描 assisted
 	if len(assistedTargets) > 0 {
 		log.Printf("[NAT-HOLE] 优先扫描 %d 个 assisted 端点", len(assistedTargets))
 		for _, t := range assistedTargets {
