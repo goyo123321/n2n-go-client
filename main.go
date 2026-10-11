@@ -53,7 +53,15 @@ type Edge struct {
 	ws         *WSTransport
 	relayMgr   *RelayManager
 	turnClient *TURNClient
-	tun        *TUNDevice
+
+	// ★ tun 改为 atomic.Pointer：tunWriteLoop 与 ready 分支（重建 TUN）
+	//   之间原本存在 TOCTOU 竞争——校验 `e.tun != nil` 与调用 Write
+	//   之间可能发生重建。用原子指针后，快照和写入是原子的：
+	//   - 快照到旧 tun：旧 tun 可能已被 close，Write 返回 error（忽略）
+	//   - 快照到新 tun：正常写入
+	//   - 快照到 nil：跳过
+	//   任何一条路径都不会写到未初始化或被替换的 fd 上。
+	tun atomic.Pointer[TUNDevice]
 
 	udpConn *net.UDPConn
 	udpPort int
@@ -166,10 +174,6 @@ func (e *Edge) startKeepalive() {
 
 // ============ 日志节流 ============
 
-// logNoPeerThrottled 5 秒内只打一条"无匹配 peer"日志。
-//
-// 使用全局键（__global__）而非按 dstIP 分桶——避免 250 个不同 IP
-// 各打一条日志（网段扫描场景）。
 func (e *Edge) logNoPeerThrottled(dstIP string, n int) {
 	now := time.Now().UnixMilli()
 	e.lastNoPeerLogMu.Lock()
@@ -448,10 +452,13 @@ func main() {
 		}
 	})
 
+	// ★ tunWriteLoop：通过 atomic.Pointer 快照当前 TUN。
+	//   快照是原子的，避免与 ready 分支的 TUN 重建竞争。
+	//   快照到旧 tun（已 close）时 Write 返回 error，被忽略。
 	safeGo("tunWriteLoop", func() {
 		for data := range edge.tunWriteCh {
-			if edge.tun != nil {
-				_, _ = edge.tun.Write(data)
+			if tun := edge.tun.Load(); tun != nil {
+				_, _ = tun.Write(data)
 			}
 		}
 	})
@@ -505,8 +512,9 @@ func (e *Edge) Stop() {
 	if e.turnClient != nil {
 		e.turnClient.Close()
 	}
-	if e.tun != nil {
-		_ = e.tun.Close()
+	// ★ atomic.Pointer 读取
+	if tun := e.tun.Load(); tun != nil {
+		_ = tun.Close()
 	}
 }
 
@@ -638,8 +646,12 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 	switch t {
 	case "ready":
 		payload, _ := msg["payload"].(map[string]interface{})
-		e.virtualIP, _ = payload["virtualIp"].(string)
 
+		// ★ 记录旧值，用于判断是否需要重建 TUN
+		oldVIP := e.virtualIP
+		oldCIDR := e.virtualCIDR
+
+		e.virtualIP, _ = payload["virtualIp"].(string)
 		if cidr, ok := payload["virtualNetwork"].(string); ok && cidr != "" {
 			e.virtualCIDR = cidr
 		}
@@ -652,12 +664,37 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			log.Printf("[信令] 服务端看到的本机出口 IP: %s（WS/TCP 出口，仅参考）", serverIP)
 		}
 
-		var err error
-		e.tun, err = setupTUN(e.virtualIP, e.virtualCIDR, getEnv("TUN_NAME", "n2n0"))
-		if err != nil {
-			log.Printf("[TUN] 启动失败: %v", err)
+		// ★ 只在以下情形重建 TUN：
+		//   1. 首次连接（尚未建立）
+		//   2. 虚拟 IP 变化（服务端重分配）
+		//   3. 虚拟网段变化（服务端改 VIRTUAL_NETWORK）
+		//
+		//   修复背景：旧版每次 ready 都无条件 setupTUN()，WS 抖动重连
+		//   会导致 TUN fd 泄漏 + 旧 readLoop goroutine 残留 + 路由重复。
+		oldTun := e.tun.Load()
+		needBuild := oldTun == nil || oldVIP != e.virtualIP || oldCIDR != e.virtualCIDR
+
+		if needBuild {
+			if oldTun != nil {
+				log.Printf("[TUN] 重建（VIP %s→%s，网段 %s→%s）",
+					oldVIP, e.virtualIP, oldCIDR, e.virtualCIDR)
+				// 先清空指针，再 close。这样 tunWriteLoop 立刻快照到
+				// nil 而跳过写入，不会写到即将失效的 fd 上。
+				e.tun.Store(nil)
+				_ = oldTun.Close()
+			}
+			tun, err := setupTUN(e.virtualIP, e.virtualCIDR, getEnv("TUN_NAME", "n2n0"))
+			if err != nil {
+				log.Printf("[TUN] 启动失败: %v", err)
+			} else {
+				e.tun.Store(tun)
+				// ★ 传参：旧 readLoop 阻塞在旧 tun 上（tun.Close() 会让它退
+				//   出），新 readLoop 只读新 tun。避免多个 goroutine 抢读。
+				safeGo("tunReadLoop", func() { e.tunReadLoop(tun) })
+			}
 		} else {
-			safeGo("tunReadLoop", e.tunReadLoop)
+			log.Printf("[TUN] 已存在且未变（vip=%s cidr=%s），跳过重建",
+				e.virtualIP, e.virtualCIDR)
 		}
 
 		e.reportMetadata()
@@ -833,7 +870,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 	}
 }
 
-// maybeResetFailCountForPeer 检测对端 pubSocket 是否变化。
 func (e *Edge) maybeResetFailCountForPeer(peerID, newPubIP string, newPubPort int) {
 	if peerID == "" || newPubIP == "" || newPubPort <= 0 {
 		return
@@ -865,7 +901,6 @@ func (e *Edge) maybeResetFailCountForPeer(peerID, newPubIP string, newPubPort in
 		peerID, oldPubIP, oldPubPort, newPubIP, newPubPort, hadCount)
 }
 
-// maybeResetOwnFailCounts 检测本机出口 IP 是否变化。
 func (e *Edge) maybeResetOwnFailCounts(newEndpoint string) {
 	if newEndpoint == "" {
 		return
@@ -1026,17 +1061,24 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 
 // tunReadLoop 从 TUN 读 IPv4 包，转发给对应 peer。
 //
-// ★ 优化：短 UDP 包（广播/网段扫描）静默处理，避免日志风暴。
-func (e *Edge) tunReadLoop() {
+// ★ 接收 tun 参数而非读 e.tun：
+//   服务端改 VIRTUAL_NETWORK 或重分配 VIP 时会重建 TUN。旧 readLoop
+//   阻塞在旧 tun 上，tun.Close() 让它 read 出错退出；新 readLoop 只
+//   读新 tun。避免多个 goroutine 抢读同一字段。
+func (e *Edge) tunReadLoop(tun *TUNDevice) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[TUN] tunReadLoop panic: %v", r)
 		}
 	}()
 
+	if tun == nil {
+		return
+	}
+
 	buf := make([]byte, 65535)
 	for {
-		n, err := e.tun.Read(buf)
+		n, err := tun.Read(buf)
 		if err != nil {
 			select {
 			case <-e.doneCh:
@@ -1063,11 +1105,7 @@ func (e *Edge) tunReadLoop() {
 		e.peersMu.RUnlock()
 
 		if target == nil {
-			// ★ 短 UDP 包（广播/网段扫描）静默处理
-			//
-			// 场景：某些 App 会扫描 10.64.0.0/24 网段（mDNS / SSDP /
-			// NetBIOS），产生 250+ 条"无匹配 peer"日志。
-			// 判断：len < 200 且 proto=17（UDP）→ 静默。
+			// 短 UDP 包（广播/网段扫描）静默处理
 			proto := 0
 			if n >= 10 {
 				proto = int(buf[9])
@@ -1124,13 +1162,6 @@ func (e *Edge) notePeerTrafficTURN(addr *net.UDPAddr) {
 	e.notePeerCommon(addr, true, true)
 }
 
-// notePeerCommon 处理来自对端的 UDP 包。
-//
-// 首次收到 probe 时：
-//  1. 立即上报 P2P（MarkP2P）
-//  2. 并发启动 5 轮 probe 回包（每 100ms 一次）
-//
-// 后续收到的 probe 只刷新 lastRecvAt。
 func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool) {
 	now := time.Now().UnixMilli()
 
@@ -1207,7 +1238,6 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool) 
 	})
 }
 
-// writeProbe 按原路写一个 probe 包。
 func (e *Edge) writeProbe(addr *net.UDPAddr, probe []byte, viaTURN bool) {
 	if addr == nil {
 		return
