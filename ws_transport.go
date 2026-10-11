@@ -45,12 +45,10 @@ func NewWSTransport(signalingURL, roomId, clientId, connectToken string) (*WSTra
 	if err := ws.dial(); err != nil {
 		return nil, err
 	}
-	// ★ 用 safeGo 起 readLoop，防止漏网 panic
 	safeGo("ws-readLoop", ws.readLoop)
 	return ws, nil
 }
 
-// SetHandlers 设置回调并重放缓冲消息。
 func (ws *WSTransport) SetHandlers(
 	onMessage func(map[string]interface{}),
 	onBinary func([]byte),
@@ -79,7 +77,6 @@ func (ws *WSTransport) SetHandlers(
 	}
 }
 
-// routeText 安全分发文本消息（handler panic 只记日志）。
 func (ws *WSTransport) routeText(msg map[string]interface{}) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -98,7 +95,6 @@ func (ws *WSTransport) routeText(msg map[string]interface{}) {
 	}
 }
 
-// routeBinary 安全分发二进制消息。
 func (ws *WSTransport) routeBinary(data []byte) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -150,16 +146,12 @@ func maskToken(u string) string {
 	return parts[0] + "token=***"
 }
 
-// readLoop 断线自动重连（指数退避，最长 30s）。
+// readLoop 断线自动重连（指数退避，封顶 5 分钟，无限重试）。
+//
+// ★ 修复：旧版只重试 30 秒上限，用完后永久放弃。现在无限重试。
 func (ws *WSTransport) readLoop() {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("[WS] readLoop panic: %v\n%s", r, debug.Stack())
-		}
-	}()
-
 	backoff := 1 * time.Second
-	const maxBackoff = 30 * time.Second
+	const maxBackoff = 5 * time.Minute
 
 	for {
 		select {
@@ -175,14 +167,26 @@ func (ws *WSTransport) readLoop() {
 			time.Sleep(backoff)
 			if err := ws.dial(); err != nil {
 				log.Printf("[WS] 重连失败: %v，%v 后重试", err, backoff)
-				backoff *= 2
-				if backoff > maxBackoff {
+				switch {
+				case backoff < 2*time.Second:
+					backoff = 2 * time.Second
+				case backoff < 5*time.Second:
+					backoff = 5 * time.Second
+				case backoff < 10*time.Second:
+					backoff = 10 * time.Second
+				case backoff < 30*time.Second:
+					backoff = 30 * time.Second
+				case backoff < 60*time.Second:
+					backoff = 60 * time.Second
+				case backoff < 2*time.Minute:
+					backoff = 2 * time.Minute
+				default:
 					backoff = maxBackoff
 				}
 				continue
 			}
 			backoff = 1 * time.Second
-			log.Printf("[WS] 重连成功")
+			log.Printf("[WS] ✅ 重连成功")
 			if ws.onReconnect != nil {
 				ws.onReconnect()
 			}
@@ -200,11 +204,6 @@ func (ws *WSTransport) readLoop() {
 			ws.mu.Lock()
 			ws.conn = nil
 			ws.mu.Unlock()
-			time.Sleep(backoff)
-			backoff *= 2
-			if backoff > maxBackoff {
-				backoff = maxBackoff
-			}
 			continue
 		}
 
