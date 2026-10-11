@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/binary"
+	"fmt"
 	"log"
 	"net"
 	"strconv"
@@ -19,6 +20,43 @@ type NATMetadata struct {
 	RegularPortsChange bool
 	Behavior           string
 	MultiExit          bool
+}
+
+// STUN magic cookie 的 4 个字节，用于 XOR-MAPPED-ADDRESS 解码
+var magicBytes = [4]byte{0x21, 0x12, 0xA4, 0x42}
+
+// xorDecodePeer 解码 STUN XOR-MAPPED-ADDRESS 属性。
+//
+// RFC 5389 §15.2：
+//   - IPv4：family=0x01，port ^ 0x2112，IP ^ magicCookie
+//   - IPv6：family=0x02，port ^ 0x2112，IP ^ magicCookie 循环 XOR
+func xorDecodePeer(data []byte) (net.IP, int, error) {
+	if len(data) < 4 {
+		return nil, 0, fmt.Errorf("XOR 地址太短")
+	}
+	family := data[1]
+	port := int(binary.BigEndian.Uint16(data[2:4]) ^ 0x2112)
+	switch family {
+	case 0x01:
+		if len(data) < 8 {
+			return nil, 0, fmt.Errorf("IPv4 数据不足")
+		}
+		ip := make(net.IP, 4)
+		for i := 0; i < 4; i++ {
+			ip[i] = data[4+i] ^ magicBytes[i]
+		}
+		return ip, port, nil
+	case 0x02:
+		if len(data) < 20 {
+			return nil, 0, fmt.Errorf("IPv6 数据不足")
+		}
+		ip := make(net.IP, 16)
+		for i := 0; i < 16; i++ {
+			ip[i] = data[4+i] ^ magicBytes[i%4]
+		}
+		return ip, port, nil
+	}
+	return nil, 0, fmt.Errorf("未知地址族 0x%02x", family)
 }
 
 // parseSTUNResponse 解析 STUN Binding Response 里的 XOR-MAPPED-ADDRESS。
