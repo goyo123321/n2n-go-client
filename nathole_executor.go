@@ -105,6 +105,33 @@ func lastIndexByte(s string, c byte) int {
 	return -1
 }
 
+// startFailCountResetLoop 定期清空 failCounts。
+//
+// 触发场景：长时间降级到 TURN 后，网络环境可能已变化，应该给一次
+// 重试机会。5 分钟清一次。
+func (e *Edge) startFailCountResetLoop() {
+	safeGo("fail-count-reset", func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-e.doneCh:
+				return
+			case <-ticker.C:
+				natHoleActiveMu.Lock()
+				count := len(failCounts)
+				if count > 0 {
+					failCounts = make(map[string]int)
+				}
+				natHoleActiveMu.Unlock()
+				if count > 0 {
+					log.Printf("[NAT-HOLE] 定期清空 %d 个 target 的失败计数（5 分钟）", count)
+				}
+			}
+		}
+	})
+}
+
 func (e *Edge) chooseScanTiers(targetAddr *net.UDPAddr) (tiers []int, sameStun bool, portDiff int, halfWidth int) {
 	e.mu.Lock()
 	ep := ""
@@ -230,6 +257,36 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		log.Printf("[NAT-HOLE] 模式：不同 STUN IP，全端口扫描，分级 %v", tiers)
 	}
 
+	// ★ 优化：先只扫 assisted 端点，命中则跳过整个 tier 扫描
+	if len(assistedTargets) > 0 {
+		log.Printf("[NAT-HOLE] 优先扫描 %d 个 assisted 端点", len(assistedTargets))
+		for _, t := range assistedTargets {
+			if _, err := e.udpConn.WriteToUDP(probe, t); err == nil {
+				attempts++
+			}
+		}
+
+		select {
+		case <-e.doneCh:
+			res.State = PunchStateFailed
+			res.Detail = "aborted: edge stopped"
+			return res
+		case <-time.After(300 * time.Millisecond):
+		}
+
+		if e.hasTrafficFromTarget(instr.TargetMac, startAt) {
+			res.State = PunchStateSucceeded
+			res.Attempts = attempts
+			res.Detail = fmt.Sprintf("assisted 命中 (%d 个端点)", len(assistedTargets))
+			e.recordP2PSuccess(instr, targetAddr)
+			log.Printf("[NAT-HOLE] ✅ 成功 (assisted) role=%d target=%s attempts=%d",
+				instr.Role, targetAddr.IP, attempts)
+			e.resetFailCount(instr.TargetMac)
+			return res
+		}
+		log.Printf("[NAT-HOLE] assisted 未命中，进入 tier 扫描")
+	}
+
 	lastHalf := 0
 	receiverPort := targetAddr.Port
 
@@ -280,6 +337,7 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 					attempts++
 				}
 			}
+
 			if e.hasTrafficFromTarget(instr.TargetMac, startAt) {
 				success = true
 				break
@@ -414,10 +472,6 @@ func buildPunchProbe(virtualIP string) []byte {
 }
 
 // hasTrafficFromTarget 检查是否从指定 peer 收到过包。
-//
-// ★ 修复：替代 hasTrafficFromAny。
-// hasTrafficFromAny 只比对 IP —— 同 CGNAT 时任何来自同出口 IP 的包
-// 都会误判"打洞成功"。hasTrafficFromTarget 只看目标 peer 的 lastRecvAt。
 func (e *Edge) hasTrafficFromTarget(peerID string, since int64) bool {
 	if peerID == "" {
 		return false
@@ -429,4 +483,24 @@ func (e *Edge) hasTrafficFromTarget(peerID string, since int64) bool {
 		return false
 	}
 	return p.lastRecvAt >= since
+}
+
+// hasTrafficFromAny 保留兼容（当前无调用方）。
+func (e *Edge) hasTrafficFromAny(ips []net.IP, since int64) bool {
+	if len(ips) == 0 {
+		return false
+	}
+	e.peersMu.RLock()
+	defer e.peersMu.RUnlock()
+	for _, p := range e.peers {
+		if p.UDPAddr == nil || p.lastRecvAt < since {
+			continue
+		}
+		for _, ip := range ips {
+			if p.UDPAddr.IP.Equal(ip) {
+				return true
+			}
+		}
+	}
+	return false
 }
