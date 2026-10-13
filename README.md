@@ -4,11 +4,54 @@
 
 基于 TUN 虚拟网卡，通过 Cloudflare Workers 信令服务器建立 **LAN 直连 / P2P / TURN / WebSocket 中继** 四级降级连接，实现异地组网。
 
-**与 [n2n-termux](https://github.com/goyo123321/n2n-termux) 完全互通**——PC 客户端通过 TUN 直接访问 Termux 上的服务，Termux 通过 SOCKS5 访问 PC 上的服务。
+**与 [n2n-termux](https://github.com/goyo123321/n2n-termux)、[n2n-android](https://github.com/goyo123321/n2n-android) 完全互通**——PC 通过 TUN 直接访问其他节点的服务，反之亦然。
+
+---
+
+## 🌐 四端协同全景
+
+```
+              ┌───────────────────────────────────────────┐
+              │      edge-signal (Cloudflare Worker)      │
+              │  ├─ 信令路由                              │
+              │  ├─ NAT 打洞协调                          │
+              │  ├─ TURN 凭证下发                         │
+              │  └─ WS 中继（最后兜底）                   │
+              └──────────────┬────────────────────────────┘
+                             │
+         ┌───────────────────┼───────────────────┐
+         │                   │                   │
+         ▼                   ▼                   ▼
+   n2n-go-client       n2n-termux          n2n-android
+   ┌──────────┐       ┌──────────┐        ┌──────────┐
+   │ TUN 模式  │       │ SOCKS5   │        │ VpnService│
+   │ 系统级路由│       │ 代理模式 │        │ 无 root  │
+   │ 需 root  │       │ 无 root  │        │          │
+   └──────────┘       └──────────┘        └──────────┘
+     Linux/macOS         Android              Android
+     Windows             Termux                APK
+     路由器
+
+       LAN / P2P / TURN / WS  --  完全互通
+```
+
+### 三种客户端定位对比
+
+| 维度 | **n2n-go-client**（本仓库） | n2n-termux | n2n-android |
+|:---|:---|:---|:---|
+| **运行环境** | Linux / macOS / Windows / 路由器 | Android Termux | Android APK |
+| **数据面** | TUN 虚拟网卡 | SOCKS5 代理 | VpnService（TUN） |
+| **权限要求** | root / 管理员 | 无 root | 无 root |
+| **应用透明** | ✅ 系统级 | ⚠️ 需 App 显式配 SOCKS5 | ✅ 系统级 |
+| **协议支持** | TCP / UDP / ICMP | 仅 TCP | TCP / UDP / ICMP |
+| **使用方式** | `curl http://10.64.0.X` | `curl --socks5 127.0.0.1:1080 ...` | 同 TUN |
+| **适用场景** | 服务器 / 桌面 / 路由器 | 临时测试 / 无 root 设备 | 日常使用（手机） |
+
+---
 
 ## ✨ 特性
 
-- **跨平台** — Linux / macOS / Windows 全支持
+- **跨平台** — Linux / macOS / Windows / 路由器全支持
 - **TUN 虚拟网卡** — 内核原生 TCP/IP 栈，性能高
 - **四级降级** — `LAN → P2P → TURN → WS`，连接永远可用
 - **LAN 直连** — 同 WiFi 场景自动发现 LAN 地址，绕过 NAT 直接内网通信
@@ -25,6 +68,8 @@
 - **虚拟网段可配** — 服务端通过 `VIRTUAL_NETWORK` 下发网段，客户端自动适配
 - **无依赖** — Windows 版内嵌 wintun.dll
 - **三端互通** — 与 [n2n-termux](https://github.com/goyo123321/n2n-termux)、[n2n-android](https://github.com/goyo123321/n2n-android) 无缝互通
+
+---
 
 ## 🏗️ 架构
 
@@ -45,32 +90,7 @@
 └──────────────────────────────────────────┘
 ```
 
-## 🌐 三端互通拓扑
-
-```
-              edge-signal (Cloudflare Worker)
-                    │
-       ┌────────────┼────────────┐
-       │            │            │
-       ▼            ▼            ▼
-  n2n-go-client  n2n-termux  n2n-android
-   (TUN 模式)    (SOCKS5 模式)  (VpnService)
-   Linux/macOS   Android       Android
-   /Windows      Termux        APK
-       │            │            │
-       └────────────┴────────────┘
-              P2P / TURN / WS
-               完全互通
-```
-
-**场景示例**：
-
-| 组合 | 访问方式 | 说明 |
-|:---|:---|:---|
-| **PC → PC** | `curl http://10.64.0.X:8080/` | 双端 TUN，直接走虚拟网 |
-| **PC → Termux** | `curl http://10.64.0.X:8080/` | PC 用 TUN，Termux 端服务监听 `0.0.0.0` |
-| **Termux → PC** | `curl --socks5 127.0.0.1:1080 http://10.64.0.X:8080/` | Termux 用 SOCKS5，PC 端服务监听 `0.0.0.0` |
-| **Termux → Termux** | `curl --socks5 127.0.0.1:1080 http://10.64.0.X:8080/` | 双端 SOCKS5 |
+---
 
 ## 📡 四级降级链路
 
@@ -85,6 +105,8 @@
 ```
 
 **每对 peer 独立决策**：A↔B 可能走 LAN，A↔C 走 P2P，A↔D 走 TURN，互不影响。
+
+---
 
 ## 🔥 保活机制
 
@@ -117,6 +139,8 @@ CGNAT（运营商级 NAT）的 UDP 映射**不是永久的**。当 socket 空闲
 ### 数据流优先
 
 **真实数据帧天然刷新 CGNAT 映射**（最强保活）。保活机制只在**空闲时**起兜底作用。
+
+---
 
 ## 🚀 快速开始
 
@@ -184,6 +208,8 @@ $env:NODE_NAME="A的PC"
 
 .\n2n-client-windows-amd64.exe
 ```
+
+---
 
 ## 🔗 与 Termux 互通
 
@@ -259,6 +285,29 @@ ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@10.64.0.4
 
 **唯一区别**：PC 端还有 `peer.UDPAddr` 直发路径（TUN 里发包到虚拟 IP），Termux 端只能通过 SOCKS5 触发。
 
+---
+
+## 🔗 与 Android APK 互通
+
+**Android APK（n2n-android）也是 TUN 数据面**，与 PC 端**完全等价**：
+
+- 双端都是 VpnService / TUN
+- 双端都监听同一虚拟网段
+- 双端数据面直接走 N2NS 帧
+
+**PC → Android**：
+
+```bash
+curl http://10.64.0.3:8080/       # Android 上跑 HTTP 服务
+ssh user@10.64.0.3
+```
+
+**Android → PC**：
+
+Android 端通过 TUN 直接访问 `10.64.0.2`，无需额外配置。
+
+---
+
 ## ⚙️ 环境变量
 
 | 变量 | 必填 | 默认值 | 说明 |
@@ -274,6 +323,8 @@ ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@10.64.0.4
 | `SOCKS5_LISTEN` | ❌ | `127.0.0.1:1080` | SOCKS5 监听地址（额外入口，可选）|
 
 **虚拟网段**由服务端 `wrangler.toml` 的 `VIRTUAL_NETWORK` 决定，客户端从 `ready` 消息自动接收，无需配置。默认 `10.64.0.0/24`。
+
+---
 
 ## 📋 启动日志
 
@@ -342,6 +393,8 @@ n2n-go-client v1.2.0 启动
 ```
 [连接] termux-b → WS 中继 (TURN 未就绪，最后兜底)
 ```
+
+---
 
 ## 🔍 P2P 数据流原理
 
@@ -433,6 +486,8 @@ Unknown → P2PAvailable → P2P
 
 **一帧同时发往所有候选**，命中率大幅提升。
 
+---
+
 ## 🎯 使用场景
 
 ### 场景 1：异地办公室组网
@@ -459,7 +514,7 @@ CLIENT_ID="laptop" ...
 
 之后 `http://10.64.0.2:<NAS端口>` 访问 NAS 服务。
 
-### 场景 3：PC + Termux 混合组网
+### 场景 3：PC + Termux + Android 三端混合组网
 
 ```bash
 # PC
@@ -467,6 +522,9 @@ CLIENT_ID="pc-a" NODE_NAME="A的电脑" ...
 
 # Termux（Android 手机）
 CLIENT_ID="termux-a" NODE_NAME="A的手机" ...
+
+# Android APK（另一台手机）
+CLIENT_ID="android-b" NODE_NAME="B的手机" ...
 ```
 
 **PC → Termux**：
@@ -476,24 +534,43 @@ curl http://10.64.0.3:8080/       # PC 走 TUN
 ssh -p 8022 u0_aXXX@10.64.0.3
 ```
 
+**PC → Android**：
+
+```bash
+curl http://10.64.0.4:8080/       # Android 走 TUN
+```
+
 **Termux → PC**：
 
 ```bash
-curl --socks5 127.0.0.1:1080 http://10.64.0.2:8080/   # Termux 走 SOCKS5
-ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@10.64.0.2
+curl --socks5 127.0.0.1:1080 http://10.64.0.2:8080/
 ```
 
-### 场景 4：游戏联机
+### 场景 4：路由器做网关
+
+在 OpenWrt / 华硕路由器上跑 n2n-go-client，整个 LAN 即可访问组网内的其他节点：
+
+```bash
+CLIENT_ID="router-sh" ROOM_ID="office" TUN_NAME="n2n0" ...
+```
+
+路由器后面的设备可通过 `10.64.0.x` 直接访问其他城市的办公室资源。
+
+### 场景 5：游戏联机
 
 ```bash
 # 玩家 A（PC）
 CLIENT_ID="player-a" ROOM_ID="game-night" ...
 
-# 玩家 B（手机 + Termux）
-CLIENT_ID="termux-b" ROOM_ID="game-night" ...
+# 玩家 B（Android APK，也是 TUN）
+CLIENT_ID="android-b" ROOM_ID="game-night" ...
 ```
 
-**注意**：Termux 端只支持 SOCKS5（TCP），不支持游戏常见的 UDP 数据面。PC ↔ PC 才能玩 UDP 游戏。
+**PC ↔ Android 可以玩 UDP 游戏**（双端 TUN，支持 UDP/ICMP）。
+
+**Termux 端仅 TCP**，不支持游戏常见的 UDP 数据面。
+
+---
 
 ## 🔧 从源码构建
 
@@ -540,6 +617,8 @@ Actions → Build n2n-go Client → Run workflow
   platforms: （留空=全部5个平台）
 ```
 
+---
+
 ## 📁 项目结构
 
 ```
@@ -566,6 +645,8 @@ n2n-go-client/
 ├── install.sh                    # 一键部署脚本
 └── go.mod
 ```
+
+---
 
 ## ⚠️ 注意事项
 
@@ -615,16 +696,7 @@ UDP_PORT=50001 ./n2n-client ...
 
 **更换网段需要同时重启所有客户端**——旧的 IP 和路由是旧网段的，连接后会被新网段覆盖。
 
-### Termux / Android 限制
-
-Android 内核**不允许普通 App 创建 TUN 网卡**。Termux 里运行**本客户端**：
-
-- ✅ 能连上 Worker
-- ✅ 能拿到虚拟 IP
-- ✅ 面板显示为 peer
-- ❌ **无法创建 TUN**（需要 root）
-
-**组网测试请用电脑**（Linux/macOS/Windows）。或者用专门的 [n2n-termux](https://github.com/goyo123321/n2n-termux) 客户端（SOCKS5 模式，无 root）。
+---
 
 ## 📊 性能参考
 
@@ -635,6 +707,8 @@ Android 内核**不允许普通 App 创建 TUN 网卡**。Termux 里运行**本�
 | **CGNAT hairpin** | **10~30ms** | **无** |
 | TURN 中继 | 30~100ms | Cloudflare TURN 配额 |
 | WebSocket 中继 | 100~300ms | Worker 请求配额 |
+
+---
 
 ## 🐛 常见问题
 
@@ -842,6 +916,8 @@ cat ~/.n2n-go/client_id
 
 **如果一直停在 `p2p-avail`**：30 秒后会超时降级到 TURN/WS。
 
+---
+
 ## 🔗 与 edge-signal 配合
 
 | 项 | edge-signal | n2n-go-client |
@@ -852,6 +928,8 @@ cat ~/.n2n-go/client_id
 | 存储 | Durable Objects | 本地 |
 
 **先部署 edge-signal，再运行客户端。**
+
+---
 
 ## 📄 License
 
