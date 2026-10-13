@@ -21,13 +21,14 @@ type NatHoleInstruction struct {
 	TargetVirtualIp         string   `json:"targetVirtualIp"`
 	TargetPubSocket         string   `json:"targetPubSocket"`
 	TargetAssistedEndpoints []string `json:"targetAssistedEndpoints"`
-	TargetLanEndpoints      []string `json:"targetLanEndpoints"`
+	TargetLanEndpoints      []string `json:"targetLanEndpoints"` // ★ 新增
 	SenderMac               string   `json:"senderMac"`
 	SenderP2PEndpoint       string   `json:"senderP2pEndpoint"`
 	SenderPubSocket         string   `json:"senderPubSocket"`
 	SenderNatType           string   `json:"senderNatType"`
 	SenderBehavior          string   `json:"senderBehavior"`
 	SenderAssistedEndpoints []string `json:"senderAssistedEndpoints"`
+	SenderLanEndpoints      []string `json:"senderLanEndpoints"` // ★ 新增
 	ReceiverMac               string   `json:"receiverMac"`
 	ReceiverP2PEndpoint       string   `json:"receiverP2pEndpoint"`
 	ReceiverPubSocket         string   `json:"receiverPubSocket"`
@@ -55,7 +56,9 @@ const (
 
 const maxConsecutiveFails = 5
 
-var probePrefix = []byte{0x4E, 0x32, 0x4E, 0x50}
+// ★ 注意：probePrefix 和 buildPunchProbe 定义在 punch.go。
+//   此文件之前重复定义过这两项，导致 "redeclared in this block"
+//   编译错误，现已全部删除。
 
 var (
 	natHoleActiveMu sync.Mutex
@@ -154,7 +157,6 @@ func (e *Edge) chooseScanTiers(targetAddr *net.UDPAddr) (tiers []int, sameStun b
 		diff = -diff
 	}
 
-	// ★ 端口差 > 5000：放弃
 	if diff > 5000 {
 		return nil, true, diff, -1
 	}
@@ -165,6 +167,62 @@ func (e *Edge) chooseScanTiers(targetAddr *net.UDPAddr) (tiers []int, sameStun b
 
 	hw := diff + 100
 	return buildTiers(hw), true, diff, hw
+}
+
+// collectScanTargets 收集本轮打洞的全部候选地址。
+//
+// 与 Termux 端对齐，四类候选去重合并：
+//   1. LAN 地址（本机 peer 记录）—— 同 WiFi 场景优先
+//   2. 观测 raddr —— 已被证明可达的地址
+//   3. 服务端下发的 TargetAssistedEndpoints —— STUN 反射地址
+//   4. 服务端下发的 TargetLanEndpoints —— 对端上报的 LAN
+func (e *Edge) collectScanTargets(instr *NatHoleInstruction) []*net.UDPAddr {
+	var raw []*net.UDPAddr
+
+	// 1. LAN 地址
+	e.peersMu.RLock()
+	if p := e.peers[instr.TargetMac]; p != nil {
+		for _, lan := range p.LanEndpoints {
+			if addr := parseSockAddr(lan); addr != nil {
+				raw = append(raw, addr)
+			}
+		}
+	}
+	e.peersMu.RUnlock()
+
+	// 2. 观测 raddr（最高优先）
+	e.peersMu.RLock()
+	if p := e.peers[instr.TargetMac]; p != nil && p.UDPAddr != nil && p.lastRecvAt > 0 {
+		raw = append(raw, &net.UDPAddr{IP: p.UDPAddr.IP, Port: p.UDPAddr.Port})
+	}
+	e.peersMu.RUnlock()
+
+	// 3. 服务端下发的 assisted
+	for _, ep := range instr.TargetAssistedEndpoints {
+		if addr := parseSockAddr(ep); addr != nil {
+			raw = append(raw, addr)
+		}
+	}
+
+	// 4. 服务端下发的 LAN
+	for _, ep := range instr.TargetLanEndpoints {
+		if addr := parseSockAddr(ep); addr != nil {
+			raw = append(raw, addr)
+		}
+	}
+
+	// 去重（保持首次出现顺序）
+	seen := make(map[string]bool)
+	var out []*net.UDPAddr
+	for _, a := range raw {
+		key := a.String()
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, a)
+	}
+	return out
 }
 
 func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
@@ -232,23 +290,20 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		instr.BehaviorIndex, instr.Mode, instr.TTL,
 	)
 
-	var assistedTargets []*net.UDPAddr
-	for _, ep := range instr.TargetAssistedEndpoints {
-		if addr := parseSockAddr(ep); addr != nil {
-			assistedTargets = append(assistedTargets, addr)
-		}
-	}
+	// 多目标候选：LAN + raddr + assisted + lan
+	assistedTargets := e.collectScanTargets(instr)
+	log.Printf("[NAT-HOLE] 多目标扫描：LAN+raddr+assisted 共 %d 个候选", len(assistedTargets))
 
 	if instr.Role == 0 && instr.SendDelayMs > 0 {
 		time.Sleep(time.Duration(instr.SendDelayMs) * time.Millisecond)
 	}
 
+	// ★ buildPunchProbe 定义在 punch.go 里
 	probe := buildPunchProbe(e.virtualIP)
 	var attempts uint32
 
 	tiers, sameStun, portDiff, halfWidth := e.chooseScanTiers(targetAddr)
 
-	// ★ 端口差过大，直接放弃
 	if sameStun && halfWidth < 0 {
 		res.State = PunchStateFailed
 		res.Detail = fmt.Sprintf("端口差过大 (%d)，放弃打洞", portDiff)
@@ -271,9 +326,9 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		log.Printf("[NAT-HOLE] 模式：不同 STUN IP，全端口扫描，分级 %v", tiers)
 	}
 
-	// ★ 优先扫描 assisted
+	// 优先扫候选列表
 	if len(assistedTargets) > 0 {
-		log.Printf("[NAT-HOLE] 优先扫描 %d 个 assisted 端点", len(assistedTargets))
+		log.Printf("[NAT-HOLE] 优先扫描 %d 个候选端点", len(assistedTargets))
 		for _, t := range assistedTargets {
 			if _, err := e.udpConn.WriteToUDP(probe, t); err == nil {
 				attempts++
@@ -291,14 +346,14 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		if e.hasTrafficFromTarget(instr.TargetMac, startAt) {
 			res.State = PunchStateSucceeded
 			res.Attempts = attempts
-			res.Detail = fmt.Sprintf("assisted 命中 (%d 个端点)", len(assistedTargets))
+			res.Detail = fmt.Sprintf("候选命中 (%d 个端点)", len(assistedTargets))
 			e.recordP2PSuccess(instr, targetAddr)
-			log.Printf("[NAT-HOLE] ✅ 成功 (assisted) role=%d target=%s attempts=%d",
+			log.Printf("[NAT-HOLE] ✅ 成功 (candidates) role=%d target=%s attempts=%d",
 				instr.Role, targetAddr.IP, attempts)
 			e.resetFailCount(instr.TargetMac)
 			return res
 		}
-		log.Printf("[NAT-HOLE] assisted 未命中，进入 tier 扫描")
+		log.Printf("[NAT-HOLE] 候选未命中，进入 tier 扫描")
 	}
 
 	lastHalf := 0
@@ -464,7 +519,17 @@ func parseSockAddr(s string) *net.UDPAddr {
 	return &net.UDPAddr{IP: ip, Port: port}
 }
 
+// resolveTarget 优先使用本机观测过的 raddr。
 func (e *Edge) resolveTarget(instr *NatHoleInstruction) *net.UDPAddr {
+	e.peersMu.RLock()
+	if p := e.peers[instr.TargetMac]; p != nil && p.UDPAddr != nil && p.lastRecvAt > 0 {
+		raddr := &net.UDPAddr{IP: p.UDPAddr.IP, Port: p.UDPAddr.Port}
+		e.peersMu.RUnlock()
+		log.Printf("[NAT-HOLE] 优先使用观测 raddr %s（已被证明可达）", raddr.String())
+		return raddr
+	}
+	e.peersMu.RUnlock()
+
 	sock := instr.TargetPubSocket
 	if sock == "" {
 		if instr.Role == 1 {
@@ -476,16 +541,6 @@ func (e *Edge) resolveTarget(instr *NatHoleInstruction) *net.UDPAddr {
 	return parseSockAddr(sock)
 }
 
-func buildPunchProbe(virtualIP string) []byte {
-	buf := make([]byte, 32)
-	copy(buf[0:4], probePrefix)
-	if ip := net.ParseIP(virtualIP); ip != nil && ip.To4() != nil {
-		copy(buf[4:8], ip.To4())
-	}
-	return buf
-}
-
-// hasTrafficFromTarget 检查是否从指定 peer 收到过包。
 func (e *Edge) hasTrafficFromTarget(peerID string, since int64) bool {
 	if peerID == "" {
 		return false
@@ -499,7 +554,6 @@ func (e *Edge) hasTrafficFromTarget(peerID string, since int64) bool {
 	return p.lastRecvAt >= since
 }
 
-// hasTrafficFromAny 保留兼容（当前无调用方）。
 func (e *Edge) hasTrafficFromAny(ips []net.IP, since int64) bool {
 	if len(ips) == 0 {
 		return false
