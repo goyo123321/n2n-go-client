@@ -105,7 +105,7 @@ type P2PStream struct {
 	peerAddr *net.UDPAddr
 	viaTURN  bool
 
-	// 最近一次成功收到对端帧的源地址，优先作为发送目标
+	// ★ 新增：最近一次成功收到对端帧的源地址，优先作为发送目标
 	lastRecvFrom *net.UDPAddr
 
 	sendNext uint32
@@ -247,6 +247,17 @@ func (m *P2PStreamManager) sendP2PProbe(peerID string) {
 }
 
 // collectN2NSTargets 收集一个 stream 的所有候选发送地址。
+//
+// ★ 修复：加入 AssistedEndpoints —— 之前只有 LAN + lastRecvFrom +
+//   peerAddr + peerUDPAddr，缺少 STUN 反射的多端点。对称 NAT 下
+//   多端点候选是命中率的关键。
+//
+// 优先级（去重保留首次出现）：
+//   1. LAN 地址
+//   2. AssistedEndpoints（STUN 反射）
+//   3. lastRecvFrom（对端最近发来的源地址）
+//   4. peerAddr（注册时分配的地址 / SYN 来源地址）
+//   5. peer.UDPAddr（观测 raddr）
 func (e *Edge) collectN2NSTargets(s *P2PStream) []*net.UDPAddr {
 	s.mu.Lock()
 	primary := s.peerAddr
@@ -256,9 +267,11 @@ func (e *Edge) collectN2NSTargets(s *P2PStream) []*net.UDPAddr {
 
 	e.peersMu.RLock()
 	var lanEndpoints []string
+	var assisted []string
 	var peerUDPAddr *net.UDPAddr
 	if p := e.peers[peerID]; p != nil {
 		lanEndpoints = p.LanEndpoints
+		assisted = p.AssistedEndpoints
 		peerUDPAddr = p.UDPAddr
 	}
 	e.peersMu.RUnlock()
@@ -282,6 +295,11 @@ func (e *Edge) collectN2NSTargets(s *P2PStream) []*net.UDPAddr {
 			add(ra)
 		}
 	}
+	for _, ep := range assisted {
+		if ra, err := net.ResolveUDPAddr("udp", ep); err == nil {
+			add(ra)
+		}
+	}
 	add(lastRecv)
 	add(primary)
 	add(peerUDPAddr)
@@ -289,6 +307,7 @@ func (e *Edge) collectN2NSTargets(s *P2PStream) []*net.UDPAddr {
 	return out
 }
 
+// sendP2PFrame 发送一帧到对端的所有候选地址。
 func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 	s.mu.Lock()
 	viaTURN := s.viaTURN
@@ -342,102 +361,6 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 		return lastErr
 	}
 	return nil
-}
-
-// handleP2PFrame 收到 N2NS 帧时的入口。
-//
-// ★ 修复：PING/PONG 的语义区分。
-//
-//   收到 PING  → 只证明"对端→本端"单向可达，不升级本端状态，
-//                仅回一个 PONG 让对端确认双向。
-//
-//   收到 PONG  → 本端发出的 PING 到达了对端，且对端回了 PONG。
-//                双向通道已被证明 → 这是真正的数据面验证 → MarkP2P。
-//
-//   之前把 PING 和 PONG 一起过滤，导致两端都停留在 P2PAvailable，
-//   socks5.go 的 useP2P 判断永远为 false，所有 SOCKS5 连接都走
-//   WS 中继——"打洞成功但数据面不过"的根因就在这。
-func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) {
-	if e.p2pStreams == nil {
-		return
-	}
-	f, err := decodeP2PFrame(data)
-	if err != nil {
-		return
-	}
-	peerID := e.findPeerIDByAddr(peerAddr)
-	if peerID == "" {
-		return
-	}
-
-	if e.relayMgr != nil {
-		switch f.Type {
-		case p2pTypePING:
-			// PING 到达只证明"对端→本端"单向通
-			// 本端不升级，等对端回 PONG 后再升级
-		case p2pTypePONG:
-			// ★ PONG 收到：双向通道已被证明
-			if e.relayMgr.GetState(peerID) != ConnP2P {
-				log.Printf("[P2P] 收到 PONG → P2P 直连（双向通道已验证）")
-				e.relayMgr.MarkP2P(peerID)
-			}
-		default:
-			// SYN/SYNACK/DATA/ACK/FIN/RST 都是真实数据帧
-			if e.relayMgr.GetState(peerID) != ConnP2P {
-				log.Printf("[P2P] 收到数据帧（stream=%d type=%d）→ P2P 直连",
-					f.StreamID, f.Type)
-				e.relayMgr.MarkP2P(peerID)
-			}
-		}
-	}
-
-	e.p2pStreams.handleFrame(peerID, peerAddr, viaTURN, f)
-}
-
-func (e *Edge) findPeerIDByAddr(addr *net.UDPAddr) string {
-	if addr == nil {
-		return ""
-	}
-	e.peersMu.RLock()
-	defer e.peersMu.RUnlock()
-
-	for id, p := range e.peers {
-		if p.UDPAddr != nil && p.UDPAddr.IP.Equal(addr.IP) && p.UDPAddr.Port == addr.Port {
-			return id
-		}
-	}
-	for id, p := range e.peers {
-		for _, lan := range p.LanEndpoints {
-			la, err := net.ResolveUDPAddr("udp", lan)
-			if err != nil {
-				continue
-			}
-			if la.IP.Equal(addr.IP) && la.Port == addr.Port {
-				return id
-			}
-		}
-	}
-	for id, p := range e.peers {
-		if p.UDPAddr != nil && p.UDPAddr.IP.Equal(addr.IP) {
-			return id
-		}
-	}
-	return ""
-}
-
-func (e *Edge) peerAddrAndMode(peerID string) (*net.UDPAddr, bool) {
-	e.peersMu.RLock()
-	p := e.peers[peerID]
-	e.peersMu.RUnlock()
-	if p == nil || p.UDPAddr == nil {
-		return nil, false
-	}
-	viaTURN := true
-	if e.relayMgr != nil {
-		st := e.relayMgr.GetState(peerID)
-		viaTURN = st != ConnP2P && st != ConnP2PAvailable
-	}
-	return p.UDPAddr, viaTURN
 }
 
 func (m *P2PStreamManager) OpenP2PStream(peerID string, targetPort int, localConn net.Conn, timeout time.Duration) (*P2PStream, error) {
@@ -660,8 +583,11 @@ func (m *P2PStreamManager) handleFrame(peerID string, peerAddr *net.UDPAddr, via
 	case p2pTypeDATA:
 		s.handleData(m.edge, f)
 	case p2pTypeACK:
-	case p2pTypeFIN, p2pTypeRST:
-		s.close("peer-close")
+		// 已处理
+	case p2pTypeFIN:
+		s.close("peer-fin")
+	case p2pTypeRST:
+		s.close("peer-rst")
 	}
 }
 
