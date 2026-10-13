@@ -80,7 +80,6 @@ func (s *Socks5Server) handleConn(conn net.Conn) {
 
 	buf := make([]byte, 256)
 
-	// 阶段 1：方法协商
 	if _, err := io.ReadFull(conn, buf[:2]); err != nil {
 		_ = conn.Close()
 		return
@@ -103,7 +102,6 @@ func (s *Socks5Server) handleConn(conn net.Conn) {
 		return
 	}
 
-	// 阶段 2：请求
 	if _, err := io.ReadFull(conn, buf[:4]); err != nil {
 		_ = conn.Close()
 		return
@@ -163,13 +161,16 @@ func (s *Socks5Server) handleConn(conn net.Conn) {
 		return
 	}
 
-	// ★ 优先 P2P，失败回落 WS
+	// ★ 修复：加入 IsP2PAvailable —— 打洞握手成功后、PONG 验证完成前的
+	//   窗口期内，P2P 通道实际可用。之前跳过这个状态，导致每次 SOCKS5
+	//   都走 WS 中继。配合 OpenP2PStream 的 2 秒超时，最坏只多花 2 秒。
 	useP2P := s.edge.p2pStreams != nil &&
 		s.edge.relayMgr != nil &&
-		(s.edge.relayMgr.IsP2P(peerID) || s.edge.relayMgr.IsTURN(peerID))
+		(s.edge.relayMgr.IsP2P(peerID) ||
+			s.edge.relayMgr.IsP2PAvailable(peerID) ||
+			s.edge.relayMgr.IsTURN(peerID))
 
 	if useP2P {
-		// ★ 建流超时 5s → 2s，避免 P2P 失败时白等太久
 		p2s, err := s.edge.p2pStreams.OpenP2PStream(peerID, int(dstPort), conn, 2*time.Second)
 		if err == nil {
 			log.Printf("[SOCKS5] CONNECT %s:%d → P2P 直连 (stream=%d)", dstIP, dstPort, p2s.ID)
@@ -183,7 +184,6 @@ func (s *Socks5Server) handleConn(conn net.Conn) {
 		log.Printf("[SOCKS5] P2P 建流失败(%v)，回落 WS 中继", err)
 	}
 
-	// 回落：WS app_stream
 	stream, err := s.edge.openLocalStream(peerID, int(dstPort), conn)
 	if err != nil {
 		log.Printf("[SOCKS5] 打开 stream 失败: %v", err)
