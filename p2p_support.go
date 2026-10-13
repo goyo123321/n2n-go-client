@@ -1,20 +1,17 @@
 package main
 
 // PC 端为 p2p_stream.go 补齐的依赖方法。
-//
-// p2p_stream.go 从 Termux 端复制时删除了 4 个函数（findPeerIDByAddr、
-// peerAddrAndMode、sendP2PFrame、handleP2PFrame），因为它们依赖 PC 端
-// main.go 的 Edge 结构。此文件统一补齐。
-//
-// 注意：findPeerByVIP 已在 app_stream.go 定义，本文件不再重复。
 
 import (
-	"errors"
-	"fmt"
 	"log"
 	"net"
+	"time"
 )
 
+// findPeerIDByAddr 按对端地址查 peerID。
+//
+// ★ 修复：加入 AssistedEndpoints 匹配 —— 之前只匹配 UDPAddr 和 LAN，
+//   对端从 STUN 反射地址发来的包会被漏掉。
 func (e *Edge) findPeerIDByAddr(addr *net.UDPAddr) string {
 	if addr == nil {
 		return ""
@@ -22,12 +19,13 @@ func (e *Edge) findPeerIDByAddr(addr *net.UDPAddr) string {
 	e.peersMu.RLock()
 	defer e.peersMu.RUnlock()
 
+	// 1. 精确匹配 UDPAddr
 	for id, p := range e.peers {
 		if p.UDPAddr != nil && p.UDPAddr.IP.Equal(addr.IP) && p.UDPAddr.Port == addr.Port {
 			return id
 		}
 	}
-
+	// 2. 精确匹配 LAN
 	for id, p := range e.peers {
 		for _, lan := range p.LanEndpoints {
 			la, err := net.ResolveUDPAddr("udp", lan)
@@ -39,7 +37,19 @@ func (e *Edge) findPeerIDByAddr(addr *net.UDPAddr) string {
 			}
 		}
 	}
-
+	// ★ 3. 精确匹配 Assisted
+	for id, p := range e.peers {
+		for _, ass := range p.AssistedEndpoints {
+			aa, err := net.ResolveUDPAddr("udp", ass)
+			if err != nil {
+				continue
+			}
+			if aa.IP.Equal(addr.IP) && aa.Port == addr.Port {
+				return id
+			}
+		}
+	}
+	// 4. 兜底：IP 相同即可
 	for id, p := range e.peers {
 		if p.UDPAddr != nil && p.UDPAddr.IP.Equal(addr.IP) {
 			return id
@@ -63,74 +73,20 @@ func (e *Edge) peerAddrAndMode(peerID string) (*net.UDPAddr, bool) {
 	return p.UDPAddr, viaTURN
 }
 
-// sendP2PFrame 发送一个 N2NS 帧到指定 peer。
-// 优先级：LAN > TURN > P2P 公网。
-func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
-	s.mu.Lock()
-	addr := s.peerAddr
-	viaTURN := s.viaTURN
-	peerID := s.PeerID
-	s.mu.Unlock()
-
-	buf := encodeP2PFrame(f)
-
-	e.peersMu.RLock()
-	var lanEndpoints []string
-	if p := e.peers[peerID]; p != nil {
-		lanEndpoints = p.LanEndpoints
-	}
-	e.peersMu.RUnlock()
-
-	lanSent := false
-	if e.udpConn != nil {
-		for _, lan := range lanEndpoints {
-			ra, err := net.ResolveUDPAddr("udp", lan)
-			if err != nil {
-				continue
-			}
-			if _, err := e.udpConn.WriteToUDP(buf, ra); err == nil {
-				lanSent = true
-			}
-		}
-	}
-	if lanSent {
-		return nil
-	}
-
-	if viaTURN {
-		if e.turnClient == nil || !e.turnClient.IsReady() {
-			return errors.New("turn down and no lan")
-		}
-		e.peersMu.RLock()
-		var relayAddr string
-		if p := e.peers[peerID]; p != nil {
-			relayAddr = p.TurnRelayAddr
-		}
-		e.peersMu.RUnlock()
-
-		if relayAddr == "" {
-			return errors.New("peer turn relay unknown and no lan")
-		}
-		ra, err := net.ResolveUDPAddr("udp", relayAddr)
-		if err != nil {
-			return fmt.Errorf("bad relay addr %q: %w", relayAddr, err)
-		}
-		return e.turnClient.Send(buf, ra)
-	}
-
-	if addr == nil {
-		return errors.New("no addr and no lan")
-	}
-	if e.udpConn == nil {
-		return errors.New("no udp")
-	}
-	_, err := e.udpConn.WriteToUDP(buf, addr)
-	return err
-}
-
 // handleP2PFrame 收到 N2NS 帧时的入口。
 //
-// PC 端接受 Termux 端的 SOCKS5 隧道，收到 N2NS 帧即升级到 P2P。
+// ★ 修复（与 Termux 端对齐）：
+//
+//   1. PING/PONG 语义区分：
+//      - 收到 PING → 只回 PONG，**不升级本端状态**
+//      - 收到 PONG → 双向通道已证明 → MarkP2P
+//      - 其他帧（SYN/SYNACK/DATA/ACK/FIN/RST）→ 直接 MarkP2P
+//
+//      之前把 PING/PONG 一起过滤，导致状态机永远停在 P2PAvailable，
+//      socks5.go 的 useP2P 判断永远为 false，所有 SOCKS5 都走 WS。
+//
+//   2. 收到非 TURN 中继的 N2NS 帧刷新 p.UDPAddr + lastRecvAt，
+//      避免 Keepalive 打到已老化的端口。
 func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) {
 	if e.p2pStreams == nil {
 		return
@@ -144,10 +100,33 @@ func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) 
 		return
 	}
 
+	// ★ 收到任何非 TURN 中继的 N2NS 帧都刷新 p.UDPAddr
+	if !viaTURN {
+		e.peersMu.Lock()
+		if p := e.peers[peerID]; p != nil {
+			p.UDPAddr = &net.UDPAddr{IP: peerAddr.IP, Port: peerAddr.Port}
+			p.lastRecvAt = time.Now().UnixMilli()
+		}
+		e.peersMu.Unlock()
+	}
+
 	if e.relayMgr != nil {
-		if e.relayMgr.GetState(peerID) != ConnP2P {
-			log.Printf("[P2P] 收到 N2NS 数据帧（stream=%d）→ P2P 直连", f.StreamID)
-			e.relayMgr.MarkP2P(peerID)
+		switch f.Type {
+		case p2pTypePING:
+			// PING 到达只证明"对端→本端"单向通，不升级本端状态
+		case p2pTypePONG:
+			// ★ PONG 收到：双向通道已被证明
+			if e.relayMgr.GetState(peerID) != ConnP2P {
+				log.Printf("[P2P] 收到 PONG → P2P 直连（双向通道已验证）")
+				e.relayMgr.MarkP2P(peerID)
+			}
+		default:
+			// SYN/SYNACK/DATA/ACK/FIN/RST 都是真实数据帧
+			if e.relayMgr.GetState(peerID) != ConnP2P {
+				log.Printf("[P2P] 收到数据帧（stream=%d type=%d）→ P2P 直连",
+					f.StreamID, f.Type)
+				e.relayMgr.MarkP2P(peerID)
+			}
 		}
 	}
 
