@@ -1,19 +1,16 @@
 package main
 
-// PC 端 LAN 地址收集。
-
 import (
-	"log"
 	"net"
 	"sort"
 	"strconv"
 )
 
-// collectLANEndpoints 收集本机所有 LAN 端点。
+// LAN 地址收集（双路径）。
 //
-// ★ 双路径：
-//   1. UDP connect 骗内核返回出口 IP —— 永远可靠
-//   2. 兜底遍历 net.Interfaces() —— 覆盖多网卡
+// 路径 1：UDP connect 骗内核返回出口 IP —— Termux / Android 上
+//   net.Interfaces() 有时拿不到 WiFi 接口，这个路径永远可靠。
+// 路径 2：遍历 net.Interfaces() —— 覆盖多网卡。
 func collectLANEndpoints(port int, selfVIP string) []string {
 	var result []string
 	seen := make(map[string]bool)
@@ -78,9 +75,6 @@ func collectLANEndpoints(port int, selfVIP string) []string {
 }
 
 // detectOutboundIP 用一个不真正发包的 UDP connect 骗内核选出出口网卡。
-//
-// 原理：connect UDP 只更新内核 socket 的路由缓存，不触发 ARP、不发包。
-// getsockname() 返回内核为该 socket 选定的本地 IP —— 即"出网卡"的 IP。
 func detectOutboundIP() net.IP {
 	targets := []string{
 		"8.8.8.8:80",
@@ -205,6 +199,3 @@ func sortLANByAffinity(lan []string, prefixes []*net.IPNet) []string {
 	}
 	return out
 }
-
-// 保留 log 引用（未使用时不报错）
-var _ = log.Printf
