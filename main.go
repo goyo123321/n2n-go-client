@@ -39,7 +39,7 @@ type PeerInfo struct {
 	hasRealData       bool
 	probeReplied      bool
 	AssistedEndpoints []string
-	LanEndpoints      []string // ★ 新增
+	LanEndpoints      []string
 }
 
 type Edge struct {
@@ -55,11 +55,8 @@ type Edge struct {
 	relayMgr   *RelayManager
 	turnClient *TURNClient
 
-	// ★ tun 改为 atomic.Pointer：tunWriteLoop 与 ready 分支（重建 TUN）
-	//   之间原本存在 TOCTOU 竞争。用原子指针后，快照和写入是原子的：
-	//   - 快照到旧 tun：旧 tun 可能已被 close，Write 返回 error（忽略）
-	//   - 快照到新 tun：正常写入
-	//   - 快照到 nil：跳过
+	// tun 用 atomic.Pointer：tunWriteLoop 与 ready 分支（重建 TUN）之间
+	// 原本存在 TOCTOU 竞争。用原子指针后，快照和写入是原子的。
 	tun atomic.Pointer[TUNDevice]
 
 	udpConn *net.UDPConn
@@ -83,13 +80,16 @@ type Edge struct {
 
 	lastMetadataReportAt int64
 
-	// ★ 新增：P2P stream 管理器（接受 Termux 端 N2NS 帧）
+	// ★ 应用层 WS 隧道流管理器（app_stream.go 使用）
+	streamMgr *AppStreamManager
+
+	// ★ N2NS P2P 隧道管理器（p2p_stream.go 使用）
 	p2pStreams *P2PStreamManager
 
-	// ★ 新增：SOCKS5 入口（PC 主动访问 Termux 服务）
+	// ★ SOCKS5 入口（PC 主动访问 Termux / PC 服务）
 	socks5Srv *Socks5Server
 
-	// ★ 新增：ACK 限流器
+	// ★ ACK 限流器
 	punchAckLimiter *punchAckLimiter
 
 	doneCh  chan struct{}
@@ -359,7 +359,8 @@ func main() {
 		doneCh:         make(chan struct{}),
 	}
 	edge.punchAckLimiter = newPunchAckLimiter()
-	edge.p2pStreams = NewP2PStreamManager(edge) // ★ 新增
+	edge.streamMgr = NewAppStreamManager() // ★ 新增
+	edge.p2pStreams = NewP2PStreamManager(edge)
 
 	udpAddr := &net.UDPAddr{IP: net.IPv4zero, Port: udpPort}
 	udpConn, err := net.ListenUDP("udp", udpAddr)
@@ -396,8 +397,11 @@ func main() {
 		if edge.punchAckLimiter != nil {
 			edge.punchAckLimiter.clear()
 		}
-		if edge.p2pStreams != nil { // ★ 新增
+		if edge.p2pStreams != nil {
 			edge.p2pStreams.closeAll()
+		}
+		if edge.streamMgr != nil { // ★ 新增
+			edge.streamMgr.closeAll()
 		}
 		if edge.virtualIP != "" {
 			edge.reportMetadata()
@@ -411,7 +415,7 @@ func main() {
 			edge.enqueueTUN(data)
 			return
 		}
-		// ★ N2NS（数据面）
+		// N2NS（数据面）
 		if isP2PFrame(data) {
 			edge.handleP2PFrame(ua, true, data)
 			return
@@ -468,7 +472,7 @@ func main() {
 				continue
 			}
 
-			// 2. N2NS（★ 新增）
+			// 2. N2NS
 			if isP2PFrame(buf[:n]) {
 				edge.handleP2PFrame(addr, false, buf[:n])
 				continue
@@ -502,7 +506,7 @@ func main() {
 
 	edge.startKeepalive()
 
-	// ★ 启动 SOCKS5 入口
+	// 启动 SOCKS5 入口
 	edge.socks5Srv = NewSocks5Server(edge, socks5Listen)
 	safeGo("socks5-server", func() { edge.socks5Srv.Serve() })
 
@@ -553,13 +557,15 @@ func (e *Edge) Stop() {
 	if e.turnClient != nil {
 		e.turnClient.Close()
 	}
-	if e.socks5Srv != nil { // ★ 新增
+	if e.socks5Srv != nil {
 		e.socks5Srv.Close()
 	}
-	if e.p2pStreams != nil { // ★ 新增
+	if e.streamMgr != nil { // ★ 新增
+		e.streamMgr.closeAll()
+	}
+	if e.p2pStreams != nil {
 		e.p2pStreams.closeAll()
 	}
-	// ★ atomic.Pointer 读取
 	if tun := e.tun.Load(); tun != nil {
 		_ = tun.Close()
 	}
@@ -600,7 +606,6 @@ func (e *Edge) reportMetadata() {
 		metaPayload["assistedEndpoints"] = nm.AllEndpoints
 	}
 
-	// ★ 上报 LAN 地址（同 WiFi 直连用）
 	if lanEndpoints := collectLANEndpoints(e.udpPort, e.virtualIP); len(lanEndpoints) > 0 {
 		metaPayload["lanEndpoints"] = lanEndpoints
 		log.Printf("[NAT] 上报 LAN 地址: %v", lanEndpoints)
@@ -698,8 +703,11 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		if e.punchAckLimiter != nil {
 			e.punchAckLimiter.clear()
 		}
-		if e.p2pStreams != nil { // ★ 新增
+		if e.p2pStreams != nil {
 			e.p2pStreams.closeAll()
+		}
+		if e.streamMgr != nil { // ★ 新增
+			e.streamMgr.closeAll()
 		}
 
 		e.reportMetadata()
@@ -775,7 +783,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 					}
 				}
 
-				// ★ 新增：LAN
 				var lanEndpoints []string
 				if raw, ok := pm["lanEndpoints"].([]interface{}); ok {
 					for _, v := range raw {
@@ -828,7 +835,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			}
 		}
 
-		// ★ 新增：LAN
 		var lanEndpoints []string
 		if raw, ok := payload["lanEndpoints"].([]interface{}); ok {
 			for _, v := range raw {
@@ -950,7 +956,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		delete(e.lastNoPeerLog, from)
 		e.lastNoPeerLogMu.Unlock()
 		e.forgetTunState(from)
-		// ★ 新增
 		if e.p2pStreams != nil {
 			e.p2pStreams.dropPeer(from)
 		}
@@ -1045,7 +1050,6 @@ func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natTyp
 		udpAddr = &net.UDPAddr{IP: net.ParseIP(pubIP), Port: pubPort}
 	}
 
-	// ★ LAN 同子网优先排序
 	selfVIP := e.virtualIP
 	prefixes := localPrefixes(selfVIP)
 	sortedLAN := sortLANByAffinity(lanEndpoints, prefixes)
@@ -1121,10 +1125,6 @@ func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 }
 
 // runNatHole 执行一次打洞指令，并在成功时主动触发数据面探针。
-//
-// ★ 关键改动：
-//   - 打洞成功后不再直接 MarkP2P，而是 MarkP2PAvailable
-//   - 主动发 N2NS PING 探针，触发对端和本端的 MarkP2P
 func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 	res := e.executeNatHole(instr)
 	if res == nil {
@@ -1132,10 +1132,7 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 	}
 
 	if res.State == PunchStateSucceeded {
-		// ★ 打洞握手成功 → P2PAvailable（不是 P2P）
 		e.relayMgr.MarkP2PAvailable(instr.TargetMac)
-
-		// ★ 主动发 N2NS PING 探针
 		safeGo("p2p-probe", func() {
 			e.sendP2PProbe(instr.TargetMac)
 		})
@@ -1248,7 +1245,7 @@ func (e *Edge) enqueueTUN(data []byte) {
 	}
 }
 
-// ============ peer 探测处理（★ 全段重写） ============
+// ============ peer 探测处理 ============
 
 func (e *Edge) notePeerProbe(addr *net.UDPAddr) {
 	e.notePeerCommon(addr, false, false, false)
@@ -1275,12 +1272,6 @@ func (e *Edge) notePeerTrafficTURN(addr *net.UDPAddr) {
 }
 
 // notePeerCommon 是打洞握手路径的统一入口。
-//
-// 与 Termux 端对齐四件事：
-//  1. Punch 与 ACK 分开处理，ACK **绝不回复**
-//  2. 收到 Punch 或 ACK 都升级到 P2PAvailable（打洞握手成功，未验证数据面）
-//  3. 只有收到真实 N2NS / IPv4 数据帧才升级到 P2P
-//  4. 首次进入 P2PAvailable 时主动发 N2NS PING 探针
 func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, isAck bool) {
 	now := time.Now().UnixMilli()
 
@@ -1317,7 +1308,7 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 		return
 	}
 
-	// ---- 1. 真实数据帧：直接升 P2P ----
+	// 1. 真实数据帧：直接升 P2P
 	if isRealData {
 		if e.relayMgr.GetState(clientID) != ConnP2P {
 			log.Printf("[P2P] 从 %s (%s) 收到真实数据帧 → P2P 直连", clientID, ip)
@@ -1326,7 +1317,7 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 		return
 	}
 
-	// ---- 2. Punch / ACK：升级到 P2PAvailable ----
+	// 2. Punch / ACK：升级到 P2PAvailable
 	curState := e.relayMgr.GetState(clientID)
 	justUpgraded := false
 	if curState != ConnP2P && curState != ConnP2PAvailable {
@@ -1339,12 +1330,11 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 		justUpgraded = true
 	}
 
-	// ---- 3. 首次进入 P2PAvailable：主动发 N2NS PING 探针 ----
+	// 3. 首次进入 P2PAvailable：主动发 N2NS PING 探针
 	if justUpgraded {
 		safeGo("p2p-probe", func() {
 			e.sendP2PProbe(clientID)
 		})
-		// 30 秒超时降级：P2PAvailable 未升级到 P2P 则强制降级
 		safeGo("p2p-avail-timeout", func() {
 			select {
 			case <-e.doneCh:
@@ -1358,7 +1348,7 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 		})
 	}
 
-	// ---- 4. 只对 Punch 回 ACK，对 ACK 绝不回复 ----
+	// 4. 只对 Punch 回 ACK，对 ACK 绝不回复
 	if isAck {
 		return
 	}
