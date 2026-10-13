@@ -1,6 +1,12 @@
 package main
 
 // PC 端为 p2p_stream.go 补齐的依赖方法。
+//
+// p2p_stream.go 从 Termux 端复制时删除了 4 个函数（findPeerIDByAddr、
+// peerAddrAndMode、sendP2PFrame、handleP2PFrame），因为它们依赖 PC 端
+// main.go 的 Edge 结构。此文件统一补齐。
+//
+// 注意：findPeerByVIP 已在 app_stream.go 定义，本文件不再重复。
 
 import (
 	"errors"
@@ -8,18 +14,6 @@ import (
 	"log"
 	"net"
 )
-
-// findPeerByVIP 供 socks5.go 使用。
-func (e *Edge) findPeerByVIP(vip string) (string, bool) {
-	e.peersMu.RLock()
-	defer e.peersMu.RUnlock()
-	for id, p := range e.peers {
-		if p.VirtualIP == vip {
-			return id, true
-		}
-	}
-	return "", false
-}
 
 func (e *Edge) findPeerIDByAddr(addr *net.UDPAddr) string {
 	if addr == nil {
