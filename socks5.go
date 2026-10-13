@@ -1,0 +1,219 @@
+package main
+
+import (
+	"encoding/binary"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"sync"
+	"time"
+)
+
+const (
+	socks5Version                 = 0x05
+	socks5NoAuth                  = 0x00
+	socks5CmdConnect              = 0x01
+	socks5AtypIPv4                = 0x01
+	socks5AtypDomain              = 0x03
+	socks5AtypIPv6                = 0x04
+	socks5RepSuccess              = 0x00
+	socks5RepGeneralFailure       = 0x01
+	socks5RepHostUnreachable      = 0x04
+	socks5RepCommandNotSupported  = 0x07
+	socks5RepAddrTypeNotSupported = 0x08
+)
+
+type Socks5Server struct {
+	edge     *Edge
+	listen   string
+	ln       net.Listener
+	stopCh   chan struct{}
+	stopOnce sync.Once
+}
+
+func NewSocks5Server(edge *Edge, listen string) *Socks5Server {
+	return &Socks5Server{
+		edge:   edge,
+		listen: listen,
+		stopCh: make(chan struct{}),
+	}
+}
+
+func (s *Socks5Server) Serve() {
+	ln, err := net.Listen("tcp", s.listen)
+	if err != nil {
+		log.Printf("[SOCKS5] 监听 %s 失败: %v", s.listen, err)
+		return
+	}
+	s.ln = ln
+	log.Printf("[SOCKS5] 监听 %s（用 curl --socks5 或 ALL_PROXY 访问虚拟 IP）", s.listen)
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			select {
+			case <-s.stopCh:
+				return
+			default:
+			}
+			log.Printf("[SOCKS5] Accept 失败: %v", err)
+			return
+		}
+		safeGo("socks5-conn", func() { s.handleConn(conn) })
+	}
+}
+
+func (s *Socks5Server) Close() {
+	s.stopOnce.Do(func() { close(s.stopCh) })
+	if s.ln != nil {
+		_ = s.ln.Close()
+	}
+}
+
+func (s *Socks5Server) handleConn(conn net.Conn) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[SOCKS5] handleConn panic: %v", r)
+		}
+	}()
+
+	buf := make([]byte, 256)
+
+	// 阶段 1：方法协商
+	if _, err := io.ReadFull(conn, buf[:2]); err != nil {
+		_ = conn.Close()
+		return
+	}
+	if buf[0] != socks5Version {
+		_ = conn.Close()
+		return
+	}
+	nMethods := int(buf[1])
+	if nMethods < 1 || nMethods > 255 {
+		_ = conn.Close()
+		return
+	}
+	if _, err := io.ReadFull(conn, buf[:nMethods]); err != nil {
+		_ = conn.Close()
+		return
+	}
+	if _, err := conn.Write([]byte{socks5Version, socks5NoAuth}); err != nil {
+		_ = conn.Close()
+		return
+	}
+
+	// 阶段 2：请求
+	if _, err := io.ReadFull(conn, buf[:4]); err != nil {
+		_ = conn.Close()
+		return
+	}
+	if buf[0] != socks5Version {
+		_ = conn.Close()
+		return
+	}
+	if buf[1] != socks5CmdConnect {
+		writeSocks5Reply(conn, socks5RepCommandNotSupported)
+		_ = conn.Close()
+		return
+	}
+
+	var dstIP string
+	var dstPort uint16
+
+	switch buf[3] {
+	case socks5AtypIPv4:
+		if _, err := io.ReadFull(conn, buf[:6]); err != nil {
+			_ = conn.Close()
+			return
+		}
+		dstIP = fmt.Sprintf("%d.%d.%d.%d", buf[0], buf[1], buf[2], buf[3])
+		dstPort = binary.BigEndian.Uint16(buf[4:6])
+	case socks5AtypDomain:
+		if _, err := io.ReadFull(conn, buf[:1]); err != nil {
+			_ = conn.Close()
+			return
+		}
+		nameLen := int(buf[0])
+		if nameLen == 0 || nameLen > 253 {
+			_ = conn.Close()
+			return
+		}
+		if _, err := io.ReadFull(conn, buf[:nameLen+2]); err != nil {
+			_ = conn.Close()
+			return
+		}
+		log.Printf("[SOCKS5] 不支持域名 %s（请用虚拟 IP）", string(buf[:nameLen]))
+		writeSocks5Reply(conn, socks5RepAddrTypeNotSupported)
+		_ = conn.Close()
+		return
+	default:
+		writeSocks5Reply(conn, socks5RepAddrTypeNotSupported)
+		_ = conn.Close()
+		return
+	}
+
+	log.Printf("[SOCKS5] CONNECT %s:%d", dstIP, dstPort)
+
+	peerID, ok := s.edge.findPeerByVIP(dstIP)
+	if !ok {
+		log.Printf("[SOCKS5] 找不到 VIP %s 对应的 peer", dstIP)
+		writeSocks5Reply(conn, socks5RepHostUnreachable)
+		_ = conn.Close()
+		return
+	}
+
+	// ★ 优先 P2P，失败回落 WS
+	useP2P := s.edge.p2pStreams != nil &&
+		s.edge.relayMgr != nil &&
+		(s.edge.relayMgr.IsP2P(peerID) || s.edge.relayMgr.IsTURN(peerID))
+
+	if useP2P {
+		// ★ 建流超时 5s → 2s，避免 P2P 失败时白等太久
+		p2s, err := s.edge.p2pStreams.OpenP2PStream(peerID, int(dstPort), conn, 2*time.Second)
+		if err == nil {
+			log.Printf("[SOCKS5] CONNECT %s:%d → P2P 直连 (stream=%d)", dstIP, dstPort, p2s.ID)
+			if werr := writeSocks5Reply(conn, socks5RepSuccess); werr != nil {
+				p2s.close("reply-fail")
+				_ = conn.Close()
+				return
+			}
+			return
+		}
+		log.Printf("[SOCKS5] P2P 建流失败(%v)，回落 WS 中继", err)
+	}
+
+	// 回落：WS app_stream
+	stream, err := s.edge.openLocalStream(peerID, int(dstPort), conn)
+	if err != nil {
+		log.Printf("[SOCKS5] 打开 stream 失败: %v", err)
+		writeSocks5Reply(conn, socks5RepGeneralFailure)
+		_ = conn.Close()
+		return
+	}
+
+	if !stream.WaitAck(10 * time.Second) {
+		log.Printf("[SOCKS5] stream %s 未收到 ack", stream.ID)
+		writeSocks5Reply(conn, socks5RepHostUnreachable)
+		s.edge.closeStream(stream, "ack-timeout")
+		_ = conn.Close()
+		return
+	}
+
+	if err := writeSocks5Reply(conn, socks5RepSuccess); err != nil {
+		s.edge.closeStream(stream, "reply-fail")
+		_ = conn.Close()
+		return
+	}
+
+	log.Printf("[SOCKS5] CONNECT %s:%d → WS 中继 (stream=%s)", dstIP, dstPort, stream.ID)
+	safeGo("socks5-pump", func() { s.edge.pumpLocalToRemote(stream) })
+}
+
+func writeSocks5Reply(conn net.Conn, rep byte) error {
+	_, err := conn.Write([]byte{
+		socks5Version, rep, 0, socks5AtypIPv4,
+		0, 0, 0, 0, 0, 0,
+	})
+	return err
+}
