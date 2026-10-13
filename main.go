@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -55,41 +57,31 @@ type Edge struct {
 	relayMgr   *RelayManager
 	turnClient *TURNClient
 
-	// tun 用 atomic.Pointer：tunWriteLoop 与 ready 分支（重建 TUN）之间
-	// 原本存在 TOCTOU 竞争。用原子指针后，快照和写入是原子的。
-	tun atomic.Pointer[TUNDevice]
-
 	udpConn *net.UDPConn
 	udpPort int
 
 	peers   map[string]*PeerInfo
 	peersMu sync.RWMutex
 
-	tunWriteCh chan []byte
-
 	natMeta *NATMetadata
 
 	fallbackTimers   map[string]*time.Timer
 	fallbackTimersMu sync.Mutex
 
-	lastNoPeerLog   map[string]int64
-	lastNoPeerLogMu sync.Mutex
-
-	tunStateLog   map[string]ConnType
-	tunStateLogMu sync.Mutex
+	// ★ 新增：P2PAvailable 30 秒超时降级定时器。
+	//
+	// 打洞握手成功后进入 P2PAvailable，30 秒内如果没升到 P2P
+	// （没收到 PONG 或真实数据帧），强制降级到 TURN/WS。
+	// 用可取消的定时器替代之前匿名的 safeGo("p2p-avail-timeout")。
+	p2pAvailTimers   map[string]*time.Timer
+	p2pAvailTimersMu sync.Mutex
 
 	lastMetadataReportAt int64
 
-	// ★ 应用层 WS 隧道流管理器（app_stream.go 使用）
-	streamMgr *AppStreamManager
-
-	// ★ N2NS P2P 隧道管理器（p2p_stream.go 使用）
+	streamMgr  *AppStreamManager
 	p2pStreams *P2PStreamManager
+	socks5Srv  *Socks5Server
 
-	// ★ SOCKS5 入口（PC 主动访问 Termux / PC 服务）
-	socks5Srv *Socks5Server
-
-	// ★ ACK 限流器
 	punchAckLimiter *punchAckLimiter
 
 	doneCh  chan struct{}
@@ -100,7 +92,7 @@ type Edge struct {
 
 func (e *Edge) Done() <-chan struct{} { return e.doneCh }
 
-// ============ UDP 保活 ============
+// ============ UDP 保活（STUN 侧） ============
 
 const keepaliveInterval = 5 * time.Second
 
@@ -142,7 +134,7 @@ func (e *Edge) startKeepalive() {
 		return
 	}
 
-	log.Printf("[Keepalive] 启动（条件触发），每 %v 刷新 %d 个 STUN 服务器（仅在有 peer 时）",
+	log.Printf("[Keepalive] 启动，每 %v 刷新 %d 个 STUN 服务器（仅在有 peer 时）",
 		keepaliveInterval, len(addrs))
 
 	safeGo("keepalive", func() {
@@ -180,39 +172,65 @@ func (e *Edge) startKeepalive() {
 	})
 }
 
-// ============ 日志节流 ============
+// ============ P2P 通道保活 ============
 
-func (e *Edge) logNoPeerThrottled(dstIP string, n int) {
-	now := time.Now().UnixMilli()
-	e.lastNoPeerLogMu.Lock()
-	last := e.lastNoPeerLog["__global__"]
-	if now-last < 5000 {
-		e.lastNoPeerLogMu.Unlock()
-		return
-	}
-	e.lastNoPeerLog["__global__"] = now
-	e.lastNoPeerLogMu.Unlock()
-	log.Printf("[TUN] 无匹配 peer，dst=%s len=%d", dstIP, n)
+const p2pKeepaliveInterval = 15 * time.Second
+
+func (e *Edge) startP2PKeepalive() {
+	log.Printf("[P2P-Keepalive] 启动，每 %v 刷新 P2P 通道", p2pKeepaliveInterval)
+
+	safeGo("p2p-keepalive", func() {
+		ticker := time.NewTicker(p2pKeepaliveInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-e.doneCh:
+				log.Printf("[P2P-Keepalive] 已停止")
+				return
+			case <-ticker.C:
+				e.sendP2PKeepalive()
+			}
+		}
+	})
 }
 
-func (e *Edge) logTunForward(peerID, dstIP string, n, proto int, sent bool, state ConnType) {
-	e.tunStateLogMu.Lock()
-	prev, existed := e.tunStateLog[peerID]
-	if existed && prev == state {
-		e.tunStateLogMu.Unlock()
+func (e *Edge) sendP2PKeepalive() {
+	if e.relayMgr == nil || e.udpConn == nil {
 		return
 	}
-	e.tunStateLog[peerID] = state
-	e.tunStateLogMu.Unlock()
 
-	log.Printf("[TUN] → %s dst=%s len=%d proto=%d sent=%v state=%s",
-		peerID, dstIP, n, proto, sent, state)
+	e.peersMu.RLock()
+	type target struct {
+		id   string
+		addr *net.UDPAddr
+	}
+	var targets []target
+	for id, p := range e.peers {
+		if p.UDPAddr == nil {
+			continue
+		}
+		st := e.relayMgr.GetState(id)
+		if st != ConnP2P && st != ConnP2PAvailable {
+			continue
+		}
+		targets = append(targets, target{id: id, addr: p.UDPAddr})
+	}
+	e.peersMu.RUnlock()
+
+	if len(targets) == 0 {
+		return
+	}
+
+	probe := buildPunchProbe(e.getVirtualIPLocked())
+	for _, t := range targets {
+		_, _ = e.udpConn.WriteToUDP(probe, t.addr)
+	}
 }
 
-func (e *Edge) forgetTunState(peerID string) {
-	e.tunStateLogMu.Lock()
-	delete(e.tunStateLog, peerID)
-	e.tunStateLogMu.Unlock()
+func (e *Edge) getVirtualIPLocked() string {
+	e.peersMu.RLock()
+	defer e.peersMu.RUnlock()
+	return e.virtualIP
 }
 
 // ============ 超时降级 ============
@@ -260,49 +278,64 @@ func (e *Edge) cancelFallbackTimer(peerID string) {
 	}
 }
 
-// ============ 工具函数 ============
+// ★ 新增：P2PAvailable 30 秒超时降级。
+//
+// 打洞握手成功后进入 P2PAvailable，30 秒内如果没有升到 P2P（即没有
+// 收到 PONG 或真实数据帧），强制降级到 TURN/WS。
+//
+// 场景：CGNAT hairpin 场景下握手成功但数据面永远过不去。没有这个
+// 兜底会永远停在 P2PAvailable，SOCKS5 每次都尝试建流 2 秒超时。
+//
+// 用可取消的定时器而非匿名 safeGo，原因：peer 断线重连后旧定时器
+// 会误降级新连接。
+func (e *Edge) scheduleP2PAvailTimeout(peerID string) {
+	if e.relayMgr == nil || peerID == "" {
+		return
+	}
 
-func cidrToNetmask(cidr string) string {
-	parts := strings.Split(cidr, "/")
-	if len(parts) != 2 {
-		return "255.255.255.0"
+	e.p2pAvailTimersMu.Lock()
+	if t, ok := e.p2pAvailTimers[peerID]; ok {
+		t.Stop()
 	}
-	prefix, err := strconv.Atoi(parts[1])
-	if err != nil || prefix < 0 || prefix > 32 {
-		return "255.255.255.0"
-	}
-	var mask uint32
-	if prefix > 0 {
-		mask = ^uint32(0) << (32 - prefix)
-	}
-	return fmt.Sprintf("%d.%d.%d.%d",
-		(mask>>24)&255, (mask>>16)&255, (mask>>8)&255, mask&255)
+
+	t := time.AfterFunc(30*time.Second, func() {
+		e.p2pAvailTimersMu.Lock()
+		delete(e.p2pAvailTimers, peerID)
+		e.p2pAvailTimersMu.Unlock()
+
+		if e.relayMgr == nil {
+			return
+		}
+		if e.relayMgr.GetState(peerID) == ConnP2PAvailable {
+			log.Printf("[P2P] %s P2PAvailable 超时 30s 未验证数据面，强制降级", peerID)
+			e.relayMgr.ForceFallback(peerID, "p2p-avail-timeout")
+		}
+	})
+	e.p2pAvailTimers[peerID] = t
+	e.p2pAvailTimersMu.Unlock()
 }
 
-func cidrNetworkAddr(cidr string) string {
-	parts := strings.Split(cidr, "/")
-	if len(parts) != 2 {
-		return cidr
+func (e *Edge) cancelP2PAvailTimeout(peerID string) {
+	if peerID == "" {
+		return
 	}
-	return parts[0]
-}
-
-func cidrPrefix(cidr string) string {
-	parts := strings.Split(cidr, "/")
-	if len(parts) != 2 {
-		return "24"
+	e.p2pAvailTimersMu.Lock()
+	defer e.p2pAvailTimersMu.Unlock()
+	if t, ok := e.p2pAvailTimers[peerID]; ok {
+		t.Stop()
+		delete(e.p2pAvailTimers, peerID)
 	}
-	return parts[1]
 }
 
 // ============ 主函数 ============
 
 func main() {
+	setupResolver()
+
 	signalingURL := getEnv("SIGNALING_URL", DefaultSignalingURL)
 	roomId := getEnv("ROOM_ID", "default-room")
 	clientId := getEnv("CLIENT_ID", "")
 	nodeName := getEnv("NODE_NAME", "")
-	tunName := getEnv("TUN_NAME", "n2n0")
 	udpPort := getEnvInt("UDP_PORT", 0)
 	stunServers := getEnv("STUN_SERVERS", "")
 	connectToken := getEnv("CONNECT_TOKEN", "")
@@ -313,7 +346,7 @@ func main() {
 	}
 
 	if clientId == "" {
-		installDir := getEnv("INSTALL_DIR", filepath.Join(os.Getenv("HOME"), ".n2n-go"))
+		installDir := getEnv("INSTALL_DIR", filepath.Join(os.Getenv("HOME"), ".n2n-termux"))
 		idFile := filepath.Join(installDir, "client_id")
 		if b, err := os.ReadFile(idFile); err == nil {
 			clientId = strings.TrimSpace(string(b))
@@ -336,9 +369,8 @@ func main() {
 		hostname, _ := os.Hostname()
 		nodeName = hostname
 	}
-	_ = tunName
 
-	log.Printf("n2n-go-client %s 启动", BuildVersion)
+	log.Printf("n2n-termux %s 启动", BuildVersion)
 	if connectToken != "" {
 		log.Printf("[配置] CONNECT_TOKEN 已设置（%d 字符）", len(connectToken))
 	} else {
@@ -351,16 +383,13 @@ func main() {
 		roomId:         roomId,
 		virtualCIDR:    DefaultVirtualCIDR,
 		peers:          make(map[string]*PeerInfo),
-		tunWriteCh:     make(chan []byte, 1024),
 		udpPort:        udpPort,
 		fallbackTimers: make(map[string]*time.Timer),
-		lastNoPeerLog:  make(map[string]int64),
-		tunStateLog:    make(map[string]ConnType),
+		p2pAvailTimers: make(map[string]*time.Timer), // ★ 新增
 		doneCh:         make(chan struct{}),
+		streamMgr:      NewAppStreamManager(),
 	}
 	edge.punchAckLimiter = newPunchAckLimiter()
-	edge.streamMgr = NewAppStreamManager() // ★ 新增
-	edge.p2pStreams = NewP2PStreamManager(edge)
 
 	udpAddr := &net.UDPAddr{IP: net.IPv4zero, Port: udpPort}
 	udpConn, err := net.ListenUDP("udp", udpAddr)
@@ -384,6 +413,8 @@ func main() {
 	}
 	edge.natMeta = probeNAT(actualPort, servers)
 
+	edge.p2pStreams = NewP2PStreamManager(edge)
+
 	ws, err := NewWSTransport(signalingURL, roomId, clientId, connectToken)
 	if err != nil {
 		log.Fatalf("连接信令失败: %v", err)
@@ -394,16 +425,42 @@ func main() {
 	ws.StartHeartbeat(20 * time.Second)
 
 	ws.onReconnect = func() {
-		if edge.punchAckLimiter != nil {
-			edge.punchAckLimiter.clear()
+		log.Printf("[信令] WebSocket 重连成功，清空所有连接状态")
+
+		if edge.relayMgr != nil {
+			edge.relayMgr.ClearAll()
 		}
 		if edge.p2pStreams != nil {
 			edge.p2pStreams.closeAll()
 		}
-		if edge.streamMgr != nil { // ★ 新增
-			edge.streamMgr.closeAll()
+		if edge.punchAckLimiter != nil {
+			edge.punchAckLimiter.clear()
 		}
-		if edge.virtualIP != "" {
+
+		// ★ 清理所有 P2PAvailable 超时定时器
+		edge.p2pAvailTimersMu.Lock()
+		for _, t := range edge.p2pAvailTimers {
+			t.Stop()
+		}
+		edge.p2pAvailTimers = make(map[string]*time.Timer)
+		edge.p2pAvailTimersMu.Unlock()
+
+		natHoleActiveMu.Lock()
+		failCount := len(failCounts)
+		if failCount > 0 {
+			failCounts = make(map[string]int)
+		}
+		activeCount := len(natHoleActive)
+		if activeCount > 0 {
+			natHoleActive = make(map[string]bool)
+		}
+		natHoleActiveMu.Unlock()
+		if failCount > 0 || activeCount > 0 {
+			log.Printf("[NAT-HOLE] WS 重连，清空 %d 个失败计数 / %d 个 in-flight 标记",
+				failCount, activeCount)
+		}
+
+		if edge.getVirtualIPLocked() != "" {
 			edge.reportMetadata()
 		}
 	}
@@ -412,27 +469,18 @@ func main() {
 	edge.turnClient.onMessage = func(data []byte, addr net.Addr) {
 		ua, ok := addr.(*net.UDPAddr)
 		if !ok {
-			edge.enqueueTUN(data)
 			return
 		}
-		// N2NS（数据面）
 		if isP2PFrame(data) {
 			edge.handleP2PFrame(ua, true, data)
 			return
 		}
-		// Punch / ACK
 		if isPunchProbe(data) {
 			edge.notePeerProbeTURN(ua)
 			return
 		}
 		if isPunchAck(data) {
-			edge.notePeerAckTURN(ua)
-			return
-		}
-		// IPv4
-		if len(data) > 0 && data[0]>>4 == 4 {
-			edge.notePeerTrafficTURN(ua)
-			edge.enqueueTUN(data)
+			edge.notePeerAck(ua)
 			return
 		}
 	}
@@ -443,7 +491,7 @@ func main() {
 	ws.SetHandlers(
 		edge.handleSignaling,
 		func(data []byte) {
-			edge.enqueueTUN(data)
+			// proxy 模式：服务端不会下发 binary；忽略
 		},
 	)
 
@@ -464,7 +512,6 @@ func main() {
 				continue
 			}
 
-			// 1. STUN
 			if buf[0] == 0x01 && buf[1] == 0x01 {
 				if ip, port, ok := parseSTUNResponse(buf[:n]); ok {
 					edge.addAssistedEndpoint(ip, port)
@@ -472,13 +519,11 @@ func main() {
 				continue
 			}
 
-			// 2. N2NS
 			if isP2PFrame(buf[:n]) {
 				edge.handleP2PFrame(addr, false, buf[:n])
 				continue
 			}
 
-			// 3. Punch / ACK
 			if isPunchProbe(buf[:n]) {
 				edge.notePeerProbe(addr)
 				continue
@@ -487,26 +532,12 @@ func main() {
 				edge.notePeerAck(addr)
 				continue
 			}
-
-			// 4. IPv4（TUN）
-			if buf[0]>>4 == 4 {
-				edge.notePeerTraffic(addr)
-				edge.enqueueTUN(buf[:n])
-			}
-		}
-	})
-
-	safeGo("tunWriteLoop", func() {
-		for data := range edge.tunWriteCh {
-			if tun := edge.tun.Load(); tun != nil {
-				_, _ = tun.Write(data)
-			}
 		}
 	})
 
 	edge.startKeepalive()
+	edge.startP2PKeepalive()
 
-	// 启动 SOCKS5 入口
 	edge.socks5Srv = NewSocks5Server(edge, socks5Listen)
 	safeGo("socks5-server", func() { edge.socks5Srv.Serve() })
 
@@ -554,20 +585,25 @@ func (e *Edge) Stop() {
 	e.fallbackTimers = make(map[string]*time.Timer)
 	e.fallbackTimersMu.Unlock()
 
+	// ★ 新增：清理 P2PAvailable 超时定时器
+	e.p2pAvailTimersMu.Lock()
+	for _, t := range e.p2pAvailTimers {
+		t.Stop()
+	}
+	e.p2pAvailTimers = make(map[string]*time.Timer)
+	e.p2pAvailTimersMu.Unlock()
+
 	if e.turnClient != nil {
 		e.turnClient.Close()
 	}
 	if e.socks5Srv != nil {
 		e.socks5Srv.Close()
 	}
-	if e.streamMgr != nil { // ★ 新增
+	if e.streamMgr != nil {
 		e.streamMgr.closeAll()
 	}
 	if e.p2pStreams != nil {
 		e.p2pStreams.closeAll()
-	}
-	if tun := e.tun.Load(); tun != nil {
-		_ = tun.Close()
 	}
 }
 
@@ -606,7 +642,8 @@ func (e *Edge) reportMetadata() {
 		metaPayload["assistedEndpoints"] = nm.AllEndpoints
 	}
 
-	if lanEndpoints := collectLANEndpoints(e.udpPort, e.virtualIP); len(lanEndpoints) > 0 {
+	vip := e.getVirtualIPLocked()
+	if lanEndpoints := collectLANEndpoints(e.udpPort, vip); len(lanEndpoints) > 0 {
 		metaPayload["lanEndpoints"] = lanEndpoints
 		log.Printf("[NAT] 上报 LAN 地址: %v", lanEndpoints)
 	}
@@ -636,9 +673,10 @@ func (e *Edge) printNodeSummary() {
 	log.Println("================= 本机信息 =================")
 	log.Printf("  Client ID   : %s", e.clientId)
 	log.Printf("  节点名       : %s", e.nodeName)
-	log.Printf("  虚拟 IP     : %s", e.virtualIP)
+	log.Printf("  虚拟 IP     : %s", e.getVirtualIPLocked())
 	log.Printf("  虚拟网段    : %s", e.virtualCIDR)
 	log.Printf("  P2P 端口    : %d", e.udpPort)
+	log.Printf("  模式         : proxy (SOCKS5)")
 	log.Println("==========================================")
 	log.Println("")
 }
@@ -684,76 +722,25 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 	t, _ := msg["type"].(string)
 	from, _ := msg["from"].(string)
 
-	if t == "_reconnected" {
-		log.Printf("[信令] WebSocket 重连成功，重新上报元数据")
-
-		natHoleActiveMu.Lock()
-		count := len(failCounts)
-		if count > 0 {
-			failCounts = make(map[string]int)
-		}
-		natHoleActiveMu.Unlock()
-		if count > 0 {
-			log.Printf("[NAT-HOLE] WS 重连，清空 %d 个 peer 的失败计数", count)
-		}
-
-		if e.relayMgr != nil {
-			e.relayMgr.ClearAll()
-		}
-		if e.punchAckLimiter != nil {
-			e.punchAckLimiter.clear()
-		}
-		if e.p2pStreams != nil {
-			e.p2pStreams.closeAll()
-		}
-		if e.streamMgr != nil { // ★ 新增
-			e.streamMgr.closeAll()
-		}
-
-		e.reportMetadata()
-		return
-	}
-
 	switch t {
 	case "ready":
 		payload, _ := msg["payload"].(map[string]interface{})
 
-		oldVIP := e.virtualIP
-		oldCIDR := e.virtualCIDR
-
+		e.peersMu.Lock()
 		e.virtualIP, _ = payload["virtualIp"].(string)
 		if cidr, ok := payload["virtualNetwork"].(string); ok && cidr != "" {
 			e.virtualCIDR = cidr
 		}
-		log.Printf("分配虚拟 IP: %s（网段 %s）", e.virtualIP, e.virtualCIDR)
+		vip := e.virtualIP
+		cidr := e.virtualCIDR
+		e.peersMu.Unlock()
+		log.Printf("分配虚拟 IP: %s（网段 %s）", vip, cidr)
 
 		if serverIP, ok := payload["yourPublicIp"].(string); ok && serverIP != "" {
 			e.mu.Lock()
 			e.serverSeenIP = serverIP
 			e.mu.Unlock()
 			log.Printf("[信令] 服务端看到的本机出口 IP: %s（WS/TCP 出口，仅参考）", serverIP)
-		}
-
-		oldTun := e.tun.Load()
-		needBuild := oldTun == nil || oldVIP != e.virtualIP || oldCIDR != e.virtualCIDR
-
-		if needBuild {
-			if oldTun != nil {
-				log.Printf("[TUN] 重建（VIP %s→%s，网段 %s→%s）",
-					oldVIP, e.virtualIP, oldCIDR, e.virtualCIDR)
-				e.tun.Store(nil)
-				_ = oldTun.Close()
-			}
-			tun, err := setupTUN(e.virtualIP, e.virtualCIDR, getEnv("TUN_NAME", "n2n0"))
-			if err != nil {
-				log.Printf("[TUN] 启动失败: %v", err)
-			} else {
-				e.tun.Store(tun)
-				safeGo("tunReadLoop", func() { e.tunReadLoop(tun) })
-			}
-		} else {
-			log.Printf("[TUN] 已存在且未变（vip=%s cidr=%s），跳过重建",
-				e.virtualIP, e.virtualCIDR)
 		}
 
 		e.reportMetadata()
@@ -905,7 +892,9 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			if e.relayMgr.GetState(peerID) == ConnP2P {
 				continue
 			}
-			e.relayMgr.MarkFallback(peerID)
+			// ★ 用 ForceFallback 而非 MarkFallback：服务端明确要求降级时
+			//   应该绕过 P2PAvailable 保护，直接切到 TURN/WS。
+			e.relayMgr.ForceFallback(peerID, reason)
 		}
 
 	case "turn_peer_info":
@@ -938,6 +927,10 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		if e.relayMgr != nil {
 			e.relayMgr.ClearPeer(from)
 		}
+
+		// ★ 清理 P2PAvailable 超时定时器
+		e.cancelP2PAvailTimeout(from)
+
 		if e.punchAckLimiter != nil {
 			e.punchAckLimiter.forget(from)
 		}
@@ -952,13 +945,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		e.peersMu.Unlock()
 
 		e.cancelFallbackTimer(from)
-		e.lastNoPeerLogMu.Lock()
-		delete(e.lastNoPeerLog, from)
-		e.lastNoPeerLogMu.Unlock()
-		e.forgetTunState(from)
-		if e.p2pStreams != nil {
-			e.p2pStreams.dropPeer(from)
-		}
 	}
 }
 
@@ -1050,8 +1036,8 @@ func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natTyp
 		udpAddr = &net.UDPAddr{IP: net.ParseIP(pubIP), Port: pubPort}
 	}
 
-	selfVIP := e.virtualIP
-	prefixes := localPrefixes(selfVIP)
+	vip := e.getVirtualIPLocked()
+	prefixes := localPrefixes(vip)
 	sortedLAN := sortLANByAffinity(lanEndpoints, prefixes)
 
 	e.peersMu.Lock()
@@ -1124,7 +1110,14 @@ func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 	}
 }
 
-// runNatHole 执行一次打洞指令，并在成功时主动触发数据面探针。
+// runNatHole 执行一次打洞指令，并在成功时主动触发 P2P 数据面探针。
+//
+// 打洞成功后不等上层应用流量，立刻发一个 P2P PING 探针。
+// 打洞握手成功只证明 NAT 映射打开，状态升级到 P2PAvailable。
+// 要升级到 P2P（数据面验证），必须有真实 P2P 数据帧到达。
+//
+// 主动发 PING 探针：对端收到会回 PONG；本端收到 PONG 后
+// handleP2PFrame 会 MarkP2P。双方在 1 个 RTT 内完成 P2P 升级。
 func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 	res := e.executeNatHole(instr)
 	if res == nil {
@@ -1133,21 +1126,27 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 
 	if res.State == PunchStateSucceeded {
 		e.relayMgr.MarkP2PAvailable(instr.TargetMac)
-		safeGo("p2p-probe", func() {
-			e.sendP2PProbe(instr.TargetMac)
-		})
+
+		// 主动发 P2P PING 探针
+		if e.p2pStreams != nil {
+			safeGo("p2p-probe", func() {
+				e.p2pStreams.sendP2PProbe(instr.TargetMac)
+			})
+		}
 	} else if res.State == PunchStateFailed {
 		e.relayMgr.MarkFallback(instr.TargetMac)
 	}
 
+	// ★ 修复：TURN/Relay 不冒充 P2P。只有真正 P2P 才报 3，
+	//   打洞握手成功报 2，其余一律 0，避免误导服务端做交叉校验。
 	p2pStatus := 0
 	switch e.relayMgr.GetState(instr.TargetMac) {
 	case ConnP2P:
 		p2pStatus = 3
 	case ConnP2PAvailable:
 		p2pStatus = 2
-	case ConnTURN, ConnRelay:
-		p2pStatus = 2
+	default:
+		p2pStatus = 0
 	}
 
 	_ = e.ws.Send(map[string]interface{}{
@@ -1166,85 +1165,6 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 	})
 }
 
-// tunReadLoop 从 TUN 读 IPv4 包，转发给对应 peer。
-func (e *Edge) tunReadLoop(tun *TUNDevice) {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("[TUN] tunReadLoop panic: %v", r)
-		}
-	}()
-
-	if tun == nil {
-		return
-	}
-
-	buf := make([]byte, 65535)
-	for {
-		n, err := tun.Read(buf)
-		if err != nil {
-			select {
-			case <-e.doneCh:
-				return
-			default:
-			}
-			log.Printf("[TUN] 读取错误: %v", err)
-			return
-		}
-		if n < 20 || buf[0]>>4 != 4 {
-			continue
-		}
-
-		dstIP := net.IP(buf[16:20]).String()
-
-		e.peersMu.RLock()
-		var target *PeerInfo
-		for _, p := range e.peers {
-			if p.VirtualIP == dstIP {
-				target = p
-				break
-			}
-		}
-		e.peersMu.RUnlock()
-
-		if target == nil {
-			proto := 0
-			if n >= 10 {
-				proto = int(buf[9])
-			}
-			if proto == 17 && n < 200 {
-				if e.ws != nil {
-					_ = e.ws.SendBinary(buf[:n])
-				}
-			} else {
-				e.logNoPeerThrottled(dstIP, n)
-			}
-			continue
-		}
-
-		state := ConnUnknown
-		if e.relayMgr != nil {
-			state = e.relayMgr.GetState(target.ClientID)
-		}
-		ok := e.relayMgr.SendToPeer(target.ClientID, buf[:n], target)
-		if n >= 10 {
-			e.logTunForward(target.ClientID, dstIP, n, int(buf[9]), ok, state)
-		}
-		if !ok {
-			_ = e.ws.SendBinary(buf[:n])
-		}
-	}
-}
-
-func (e *Edge) enqueueTUN(data []byte) {
-	cp := make([]byte, len(data))
-	copy(cp, data)
-	select {
-	case e.tunWriteCh <- cp:
-	default:
-		log.Printf("[TUN] 写入队列已满，丢弃 %d 字节", len(cp))
-	}
-}
-
 // ============ peer 探测处理 ============
 
 func (e *Edge) notePeerProbe(addr *net.UDPAddr) {
@@ -1259,10 +1179,6 @@ func (e *Edge) notePeerProbeTURN(addr *net.UDPAddr) {
 	e.notePeerCommon(addr, false, true, false)
 }
 
-func (e *Edge) notePeerAckTURN(addr *net.UDPAddr) {
-	e.notePeerCommon(addr, false, true, true)
-}
-
 func (e *Edge) notePeerTraffic(addr *net.UDPAddr) {
 	e.notePeerCommon(addr, true, false, false)
 }
@@ -1272,6 +1188,12 @@ func (e *Edge) notePeerTrafficTURN(addr *net.UDPAddr) {
 }
 
 // notePeerCommon 是打洞握手路径的统一入口。
+//
+// 与 PC 端 punch.go 对齐四件事：
+//  1. Punch 与 ACK 分开处理，ACK **绝不回复**
+//  2. 收到 Punch 或 ACK 都升级到 P2PAvailable（打洞握手成功，未验证数据面）
+//  3. 只有收到真实 P2P 数据帧或 PONG 才升级到 P2P
+//  4. 首次进入 P2PAvailable 时主动发 P2P PING 探针
 func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, isAck bool) {
 	now := time.Now().UnixMilli()
 
@@ -1308,7 +1230,7 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 		return
 	}
 
-	// 1. 真实数据帧：直接升 P2P
+	// ---- 1. 真实数据帧：直接升 P2P（最高优先级）----
 	if isRealData {
 		if e.relayMgr.GetState(clientID) != ConnP2P {
 			log.Printf("[P2P] 从 %s (%s) 收到真实数据帧 → P2P 直连", clientID, ip)
@@ -1317,7 +1239,7 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 		return
 	}
 
-	// 2. Punch / ACK：升级到 P2PAvailable
+	// ---- 2. Punch / ACK：打洞握手成功，升级到 P2PAvailable ----
 	curState := e.relayMgr.GetState(clientID)
 	justUpgraded := false
 	if curState != ConnP2P && curState != ConnP2PAvailable {
@@ -1330,25 +1252,18 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 		justUpgraded = true
 	}
 
-	// 3. 首次进入 P2PAvailable：主动发 N2NS PING 探针
+	// 首次进入 P2PAvailable：主动发 P2P PING 探针 + 启动超时降级定时器
 	if justUpgraded {
-		safeGo("p2p-probe", func() {
-			e.sendP2PProbe(clientID)
-		})
-		safeGo("p2p-avail-timeout", func() {
-			select {
-			case <-e.doneCh:
-				return
-			case <-time.After(30 * time.Second):
-			}
-			if e.relayMgr.GetState(clientID) == ConnP2PAvailable {
-				log.Printf("[P2P] %s P2PAvailable 超时 30s 未验证数据面，降级", clientID)
-				e.relayMgr.MarkFallback(clientID)
-			}
-		})
+		if e.p2pStreams != nil {
+			safeGo("p2p-probe", func() {
+				e.p2pStreams.sendP2PProbe(clientID)
+			})
+		}
+		// ★ 用可取消的定时器替代匿名 safeGo
+		e.scheduleP2PAvailTimeout(clientID)
 	}
 
-	// 4. 只对 Punch 回 ACK，对 ACK 绝不回复
+	// ---- 3. 只对 Punch 回 ACK，对 ACK 绝不回复 ----
 	if isAck {
 		return
 	}
@@ -1383,7 +1298,7 @@ func (e *Edge) sendProbeTo(addr *net.UDPAddr) {
 	if e.udpConn == nil || addr == nil {
 		return
 	}
-	probe := buildPunchProbe(e.virtualIP)
+	probe := buildPunchProbe(e.getVirtualIPLocked())
 	e.writeProbe(addr, probe, false)
 }
 
@@ -1464,6 +1379,242 @@ func splitCSV(s string) []string {
 	}
 	if cur != "" {
 		out = append(out, cur)
+	}
+	return out
+}
+
+// ============ DNS 修复（Termux 专用） ============
+
+func setupResolver() {
+	prefix := os.Getenv("PREFIX")
+	if prefix == "" {
+		prefix = os.Getenv("TERMUX_PREFIX")
+	}
+
+	candidates := []string{}
+	if prefix != "" {
+		candidates = append(candidates, filepath.Join(prefix, "etc", "resolv.conf"))
+	}
+	candidates = append(candidates,
+		"/data/data/com.termux/files/usr/etc/resolv.conf",
+		"/etc/resolv.conf",
+	)
+
+	var nameservers []string
+	var source string
+	for _, p := range candidates {
+		nss := readNameservers(p)
+		if len(nss) > 0 {
+			nameservers = nss
+			source = p
+			break
+		}
+	}
+
+	if len(nameservers) == 0 {
+		nameservers = []string{"8.8.8.8:53", "1.1.1.1:53", "114.114.114.114:53"}
+		source = "<fallback>"
+	}
+
+	log.Printf("[DNS] 使用 %s 的 %d 个 nameserver: %v", source, len(nameservers), nameservers)
+
+	var idx uint32
+	net.DefaultResolver = &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			n := atomic.AddUint32(&idx, 1)
+			ns := nameservers[int(n)%len(nameservers)]
+
+			netProto := "udp"
+			if strings.HasPrefix(network, "tcp") {
+				netProto = "tcp"
+			}
+			d := net.Dialer{Timeout: 5 * time.Second}
+			return d.DialContext(ctx, netProto, ns)
+		},
+	}
+}
+
+func readNameservers(path string) []string {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	var result []string
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[0] == "nameserver" {
+			ns := fields[1]
+			if strings.Contains(ns, ":") {
+				if !strings.HasPrefix(ns, "[") {
+					ns = "[" + ns + "]"
+				}
+				ns += ":53"
+			} else {
+				ns += ":53"
+			}
+			result = append(result, ns)
+		}
+	}
+	return result
+}
+
+// ============ LAN 地址探测（同 WiFi 直连用） ============
+
+func collectLANEndpoints(port int, selfVIP string) []string {
+	var result []string
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	seen := make(map[string]bool)
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip == nil || ip.To4() == nil {
+				continue
+			}
+			ip4 := ip.To4()
+			if isCGNATOverlay(ip4) {
+				continue
+			}
+			if selfVIP != "" && ip4.String() == selfVIP {
+				continue
+			}
+			if !isPrivateIPv4(ip4) {
+				continue
+			}
+			if ip4.IsLoopback() || ip4.IsLinkLocalUnicast() {
+				continue
+			}
+			ep := net.JoinHostPort(ip4.String(), strconv.Itoa(port))
+			if seen[ep] {
+				continue
+			}
+			seen[ep] = true
+			result = append(result, ep)
+		}
+	}
+	return result
+}
+
+func isPrivateIPv4(ip net.IP) bool {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return false
+	}
+	if ip4[0] == 10 {
+		return true
+	}
+	if ip4[0] == 172 && ip4[1] >= 16 && ip4[1] <= 31 {
+		return true
+	}
+	if ip4[0] == 192 && ip4[1] == 168 {
+		return true
+	}
+	return false
+}
+
+func isCGNATOverlay(ip net.IP) bool {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return false
+	}
+	return ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127
+}
+
+func localPrefixes(selfVIP string) []*net.IPNet {
+	var result []*net.IPNet
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			ipnet, ok := addr.(*net.IPNet)
+			if !ok || ipnet.IP.To4() == nil {
+				continue
+			}
+			ip4 := ipnet.IP.To4()
+			if isCGNATOverlay(ip4) {
+				continue
+			}
+			if selfVIP != "" && ip4.String() == selfVIP {
+				continue
+			}
+			if !isPrivateIPv4(ip4) {
+				continue
+			}
+			if ip4.IsLoopback() || ip4.IsLinkLocalUnicast() {
+				continue
+			}
+			result = append(result, ipnet)
+		}
+	}
+	return result
+}
+
+func sortLANByAffinity(lan []string, prefixes []*net.IPNet) []string {
+	if len(lan) < 2 || len(prefixes) == 0 {
+		return lan
+	}
+	type entry struct {
+		ep    string
+		score int
+	}
+	scored := make([]entry, len(lan))
+	for i, ep := range lan {
+		host, _, err := net.SplitHostPort(ep)
+		if err != nil {
+			host = ep
+		}
+		ip := net.ParseIP(host)
+		score := 0
+		if ip != nil && !isCGNATOverlay(ip) {
+			for _, p := range prefixes {
+				if p.Contains(ip) {
+					ones, _ := p.Mask.Size()
+					if ones > score {
+						score = ones
+					}
+				}
+			}
+		}
+		scored[i] = entry{ep, score}
+	}
+	sort.SliceStable(scored, func(i, j int) bool {
+		return scored[i].score > scored[j].score
+	})
+	out := make([]string, len(scored))
+	for i, s := range scored {
+		out[i] = s.ep
 	}
 	return out
 }
