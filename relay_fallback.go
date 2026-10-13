@@ -12,8 +12,8 @@ type ConnType string
 
 const (
 	ConnUnknown      ConnType = "unknown"
-	ConnP2PAvailable ConnType = "p2p-avail" // ★ 打洞握手成功，未验证数据面
-	ConnP2P          ConnType = "p2p"       // ★ 收到真实数据帧，已验证
+	ConnP2PAvailable ConnType = "p2p-avail" // 打洞握手成功，未验证数据面
+	ConnP2P          ConnType = "p2p"       // 收到真实数据帧，已验证
 	ConnTURN         ConnType = "turn"
 	ConnRelay        ConnType = "relay"
 )
@@ -82,8 +82,8 @@ func (rm *RelayManager) MarkP2P(peerId string) {
 func (rm *RelayManager) MarkFallback(peerId string) {
 	rm.mu.Lock()
 
-	// ★ 只有 ConnP2P 阻止降级；ConnP2PAvailable 允许降级
-	//   （给 P2PAvailable 超时降级留通路）
+	// 只有 ConnP2P 阻止降级；ConnP2PAvailable 允许降级
+	// （给 P2PAvailable 超时降级留通路）
 	if rm.states[peerId] == ConnP2P {
 		rm.mu.Unlock()
 		rm.cancelFallbackTimer(peerId)
@@ -139,10 +139,6 @@ func (rm *RelayManager) MarkFallback(peerId string) {
 	rm.cancelFallbackTimer(peerId)
 }
 
-// ClearPeer 清空某个 peer 的连接状态。
-//
-// 对端离线时调用。避免新会话继承旧状态（如 TURN）导致
-// MarkFallback 被跳过。
 func (rm *RelayManager) ClearPeer(peerID string) {
 	if peerID == "" {
 		return
@@ -152,9 +148,6 @@ func (rm *RelayManager) ClearPeer(peerID string) {
 	delete(rm.states, peerID)
 }
 
-// ClearAll 清空所有 peer 的连接状态。
-//
-// WS 重连时调用（服务端会清所有 pair，客户端对应清）。
 func (rm *RelayManager) ClearAll() {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
@@ -256,14 +249,14 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 
 	switch state {
 	case ConnP2P, ConnP2PAvailable:
-		// ★ LAN 优先（同 WiFi 直连）
+		// LAN 优先（同 WiFi 直连）
 		if target != nil && len(target.LanEndpoints) > 0 {
 			for _, lan := range target.LanEndpoints {
 				ra, err := net.ResolveUDPAddr("udp", lan)
 				if err != nil {
 					continue
 				}
-				if _, err := rm.edge.udpConn.WriteToUDP(data, ra); err == nil {
+				if _, werr := rm.edge.udpConn.WriteToUDP(data, ra); werr == nil {
 					return true
 				}
 			}
@@ -271,11 +264,12 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 
 		// 回退公网
 		if target != nil && target.UDPAddr != nil {
-			if _, err := rm.edge.udpConn.WriteToUDP(data, target.UDPAddr); err == nil {
+			_, werr := rm.edge.udpConn.WriteToUDP(data, target.UDPAddr)
+			if werr == nil {
 				return true
 			}
 			if state == ConnP2P {
-				log.Printf("[P2P] UDP 发送到 %s 失败: %v，降级到 TURN/WS", peerId, err)
+				log.Printf("[P2P] UDP 发送到 %s 失败: %v，降级到 TURN/WS", peerId, werr)
 				rm.MarkFallback(peerId)
 			}
 		} else if state == ConnP2P {
@@ -285,8 +279,8 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 
 	case ConnTURN:
 		if target != nil && target.TurnRelayAddr != "" && rm.turnClient != nil {
-			relayAddr, err := net.ResolveUDPAddr("udp", target.TurnRelayAddr)
-			if err == nil {
+			relayAddr, rerr := net.ResolveUDPAddr("udp", target.TurnRelayAddr)
+			if rerr == nil {
 				if sendErr := rm.turnClient.Send(data, relayAddr); sendErr == nil {
 					return true
 				} else {
@@ -297,7 +291,7 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 					return false
 				}
 			} else {
-				log.Printf("[TURN] 解析中继地址 %q 失败: %v", target.TurnRelayAddr, err)
+				log.Printf("[TURN] 解析中继地址 %q 失败: %v", target.TurnRelayAddr, rerr)
 			}
 		}
 		if rm.ws != nil {
@@ -306,8 +300,8 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 		return false
 
 	case ConnRelay:
-		err := rm.ws.SendBinary(data)
-		return err == nil
+		serr := rm.ws.SendBinary(data)
+		return serr == nil
 	}
 
 	return false
