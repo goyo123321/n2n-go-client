@@ -1,9 +1,6 @@
 package main
 
 // PC 端 LAN 地址收集。
-//
-// 与 Termux 端逻辑一致：收集本机所有私有 IPv4 地址，每条配上
-// P2P 端口上报服务端。同 WiFi 的对端会用这些地址优先直连。
 
 import (
 	"net"
