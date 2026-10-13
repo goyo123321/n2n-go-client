@@ -21,14 +21,14 @@ type NatHoleInstruction struct {
 	TargetVirtualIp         string   `json:"targetVirtualIp"`
 	TargetPubSocket         string   `json:"targetPubSocket"`
 	TargetAssistedEndpoints []string `json:"targetAssistedEndpoints"`
-	TargetLanEndpoints      []string `json:"targetLanEndpoints"` // ★ 新增
+	TargetLanEndpoints      []string `json:"targetLanEndpoints"`
 	SenderMac               string   `json:"senderMac"`
 	SenderP2PEndpoint       string   `json:"senderP2pEndpoint"`
 	SenderPubSocket         string   `json:"senderPubSocket"`
 	SenderNatType           string   `json:"senderNatType"`
 	SenderBehavior          string   `json:"senderBehavior"`
 	SenderAssistedEndpoints []string `json:"senderAssistedEndpoints"`
-	SenderLanEndpoints      []string `json:"senderLanEndpoints"` // ★ 新增
+	SenderLanEndpoints      []string `json:"senderLanEndpoints"`
 	ReceiverMac               string   `json:"receiverMac"`
 	ReceiverP2PEndpoint       string   `json:"receiverP2pEndpoint"`
 	ReceiverPubSocket         string   `json:"receiverPubSocket"`
@@ -55,10 +55,6 @@ const (
 )
 
 const maxConsecutiveFails = 5
-
-// ★ 注意：probePrefix 和 buildPunchProbe 定义在 punch.go。
-//   此文件之前重复定义过这两项，导致 "redeclared in this block"
-//   编译错误，现已全部删除。
 
 var (
 	natHoleActiveMu sync.Mutex
@@ -171,26 +167,29 @@ func (e *Edge) chooseScanTiers(targetAddr *net.UDPAddr) (tiers []int, sameStun b
 
 // collectScanTargets 收集本轮打洞的全部候选地址。
 //
-// 与 Termux 端对齐，四类候选去重合并：
-//   1. LAN 地址（本机 peer 记录）—— 同 WiFi 场景优先
-//   2. 观测 raddr —— 已被证明可达的地址
-//   3. 服务端下发的 TargetAssistedEndpoints —— STUN 反射地址
-//   4. 服务端下发的 TargetLanEndpoints —— 对端上报的 LAN
+// ★ 诊断日志：打印 4 个来源的原始值，用于定位 LAN 候选丢失。
 func (e *Edge) collectScanTargets(instr *NatHoleInstruction) []*net.UDPAddr {
 	var raw []*net.UDPAddr
 
-	// 1. LAN 地址
+	// ★ 诊断：打印所有候选来源
 	e.peersMu.RLock()
+	var pLan, pAssisted []string
 	if p := e.peers[instr.TargetMac]; p != nil {
-		for _, lan := range p.LanEndpoints {
-			if addr := parseSockAddr(lan); addr != nil {
-				raw = append(raw, addr)
-			}
-		}
+		pLan = p.LanEndpoints
+		pAssisted = p.AssistedEndpoints
 	}
 	e.peersMu.RUnlock()
+	log.Printf("[collectScanTargets] target=%s p.Lan=%v p.Assisted=%v instr.TargetLan=%v instr.TargetAssisted=%v TargetPubSocket=%q",
+		instr.TargetMac, pLan, pAssisted, instr.TargetLanEndpoints, instr.TargetAssistedEndpoints, instr.TargetPubSocket)
 
-	// 2. 观测 raddr（最高优先）
+	// 1. 本机 peer 记录里的 LAN 地址
+	for _, lan := range pLan {
+		if addr := parseSockAddr(lan); addr != nil {
+			raw = append(raw, addr)
+		}
+	}
+
+	// 2. 观测 raddr
 	e.peersMu.RLock()
 	if p := e.peers[instr.TargetMac]; p != nil && p.UDPAddr != nil && p.lastRecvAt > 0 {
 		raw = append(raw, &net.UDPAddr{IP: p.UDPAddr.IP, Port: p.UDPAddr.Port})
@@ -211,7 +210,7 @@ func (e *Edge) collectScanTargets(instr *NatHoleInstruction) []*net.UDPAddr {
 		}
 	}
 
-	// 去重（保持首次出现顺序）
+	// 去重
 	seen := make(map[string]bool)
 	var out []*net.UDPAddr
 	for _, a := range raw {
@@ -222,6 +221,7 @@ func (e *Edge) collectScanTargets(instr *NatHoleInstruction) []*net.UDPAddr {
 		seen[key] = true
 		out = append(out, a)
 	}
+	log.Printf("[collectScanTargets] 去重后 %d 个候选: %v", len(out), out)
 	return out
 }
 
@@ -290,7 +290,6 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		instr.BehaviorIndex, instr.Mode, instr.TTL,
 	)
 
-	// 多目标候选：LAN + raddr + assisted + lan
 	assistedTargets := e.collectScanTargets(instr)
 	log.Printf("[NAT-HOLE] 多目标扫描：LAN+raddr+assisted 共 %d 个候选", len(assistedTargets))
 
@@ -298,8 +297,7 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		time.Sleep(time.Duration(instr.SendDelayMs) * time.Millisecond)
 	}
 
-	// ★ buildPunchProbe 定义在 punch.go 里
-	probe := buildPunchProbe(e.virtualIP)
+	probe := buildPunchProbe(e.getVirtualIPLocked())
 	var attempts uint32
 
 	tiers, sameStun, portDiff, halfWidth := e.chooseScanTiers(targetAddr)
@@ -519,7 +517,6 @@ func parseSockAddr(s string) *net.UDPAddr {
 	return &net.UDPAddr{IP: ip, Port: port}
 }
 
-// resolveTarget 优先使用本机观测过的 raddr。
 func (e *Edge) resolveTarget(instr *NatHoleInstruction) *net.UDPAddr {
 	e.peersMu.RLock()
 	if p := e.peers[instr.TargetMac]; p != nil && p.UDPAddr != nil && p.lastRecvAt > 0 {
