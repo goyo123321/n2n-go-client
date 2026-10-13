@@ -60,7 +60,6 @@ func (rm *RelayManager) MarkP2PAvailable(peerID string) {
 	log.Printf("[连接] %s → P2PAvailable（打洞握手成功，等待数据帧验证）", peerID)
 	rm.cancelFallbackTimer(peerID)
 
-	// ★ 取消旧的超时降级定时器（如果之前进过 P2PAvailable）
 	if rm.edge != nil {
 		rm.edge.cancelP2PAvailTimeout(peerID)
 	}
@@ -80,16 +79,16 @@ func (rm *RelayManager) MarkP2P(peerId string) {
 	log.Printf("[连接] %s → P2P 直连（prev=%s，数据面已验证）", peerId, prev)
 	rm.cancelFallbackTimer(peerId)
 
-	// ★ P2P 已升级，取消 P2PAvailable 超时降级定时器
 	if rm.edge != nil {
 		rm.edge.cancelP2PAvailTimeout(peerId)
 	}
 }
 
-// MarkFallback 常规降级路径。保护 P2PAvailable 状态。
+// MarkFallback 常规降级路径。★ 保护 P2PAvailable 状态。
 func (rm *RelayManager) MarkFallback(peerId string) {
 	rm.mu.Lock()
 
+	// ★ 保护 P2PAvailable：给它 30 秒验证窗口，不因单次 UDP 发送失败就降级
 	if rm.states[peerId] == ConnP2P || rm.states[peerId] == ConnP2PAvailable {
 		rm.mu.Unlock()
 		rm.cancelFallbackTimer(peerId)
@@ -147,13 +146,9 @@ func (rm *RelayManager) MarkFallback(peerId string) {
 
 // ★ 新增：ForceFallback 强制降级，允许从 P2PAvailable 降级。
 //
-// 与 MarkFallback 的区别：
-//   - MarkFallback：常规路径（打洞失败 / UDP 发送失败 / 心跳超时），
-//                   保护 P2PAvailable（给它 30s 验证窗口）
-//   - ForceFallback：特殊路径，允许从 P2PAvailable 直接降级
-//     使用场景：
-//       1. 服务端下发 force_fallback（同 STUN IP 已失败）
-//       2. P2PAvailable 30s 超时兜底
+// 使用场景：
+//   1. 服务端下发 force_fallback（同 STUN IP 已失败）
+//   2. P2PAvailable 30s 超时兜底
 func (rm *RelayManager) ForceFallback(peerId string, reason string) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
