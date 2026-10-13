@@ -11,10 +11,11 @@ import (
 type ConnType string
 
 const (
-	ConnP2P     ConnType = "p2p"
-	ConnTURN    ConnType = "turn"
-	ConnRelay   ConnType = "relay"
-	ConnUnknown ConnType = "unknown"
+	ConnUnknown      ConnType = "unknown"
+	ConnP2PAvailable ConnType = "p2p-avail" // ★ 打洞握手成功，未验证数据面
+	ConnP2P          ConnType = "p2p"       // ★ 收到真实数据帧，已验证
+	ConnTURN         ConnType = "turn"
+	ConnRelay        ConnType = "relay"
 )
 
 func safeGo(name string, fn func()) {
@@ -45,6 +46,25 @@ func NewRelayManager(ws *WSTransport, turnClient *TURNClient, edge *Edge) *Relay
 	}
 }
 
+// MarkP2PAvailable 从 Unknown / Relay 升级到"打洞握手成功"。
+//
+// 对应 punchPathOpen：收到 Punch 或 ACK 证明双方 NAT 映射已打开，
+// 但数据面是否能过还没验证。
+func (rm *RelayManager) MarkP2PAvailable(peerID string) {
+	rm.mu.Lock()
+	cur := rm.states[peerID]
+	if cur == ConnP2P || cur == ConnP2PAvailable {
+		rm.mu.Unlock()
+		return
+	}
+	rm.states[peerID] = ConnP2PAvailable
+	rm.mu.Unlock()
+
+	log.Printf("[连接] %s → P2PAvailable（打洞握手成功，等待数据帧验证）", peerID)
+	rm.cancelFallbackTimer(peerID)
+}
+
+// MarkP2P 只有收到真实数据帧才应调用。
 func (rm *RelayManager) MarkP2P(peerId string) {
 	rm.mu.Lock()
 	if rm.states[peerId] == ConnP2P {
@@ -55,13 +75,15 @@ func (rm *RelayManager) MarkP2P(peerId string) {
 	rm.states[peerId] = ConnP2P
 	rm.mu.Unlock()
 
-	log.Printf("[连接] %s → P2P 直连（prev=%s）", peerId, prev)
+	log.Printf("[连接] %s → P2P 直连（prev=%s，数据面已验证）", peerId, prev)
 	rm.cancelFallbackTimer(peerId)
 }
 
 func (rm *RelayManager) MarkFallback(peerId string) {
 	rm.mu.Lock()
 
+	// ★ 只有 ConnP2P 阻止降级；ConnP2PAvailable 允许降级
+	//   （给 P2PAvailable 超时降级留通路）
 	if rm.states[peerId] == ConnP2P {
 		rm.mu.Unlock()
 		rm.cancelFallbackTimer(peerId)
@@ -169,7 +191,7 @@ func (rm *RelayManager) UpgradeRelaysToTURN() {
 func (rm *RelayManager) DowngradeToWS(peerId string, reason string) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
-	if rm.states[peerId] == ConnP2P {
+	if rm.states[peerId] == ConnP2P || rm.states[peerId] == ConnP2PAvailable {
 		return
 	}
 	if rm.states[peerId] != ConnRelay {
@@ -189,13 +211,19 @@ func (rm *RelayManager) ShouldRelay(peerId string) bool {
 	if !ok {
 		return true
 	}
-	return s == ConnTURN || s == ConnRelay
+	return s != ConnP2P && s != ConnP2PAvailable
 }
 
 func (rm *RelayManager) IsP2P(peerId string) bool {
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
 	return rm.states[peerId] == ConnP2P
+}
+
+func (rm *RelayManager) IsP2PAvailable(peerId string) bool {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
+	return rm.states[peerId] == ConnP2PAvailable
 }
 
 func (rm *RelayManager) IsTURN(peerId string) bool {
@@ -227,15 +255,30 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 	state := rm.GetState(peerId)
 
 	switch state {
-	case ConnP2P:
+	case ConnP2P, ConnP2PAvailable:
+		// ★ LAN 优先（同 WiFi 直连）
+		if target != nil && len(target.LanEndpoints) > 0 {
+			for _, lan := range target.LanEndpoints {
+				ra, err := net.ResolveUDPAddr("udp", lan)
+				if err != nil {
+					continue
+				}
+				if _, err := rm.edge.udpConn.WriteToUDP(data, ra); err == nil {
+					return true
+				}
+			}
+		}
+
+		// 回退公网
 		if target != nil && target.UDPAddr != nil {
-			_, err := rm.edge.udpConn.WriteToUDP(data, target.UDPAddr)
-			if err == nil {
+			if _, err := rm.edge.udpConn.WriteToUDP(data, target.UDPAddr); err == nil {
 				return true
 			}
-			log.Printf("[P2P] UDP 发送到 %s 失败: %v，降级到 WS", peerId, err)
-			rm.MarkFallback(peerId)
-		} else {
+			if state == ConnP2P {
+				log.Printf("[P2P] UDP 发送到 %s 失败: %v，降级到 TURN/WS", peerId, err)
+				rm.MarkFallback(peerId)
+			}
+		} else if state == ConnP2P {
 			rm.MarkFallback(peerId)
 		}
 		return rm.ws.SendBinary(data) == nil
