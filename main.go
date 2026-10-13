@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,7 +27,6 @@ var (
 
 const DefaultVirtualCIDR = "10.64.0.0/24"
 
-// LAN 缓存：reportMetadata 实时收集为空时回退用上次成功结果
 var (
 	lanCacheMu   sync.Mutex
 	lanCache     []string
@@ -83,8 +81,6 @@ type Edge struct {
 	relayMgr   *RelayManager
 	turnClient *TURNClient
 
-	// tun 用 atomic.Pointer：tunWriteLoop 与 ready 分支（重建 TUN）之间
-	// 原本存在 TOCTOU 竞争。用原子指针后，快照和写入是原子的。
 	tun atomic.Pointer[TUNDevice]
 
 	udpConn *net.UDPConn
@@ -100,7 +96,6 @@ type Edge struct {
 	fallbackTimers   map[string]*time.Timer
 	fallbackTimersMu sync.Mutex
 
-	// P2PAvailable 30 秒超时降级定时器
 	p2pAvailTimers   map[string]*time.Timer
 	p2pAvailTimersMu sync.Mutex
 
@@ -112,16 +107,10 @@ type Edge struct {
 
 	lastMetadataReportAt int64
 
-	// 应用层 WS 隧道流管理器（app_stream.go 使用）
-	streamMgr *AppStreamManager
-
-	// N2NS P2P 隧道管理器（p2p_stream.go 使用）
+	streamMgr  *AppStreamManager
 	p2pStreams *P2PStreamManager
+	socks5Srv  *Socks5Server
 
-	// SOCKS5 入口
-	socks5Srv *Socks5Server
-
-	// ACK 限流器
 	punchAckLimiter *punchAckLimiter
 
 	doneCh  chan struct{}
@@ -136,10 +125,6 @@ func (e *Edge) Done() <-chan struct{} { return e.doneCh }
 
 const keepaliveInterval = 5 * time.Second
 
-// ★ 修复：STUN 服务器从 3 个扩到 5 个
-//
-// 原因：日志里经常看到 "STUN 74.125.204.127:19302 超时"。多端点冗余后，
-// 只要有一个 STUN 服务器可达，CGNAT 映射就能保持稳定。
 var keepaliveServers = []string{
 	"74.125.250.129:19302",
 	"74.125.204.127:19302",
@@ -164,16 +149,7 @@ func buildSTUNBindingRequest() []byte {
 	return buf
 }
 
-// ★ 修复：UDP 保活无条件发送
-//
-// 旧版"仅在有 peer 时发送"，导致：
-//   1. 客户端启动到新 peer 加入的空窗期（可能 1-3 分钟）
-//   2. CGNAT 映射被回收，端口漂移（实测 42 秒漂移）
-//   3. 打洞时双方用过期端口，扫描范围暴涨（实测 3208 端口）
-//
-// 新逻辑无条件发送：
-//   - 流量代价：每设备每天 ~50 MB（可接受）
-//   - 收益：CGNAT 端口稳定，打洞一次命中
+// startKeepalive 无条件发送 STUN Binding Request（保 CGNAT 映射）。
 func (e *Edge) startKeepalive() {
 	if e.udpConn == nil {
 		return
@@ -201,7 +177,6 @@ func (e *Edge) startKeepalive() {
 			}
 		}
 
-		// 立即发一次
 		sendOnce()
 
 		ticker := time.NewTicker(keepaliveInterval)
@@ -240,7 +215,6 @@ func (e *Edge) startP2PKeepalive() {
 	})
 }
 
-// sendP2PKeepalive 用 N2NS PING 多目标发送，替代单目标 Punch。
 func (e *Edge) sendP2PKeepalive() {
 	if e.relayMgr == nil || e.p2pStreams == nil {
 		return
@@ -355,7 +329,6 @@ func (e *Edge) cancelFallbackTimer(peerID string) {
 	}
 }
 
-// P2PAvailable 30 秒超时降级。
 func (e *Edge) scheduleP2PAvailTimeout(peerID string) {
 	if e.relayMgr == nil || peerID == "" {
 		return
@@ -428,6 +401,17 @@ func cidrPrefix(cidr string) string {
 		return "24"
 	}
 	return parts[1]
+}
+
+func extractIPFromEndpoint(ep string) string {
+	if ep == "" {
+		return ""
+	}
+	i := strings.LastIndex(ep, ":")
+	if i < 0 {
+		return ep
+	}
+	return ep[:i]
 }
 
 // ============ 主函数 ============
@@ -513,7 +497,6 @@ func main() {
 	edge.udpPort = actualPort
 	log.Printf("[P2P] UDP 监听端口 %d", actualPort)
 
-	// 启动早期预收集一次 LAN 到缓存
 	if lans := collectLANEndpoints(actualPort, ""); len(lans) > 0 {
 		saveLANCache(lans)
 		log.Printf("[NAT] 启动预收集 LAN: %v", lans)
@@ -554,7 +537,6 @@ func main() {
 			edge.streamMgr.closeAll()
 		}
 
-		// 清理 P2PAvailable 超时定时器
 		edge.p2pAvailTimersMu.Lock()
 		for _, t := range edge.p2pAvailTimers {
 			t.Stop()
@@ -584,12 +566,10 @@ func main() {
 			edge.enqueueTUN(data)
 			return
 		}
-		// N2NS（数据面）
 		if isP2PFrame(data) {
 			edge.handleP2PFrame(ua, true, data)
 			return
 		}
-		// Punch / ACK
 		if isPunchProbe(data) {
 			edge.notePeerProbeTURN(ua)
 			return
@@ -598,7 +578,6 @@ func main() {
 			edge.notePeerAckTURN(ua)
 			return
 		}
-		// IPv4
 		if len(data) > 0 && data[0]>>4 == 4 {
 			edge.notePeerTrafficTURN(ua)
 			edge.enqueueTUN(data)
@@ -633,7 +612,6 @@ func main() {
 				continue
 			}
 
-			// 1. STUN
 			if buf[0] == 0x01 && buf[1] == 0x01 {
 				if ip, port, ok := parseSTUNResponse(buf[:n]); ok {
 					edge.addAssistedEndpoint(ip, port)
@@ -641,13 +619,11 @@ func main() {
 				continue
 			}
 
-			// 2. N2NS
 			if isP2PFrame(buf[:n]) {
 				edge.handleP2PFrame(addr, false, buf[:n])
 				continue
 			}
 
-			// 3. Punch / ACK
 			if isPunchProbe(buf[:n]) {
 				edge.notePeerProbe(addr)
 				continue
@@ -657,7 +633,6 @@ func main() {
 				continue
 			}
 
-			// 4. IPv4（TUN）
 			if buf[0]>>4 == 4 {
 				edge.notePeerTraffic(addr)
 				edge.enqueueTUN(buf[:n])
@@ -747,7 +722,6 @@ func (e *Edge) Stop() {
 	}
 }
 
-// reportMetadata 上报 p2p_metadata。
 func (e *Edge) reportMetadata() {
 	if e.ws == nil || e.natMeta == nil {
 		return
@@ -783,7 +757,6 @@ func (e *Edge) reportMetadata() {
 		metaPayload["assistedEndpoints"] = nm.AllEndpoints
 	}
 
-	// LAN：实时收集优先；空则用缓存；非空则更新缓存
 	vip := e.getVirtualIPLocked()
 	lanEndpoints := collectLANEndpoints(e.udpPort, vip)
 	if len(lanEndpoints) > 0 {
@@ -808,7 +781,6 @@ func (e *Edge) reportMetadata() {
 	})
 }
 
-// retryLANCollection 后台重试收集 LAN。
 func (e *Edge) retryLANCollection() {
 	safeGo("lan-retry", func() {
 		for i := 0; i < 20; i++ {
@@ -829,17 +801,6 @@ func (e *Edge) retryLANCollection() {
 		}
 		log.Printf("[NAT] ⚠️ LAN 重试 20 次仍为空（10s），放弃")
 	})
-}
-
-func extractIPFromEndpoint(ep string) string {
-	if ep == "" {
-		return ""
-	}
-	i := strings.LastIndex(ep, ":")
-	if i < 0 {
-		return ep
-	}
-	return ep[:i]
 }
 
 func (e *Edge) printNodeSummary() {
@@ -1357,7 +1318,6 @@ func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 	}
 }
 
-// runNatHole 执行一次打洞指令，并在成功时主动触发数据面探针。
 func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 	res := e.executeNatHole(instr)
 	if res == nil {
@@ -1399,7 +1359,6 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 	})
 }
 
-// tunReadLoop 从 TUN 读 IPv4 包，转发给对应 peer。
 func (e *Edge) tunReadLoop(tun *TUNDevice) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -1504,18 +1463,6 @@ func (e *Edge) notePeerTrafficTURN(addr *net.UDPAddr) {
 	e.notePeerCommon(addr, true, true, false)
 }
 
-// notePeerCommon 是打洞握手路径的统一入口。
-//
-// score 制匹配：
-//   - p.UDPAddr         分数 3~4
-//   - p.LanEndpoints    分数 2~5
-//   - p.AssistedEndpoints 分数 1~4
-//
-// 规则：
-//  1. Punch 与 ACK 分开处理，ACK 绝不回复
-//  2. 收到 Punch 或 ACK 都升级到 P2PAvailable
-//  3. 只有收到真实 P2P 数据帧或 PONG 才升级到 P2P
-//  4. 首次进入 P2PAvailable 时主动发 P2P PING 探针 + 启动 30s 超时降级
 func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, isAck bool) {
 	now := time.Now().UnixMilli()
 
@@ -1819,194 +1766,4 @@ func readNameservers(path string) []string {
 		}
 	}
 	return result
-}
-
-// ============ LAN 地址探测（双路径） ============
-
-func collectLANEndpoints(port int, selfVIP string) []string {
-	var result []string
-	seen := make(map[string]bool)
-
-	add := func(ip4 net.IP) {
-		if ip4 == nil {
-			return
-		}
-		if selfVIP != "" && ip4.String() == selfVIP {
-			return
-		}
-		if isCGNATOverlay(ip4) {
-			return
-		}
-		if !isPrivateIPv4(ip4) {
-			return
-		}
-		if ip4.IsLoopback() || ip4.IsLinkLocalUnicast() {
-			return
-		}
-		ep := net.JoinHostPort(ip4.String(), strconv.Itoa(port))
-		if seen[ep] {
-			return
-		}
-		seen[ep] = true
-		result = append(result, ep)
-	}
-
-	// 路径 1：UDP connect 骗内核
-	if ip := detectOutboundIP(); ip != nil {
-		add(ip)
-	}
-
-	// 路径 2：遍历接口
-	ifaces, err := net.Interfaces()
-	if err == nil {
-		for _, iface := range ifaces {
-			if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
-				continue
-			}
-			addrs, err := iface.Addrs()
-			if err != nil {
-				continue
-			}
-			for _, addr := range addrs {
-				var ip net.IP
-				switch v := addr.(type) {
-				case *net.IPNet:
-					ip = v.IP
-				case *net.IPAddr:
-					ip = v.IP
-				}
-				if ip == nil || ip.To4() == nil {
-					continue
-				}
-				add(ip.To4())
-			}
-		}
-	}
-
-	return result
-}
-
-func detectOutboundIP() net.IP {
-	targets := []string{
-		"8.8.8.8:80",
-		"1.1.1.1:80",
-		"114.114.114.114:80",
-	}
-	for _, t := range targets {
-		conn, err := net.Dial("udp4", t)
-		if err != nil {
-			continue
-		}
-		localAddr, ok := conn.LocalAddr().(*net.UDPAddr)
-		_ = conn.Close()
-		if !ok || localAddr == nil || localAddr.IP == nil {
-			continue
-		}
-		ip4 := localAddr.IP.To4()
-		if ip4 != nil {
-			return ip4
-		}
-	}
-	return nil
-}
-
-func isPrivateIPv4(ip net.IP) bool {
-	ip4 := ip.To4()
-	if ip4 == nil {
-		return false
-	}
-	if ip4[0] == 10 {
-		return true
-	}
-	if ip4[0] == 172 && ip4[1] >= 16 && ip4[1] <= 31 {
-		return true
-	}
-	if ip4[0] == 192 && ip4[1] == 168 {
-		return true
-	}
-	return false
-}
-
-func isCGNATOverlay(ip net.IP) bool {
-	ip4 := ip.To4()
-	if ip4 == nil {
-		return false
-	}
-	return ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127
-}
-
-func localPrefixes(selfVIP string) []*net.IPNet {
-	var result []*net.IPNet
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return nil
-	}
-	for _, iface := range ifaces {
-		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-		for _, addr := range addrs {
-			ipnet, ok := addr.(*net.IPNet)
-			if !ok || ipnet.IP.To4() == nil {
-				continue
-			}
-			ip4 := ipnet.IP.To4()
-			if isCGNATOverlay(ip4) {
-				continue
-			}
-			if selfVIP != "" && ip4.String() == selfVIP {
-				continue
-			}
-			if !isPrivateIPv4(ip4) {
-				continue
-			}
-			if ip4.IsLoopback() || ip4.IsLinkLocalUnicast() {
-				continue
-			}
-			result = append(result, ipnet)
-		}
-	}
-	return result
-}
-
-func sortLANByAffinity(lan []string, prefixes []*net.IPNet) []string {
-	if len(lan) < 2 || len(prefixes) == 0 {
-		return lan
-	}
-	type entry struct {
-		ep    string
-		score int
-	}
-	scored := make([]entry, len(lan))
-	for i, ep := range lan {
-		host, _, err := net.SplitHostPort(ep)
-		if err != nil {
-			host = ep
-		}
-		ip := net.ParseIP(host)
-		score := 0
-		if ip != nil && !isCGNATOverlay(ip) {
-			for _, p := range prefixes {
-				if p.Contains(ip) {
-					ones, _ := p.Mask.Size()
-					if ones > score {
-						score = ones
-					}
-				}
-			}
-		}
-		scored[i] = entry{ep, score}
-	}
-	sort.SliceStable(scored, func(i, j int) bool {
-		return scored[i].score > scored[j].score
-	})
-	out := make([]string, len(scored))
-	for i, s := range scored {
-		out[i] = s.ep
-	}
-	return out
 }
