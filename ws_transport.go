@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"log"
+	"net"
 	"net/url"
 	"runtime/debug"
 	"strings"
@@ -11,6 +12,11 @@ import (
 
 	"github.com/gorilla/websocket"
 )
+
+// ★ 新增：读超时。
+//   客户端每 20 秒发一次 ping，服务端立即回 pong。
+//   90 秒内没收到任何消息（包括 pong）→ 认为下行通道已死 → 主动重连。
+const wsReadTimeout = 90 * time.Second
 
 type WSTransport struct {
 	mu       sync.Mutex
@@ -148,7 +154,11 @@ func maskToken(u string) string {
 
 // readLoop 断线自动重连（指数退避，封顶 5 分钟，无限重试）。
 //
-// ★ 修复：旧版只重试 30 秒上限，用完后永久放弃。现在无限重试。
+// ★ 修复：每次读之前设置 90 秒读超时。
+//   场景：客户端网络抖动后，下行通道可能"僵死"——
+//   底层 TCP 表面正常，但服务端发的消息到达不了客户端。
+//   这时客户端发 ping 依然成功（上行 OK），但收不到 pong。
+//   设置读超时后，90 秒无任何消息会触发重连。
 func (ws *WSTransport) readLoop() {
 	backoff := 1 * time.Second
 	const maxBackoff = 5 * time.Minute
@@ -193,6 +203,8 @@ func (ws *WSTransport) readLoop() {
 			continue
 		}
 
+		// ★ 设置读超时
+		_ = conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
 		msgType, data, err := conn.ReadMessage()
 		if err != nil {
 			select {
@@ -200,7 +212,11 @@ func (ws *WSTransport) readLoop() {
 				return
 			default:
 			}
-			log.Printf("[WS] 断线: %v，%v 后重连", err, backoff)
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				log.Printf("[WS] 读超时 %v 未收到任何消息（下行僵死），触发重连", wsReadTimeout)
+			} else {
+				log.Printf("[WS] 断线: %v，%v 后重连", err, backoff)
+			}
 			ws.mu.Lock()
 			ws.conn = nil
 			ws.mu.Unlock()
@@ -212,6 +228,11 @@ func (ws *WSTransport) readLoop() {
 		if msgType == websocket.TextMessage {
 			var msg map[string]interface{}
 			if err := json.Unmarshal(data, &msg); err != nil {
+				continue
+			}
+			// ★ 服务端主动 ping，立即回 pong
+			if t, _ := msg["type"].(string); t == "server_ping" {
+				_ = ws.Send(map[string]interface{}{"type": "server_pong"})
 				continue
 			}
 			ws.routeText(msg)
