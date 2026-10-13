@@ -163,7 +163,7 @@ func (s *Socks5Server) handleConn(conn net.Conn) {
 
 	// ★ 修复：加入 IsP2PAvailable —— 打洞握手成功后、PONG 验证完成前的
 	//   窗口期内，P2P 通道实际可用。之前跳过这个状态，导致每次 SOCKS5
-	//   都走 WS 中继。配合 OpenP2PStream 的 2 秒超时，最坏只多花 2 秒。
+	//   都走 WS 中继。
 	useP2P := s.edge.p2pStreams != nil &&
 		s.edge.relayMgr != nil &&
 		(s.edge.relayMgr.IsP2P(peerID) ||
