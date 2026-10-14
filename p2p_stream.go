@@ -9,6 +9,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -30,10 +31,24 @@ const (
 	p2pHeaderLen   = 21
 	p2pMaxPayload  = 1200
 	p2pWindow      = 16
-	p2pResendMs    = 200
 	p2pMaxRetries  = 8
-	p2pIdleTimeout = 120 * time.Second
+	p2pIdleTimeout = 300 * time.Second
+
+	// 重传检查间隔独立于 RTO
+	p2pRetxCheckInterval = 50 * time.Millisecond
+
+	// ★ RTT 采样保护：超过 3 秒的样本视为异常丢弃
+	p2pMaxRTT = 3 * time.Second
+
+	// RTO 钳制范围
+	p2pMinRTO = 100 * time.Millisecond
+	p2pMaxRTO = 2 * time.Second
 )
+
+// seqAfter 判断 a 是否在 b 之后（考虑 uint32 回绕）。
+func seqAfter(a, b uint32) bool {
+	return int32(a-b) > 0
+}
 
 type p2pFrame struct {
 	Type     uint8
@@ -97,6 +112,27 @@ type p2pSeg struct {
 	isSynAck bool
 }
 
+// P2PStreamStats 诊断接口。
+type P2PStreamStats struct {
+	StreamID    uint32
+	PeerID      string
+	RTTMs       int64
+	RttvarMs    int64
+	RTOMs       int64
+	SendBase    uint32
+	SendNext    uint32
+	RecvNext    uint32
+	InFlight    uint32
+	Retransmits uint64
+	FastRetxs   uint64
+	BytesSent   uint64
+	BytesRecv   uint64
+	PktsSent    uint64
+	PktsRecv    uint64
+	ViaTURN     bool
+	IdleMs      int64
+}
+
 type P2PStream struct {
 	ID     uint32
 	PeerID string
@@ -115,6 +151,22 @@ type P2PStream struct {
 	recvBuf  map[uint32][]byte
 
 	recentlyDelivered map[uint32]time.Time
+
+	// RTT 测量（RFC 6298 风格）
+	srtt   time.Duration
+	rttvar time.Duration
+
+	// 快速重传（3 个重复 ACK）
+	lastAck     uint32
+	dupAckCount int
+
+	// 诊断计数
+	bytesSent   atomic.Uint64
+	bytesRecv   atomic.Uint64
+	pktsSent    atomic.Uint64
+	pktsRecv    atomic.Uint64
+	retransmits atomic.Uint64
+	fastRetxs   atomic.Uint64
 
 	localConn net.Conn
 	ownsConn  bool
@@ -223,6 +275,147 @@ func (m *P2PStreamManager) reaper() {
 	}
 }
 
+// AllStats 返回所有 stream 的诊断信息。
+func (m *P2PStreamManager) AllStats() []P2PStreamStats {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]P2PStreamStats, 0, len(m.byID))
+	for _, s := range m.byID {
+		out = append(out, s.Stats())
+	}
+	return out
+}
+
+// Stats 返回单个 stream 的诊断信息。
+func (s *P2PStream) Stats() P2PStreamStats {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var rto time.Duration
+	if s.srtt > 0 {
+		rto = s.rtoLocked()
+	}
+
+	return P2PStreamStats{
+		StreamID:    s.ID,
+		PeerID:      s.PeerID,
+		RTTMs:       s.srtt.Milliseconds(),
+		RttvarMs:    s.rttvar.Milliseconds(),
+		RTOMs:       rto.Milliseconds(),
+		SendBase:    s.sendBase,
+		SendNext:    s.sendNext,
+		RecvNext:    s.recvNext,
+		InFlight:    s.sendNext - s.sendBase,
+		Retransmits: s.retransmits.Load(),
+		FastRetxs:   s.fastRetxs.Load(),
+		BytesSent:   s.bytesSent.Load(),
+		BytesRecv:   s.bytesRecv.Load(),
+		PktsSent:    s.pktsSent.Load(),
+		PktsRecv:    s.pktsRecv.Load(),
+		ViaTURN:     s.viaTURN,
+		IdleMs:      time.Since(s.lastAct).Milliseconds(),
+	}
+}
+
+// updateRTTLocked 用 RFC 6298 算法更新 SRTT / RTTVAR。
+func (s *P2PStream) updateRTTLocked(rtt time.Duration) {
+	if rtt <= 0 || rtt > p2pMaxRTT {
+		return
+	}
+	if s.srtt == 0 {
+		s.srtt = rtt
+		s.rttvar = rtt / 2
+	} else {
+		delta := s.srtt - rtt
+		if delta < 0 {
+			delta = -delta
+		}
+		s.rttvar = (3*s.rttvar + delta) / 4
+		s.srtt = (7*s.srtt + rtt) / 8
+	}
+}
+
+// rtoLocked 计算当前 RTO。
+func (s *P2PStream) rtoLocked() time.Duration {
+	if s.srtt == 0 {
+		return 200 * time.Millisecond
+	}
+	rto := s.srtt + 4*s.rttvar
+	if rto < p2pMinRTO {
+		rto = p2pMinRTO
+	}
+	if rto > p2pMaxRTO {
+		rto = p2pMaxRTO
+	}
+	return rto
+}
+
+// processAckLocked 处理 ACK 字段。
+func (s *P2PStream) processAckLocked(ack uint32) (bool, uint32) {
+	if seqAfter(ack, s.sendBase) {
+		if seg, ok := s.segments[ack-1]; ok && seg.retries == 0 {
+			rtt := time.Since(seg.sentAt)
+			s.updateRTTLocked(rtt)
+		}
+
+		for seq := s.sendBase; seq != ack; seq++ {
+			delete(s.segments, seq)
+		}
+		s.sendBase = ack
+
+		s.lastAck = ack
+		s.dupAckCount = 0
+		return false, 0
+	}
+
+	if ack == s.lastAck && seqAfter(s.sendNext, ack) {
+		s.dupAckCount++
+		if s.dupAckCount == 3 {
+			if _, ok := s.segments[s.sendBase]; ok {
+				log.Printf("[P2P-STREAM] %d 快速重传触发 seq=%d", s.ID, s.sendBase)
+				s.dupAckCount = 0
+				s.fastRetxs.Add(1)
+				return true, s.sendBase
+			}
+		}
+	}
+
+	return false, 0
+}
+
+// sendFastRetx 立即重传指定 seq 的段。
+func (s *P2PStream) sendFastRetx(e *Edge, seq uint32) {
+	s.mu.Lock()
+	seg, ok := s.segments[seq]
+	if !ok || s.closed {
+		s.mu.Unlock()
+		return
+	}
+	seg.sentAt = time.Now()
+	seg.retries++
+	var ft uint8 = p2pTypeDATA
+	if seg.isSyn {
+		if seg.isSynAck {
+			ft = p2pTypeSYNACK
+		} else {
+			ft = p2pTypeSYN
+		}
+	}
+	payload := seg.data
+	ack := s.recvNext
+	s.mu.Unlock()
+
+	s.retransmits.Add(1)
+	_ = e.sendP2PFrame(s, &p2pFrame{
+		Type:     ft,
+		StreamID: s.ID,
+		Seq:      seq,
+		Ack:      ack,
+		Payload:  payload,
+	})
+}
+
+// sendP2PProbe 向 peerID 发一个裸 P2P PING 帧（无需 stream）。
 func (m *P2PStreamManager) sendP2PProbe(peerID string) {
 	if m == nil || m.edge == nil || peerID == "" {
 		return
@@ -246,6 +439,7 @@ func (m *P2PStreamManager) sendP2PProbe(peerID string) {
 	}
 }
 
+// collectN2NSTargets 收集一个 stream 的所有候选发送地址。
 func (e *Edge) collectN2NSTargets(s *P2PStream) []*net.UDPAddr {
 	s.mu.Lock()
 	primary := s.peerAddr
@@ -297,10 +491,6 @@ func (e *Edge) collectN2NSTargets(s *P2PStream) []*net.UDPAddr {
 
 // sendP2PFrame 发送一帧到对端的所有候选地址。
 //
-// ★ 修复 1：LAN 优先（窗口 300s）。
-// ★ 修复 2：控制帧全发（保 CGNAT 映射 + 探测 LAN 恢复）。
-// ★ 修复 3：TURN 模式下控制帧也尝试直连。
-//
 // ★ PC / Termux 特有：e.udpConn 是 *net.UDPConn，用 WriteToUDP。
 func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 	s.mu.Lock()
@@ -309,6 +499,9 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 	s.mu.Unlock()
 
 	buf := encodeP2PFrame(f)
+
+	s.pktsSent.Add(1)
+	s.bytesSent.Add(uint64(len(buf)))
 
 	forceDual := f.Type != p2pTypeDATA && f.Type != p2pTypeACK
 
@@ -341,6 +534,7 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 		if e.udpConn != nil {
 			targets := e.collectN2NSTargets(s)
 			for _, addr := range targets {
+				// ★ PC / Termux: WriteToUDP
 				if _, err := e.udpConn.WriteToUDP(buf, addr); err != nil {
 					lastErr = err
 				}
@@ -387,6 +581,7 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 			if !isPrivateIPv4(addr.IP) {
 				continue
 			}
+			// ★ PC / Termux: WriteToUDP
 			if _, err := e.udpConn.WriteToUDP(buf, addr); err == nil {
 				sent++
 			}
@@ -399,6 +594,7 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 	var lastErr error
 	sent := 0
 	for _, addr := range targets {
+		// ★ PC / Termux: WriteToUDP
 		if _, err := e.udpConn.WriteToUDP(buf, addr); err != nil {
 			lastErr = err
 		} else {
@@ -604,21 +800,25 @@ func (m *P2PStreamManager) handleFrame(peerID string, peerAddr *net.UDPAddr, via
 		return
 	}
 
+	s.pktsRecv.Add(1)
+	s.bytesRecv.Add(uint64(p2pHeaderLen + len(f.Payload)))
+
 	s.mu.Lock()
 	s.peerAddr = peerAddr
 	s.lastRecvFrom = peerAddr
 	s.viaTURN = viaTURN
 	s.lastAct = time.Now()
 
-	if f.Type == p2pTypeACK || f.Type == p2pTypeDATA || f.Type == p2pTypeSYNACK {
-		if f.Ack > s.sendBase {
-			for seq := s.sendBase; seq < f.Ack; seq++ {
-				delete(s.segments, seq)
-			}
-			s.sendBase = f.Ack
-		}
+	var doFastRetx bool
+	var fastRetxSeq uint32
+	if f.Ack != 0 && (f.Type == p2pTypeACK || f.Type == p2pTypeDATA || f.Type == p2pTypeSYNACK) {
+		doFastRetx, fastRetxSeq = s.processAckLocked(f.Ack)
 	}
 	s.mu.Unlock()
+
+	if doFastRetx {
+		s.sendFastRetx(m.edge, fastRetxSeq)
+	}
 
 	switch f.Type {
 	case p2pTypeSYNACK:
@@ -644,7 +844,8 @@ func (s *P2PStream) handleData(e *Edge, f *p2pFrame) {
 
 	s.mu.Lock()
 
-	if f.Seq < s.recvNext {
+	// 序列号回绕安全
+	if !seqAfter(f.Seq, s.recvNext) && f.Seq != s.recvNext {
 		ackToSend := s.recvNext
 		s.mu.Unlock()
 		_ = e.sendP2PFrame(s, &p2pFrame{
@@ -655,6 +856,7 @@ func (s *P2PStream) handleData(e *Edge, f *p2pFrame) {
 		return
 	}
 
+	// 去重：多路径重复
 	if s.recentlyDelivered == nil {
 		s.recentlyDelivered = make(map[uint32]time.Time)
 	}
@@ -696,7 +898,7 @@ func (s *P2PStream) handleData(e *Edge, f *p2pFrame) {
 				}
 			}
 		}
-	} else if f.Seq > s.recvNext {
+	} else if seqAfter(f.Seq, s.recvNext) {
 		if _, exists := s.recvBuf[f.Seq]; !exists {
 			cp := make([]byte, len(f.Payload))
 			copy(cp, f.Payload)
@@ -791,28 +993,34 @@ func (s *P2PStream) retransmitLoop(e *Edge) {
 			log.Printf("[P2P-STREAM] %d retransmit panic: %v", s.ID, r)
 		}
 	}()
-	t := time.NewTicker(p2pResendMs * time.Millisecond)
+
+	t := time.NewTicker(p2pRetxCheckInterval)
 	defer t.Stop()
+
 	for {
 		select {
 		case <-s.closeCh:
 			return
 		case <-t.C:
 		}
+
 		s.mu.Lock()
 		if s.closed {
 			s.mu.Unlock()
 			return
 		}
+
 		now := time.Now()
+		rto := s.rtoLocked()
 		var toResend []*p2pSeg
 		var kill bool
-		for seq := s.sendBase; seq < s.sendNext; seq++ {
+
+		for seq := s.sendBase; seq != s.sendNext; seq++ {
 			seg, ok := s.segments[seq]
 			if !ok {
 				continue
 			}
-			if now.Sub(seg.sentAt) < p2pResendMs*time.Millisecond {
+			if now.Sub(seg.sentAt) < rto {
 				continue
 			}
 			if seg.retries >= p2pMaxRetries {
@@ -831,7 +1039,9 @@ func (s *P2PStream) retransmitLoop(e *Edge) {
 			s.close("retransmit-exhausted")
 			return
 		}
+
 		for _, seg := range toResend {
+			s.retransmits.Add(1)
 			var ft uint8 = p2pTypeDATA
 			if seg.isSyn {
 				if seg.isSynAck {
