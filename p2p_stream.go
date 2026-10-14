@@ -224,6 +224,7 @@ func (m *P2PStreamManager) reaper() {
 	}
 }
 
+// sendP2PProbe 向 peerID 发一个裸 P2P PING 帧（无需 stream）。
 func (m *P2PStreamManager) sendP2PProbe(peerID string) {
 	if m == nil || m.edge == nil || peerID == "" {
 		return
@@ -247,6 +248,14 @@ func (m *P2PStreamManager) sendP2PProbe(peerID string) {
 	}
 }
 
+// collectN2NSTargets 收集一个 stream 的所有候选发送地址。
+//
+// 优先级（保持顺序，去重保留首次）：
+//   1. LAN 地址（同 WiFi 场景）
+//   2. AssistedEndpoints（STUN 反射的多公网映射）
+//   3. lastRecvFrom（对端最近一次发来的源地址，最可信）
+//   4. peerAddr（注册时分配的地址 / SYN 来源地址）
+//   5. peer.UDPAddr（观测 raddr）
 func (e *Edge) collectN2NSTargets(s *P2PStream) []*net.UDPAddr {
 	s.mu.Lock()
 	primary := s.peerAddr
@@ -296,6 +305,13 @@ func (e *Edge) collectN2NSTargets(s *P2PStream) []*net.UDPAddr {
 	return out
 }
 
+// sendP2PFrame 发送一帧到对端的所有候选地址。
+//
+// ★ 修复 1：如果 peer 最近从私网地址发过包（5 秒内），只发 LAN 地址，
+// 避免多路径发包导致对端 peer.UDPAddr 被公网地址覆盖，
+// 造成"去程走 LAN、回程走公网"的不对称延迟。
+//
+// ★ PC 端特有：e.udpConn 是 *net.UDPConn，用 WriteToUDP(buf, addr)。
 func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 	s.mu.Lock()
 	viaTURN := s.viaTURN
@@ -331,6 +347,35 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 	}
 	if e.udpConn == nil {
 		return errors.New("no udp")
+	}
+
+	// ★ 判断 peer 是否在 LAN：最近 5 秒从私网地址收到过包
+	e.peersMu.RLock()
+	var lanPreferred bool
+	if p := e.peers[peerID]; p != nil {
+		if p.UDPAddr != nil && isPrivateIPv4(p.UDPAddr.IP) {
+			if time.Now().UnixMilli()-p.lastRecvAt < 5000 {
+				lanPreferred = true
+			}
+		}
+	}
+	e.peersMu.RUnlock()
+
+	if lanPreferred {
+		// 只发 LAN 地址
+		sent := 0
+		for _, addr := range targets {
+			if !isPrivateIPv4(addr.IP) {
+				continue
+			}
+			if _, err := e.udpConn.WriteToUDP(buf, addr); err == nil {
+				sent++
+			}
+		}
+		if sent > 0 {
+			return nil
+		}
+		// LAN 全失败，落到下面全发
 	}
 
 	var lastErr error
@@ -431,6 +476,7 @@ func (s *P2PStream) abortNoConn() {
 	close(s.closeCh)
 }
 
+// acceptSYN 处理收到的 SYN 帧。幂等：多目标发送会导致同一 SYN 到达多次。
 func (m *P2PStreamManager) acceptSYN(peerID string, peerAddr *net.UDPAddr, viaTURN bool, f *p2pFrame) {
 	if len(f.Payload) < 4 {
 		return
