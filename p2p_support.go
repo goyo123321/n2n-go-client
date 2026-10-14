@@ -8,13 +8,6 @@ import (
 	"time"
 )
 
-// findPeerIDByAddr 按对端地址查 peerID。
-//
-// 四层匹配：
-//   1. UDPAddr 精确
-//   2. LAN 精确
-//   3. Assisted 精确
-//   4. UDPAddr IP 相同（兜底）
 func (e *Edge) findPeerIDByAddr(addr *net.UDPAddr) string {
 	if addr == nil {
 		return ""
@@ -74,20 +67,7 @@ func (e *Edge) peerAddrAndMode(peerID string) (*net.UDPAddr, bool) {
 
 // handleP2PFrame 收到 N2NS 帧时的入口。
 //
-// ★ 修复 2：更新 peer.UDPAddr 时采用"LAN 优先"策略，避免公网地址
-// 覆盖 LAN 地址导致回程走 CGNAT 回环。
-//
-// 更新规则（peer 已有的 UDPAddr 称为 oldAddr，新收到包的源地址称 newAddr）：
-//   1. oldAddr 为空                → 直接设置
-//   2. old=公网, new=LAN           → 更新（LAN 优先）
-//   3. old=LAN,  new=公网          → 保留 LAN（除非 LAN 超过 10 秒无流量）
-//   4. old=LAN,  new=LAN           → 端口变了就更新
-//   5. old=公网, new=公网          → 端口变了就更新
-//
-// PING/PONG 语义区分：
-//   - 收到 PING  → 只证明"对端→本端"单向可达，不升级本端状态
-//   - 收到 PONG  → 双向通道已被证明 → MarkP2P
-//   - 其他帧（SYN/SYNACK/DATA/ACK/FIN/RST）→ 直接 MarkP2P
+// ★ 修复：更新 peer.UDPAddr 时采用"LAN 优先 + 300 秒窗口"策略。
 func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) {
 	if e.p2pStreams == nil {
 		return
@@ -110,19 +90,24 @@ func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) 
 
 			shouldUpdate := false
 			if p.UDPAddr == nil {
-				// 无旧地址
 				shouldUpdate = true
-			} else if !oldIsLAN && newIsLAN {
-				// 旧公网 → 新 LAN（LAN 优先）
-				shouldUpdate = true
-			} else if oldIsLAN && !newIsLAN {
-				// 旧 LAN → 新公网（保留 LAN，除非 LAN 超过 10 秒无流量）
-				if now-p.lastRecvAt > 10000 {
-					shouldUpdate = true
-					log.Printf("[P2P] %s LAN 地址超过 10s 无流量，改用公网地址", peerID)
+				if newIsLAN {
+					p.lastLANRecvAt = now
 				}
+			} else if !oldIsLAN && newIsLAN {
+				shouldUpdate = true
+				p.lastLANRecvAt = now
+			} else if oldIsLAN && !newIsLAN {
+				if now-p.lastLANRecvAt > 300000 {
+					shouldUpdate = true
+					log.Printf("[P2P] %s LAN 地址超过 300s 无流量，改用公网地址", peerID)
+				}
+			} else if oldIsLAN && newIsLAN {
+				if p.UDPAddr.Port != peerAddr.Port {
+					shouldUpdate = true
+				}
+				p.lastLANRecvAt = now
 			} else {
-				// 同类型，端口不同就更新
 				if p.UDPAddr.Port != peerAddr.Port {
 					shouldUpdate = true
 				}
@@ -139,7 +124,6 @@ func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) 
 	if e.relayMgr != nil {
 		switch f.Type {
 		case p2pTypePING:
-			// 单向证明，不升级本端状态
 		case p2pTypePONG:
 			if e.relayMgr.GetState(peerID) != ConnP2P {
 				log.Printf("[P2P] 收到 PONG → P2P 直连（双向通道已验证）")
