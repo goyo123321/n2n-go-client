@@ -8,9 +8,7 @@ import (
 
 // LAN 地址收集（双路径）。
 //
-// 路径 1：UDP connect 骗内核返回出口 IP —— Termux / Android 上
-//   net.Interfaces() 有时拿不到 WiFi 接口，这个路径永远可靠。
-// 路径 2：遍历 net.Interfaces() —— 覆盖多网卡。
+// PC 端此文件独立；Termux 端把这些函数内联在 main.go 末尾。
 func collectLANEndpoints(port int, selfVIP string) []string {
 	var result []string
 	seen := make(map[string]bool)
@@ -39,12 +37,10 @@ func collectLANEndpoints(port int, selfVIP string) []string {
 		result = append(result, ep)
 	}
 
-	// 路径 1：UDP connect 骗内核
 	if ip := detectOutboundIP(); ip != nil {
 		add(ip)
 	}
 
-	// 路径 2：遍历接口
 	ifaces, err := net.Interfaces()
 	if err == nil {
 		for _, iface := range ifaces {
@@ -74,7 +70,6 @@ func collectLANEndpoints(port int, selfVIP string) []string {
 	return result
 }
 
-// detectOutboundIP 用一个不真正发包的 UDP connect 骗内核选出出口网卡。
 func detectOutboundIP() net.IP {
 	targets := []string{
 		"8.8.8.8:80",
