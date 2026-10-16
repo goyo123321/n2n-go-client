@@ -4,7 +4,7 @@
 
 基于 TUN 虚拟网卡，通过 Cloudflare Workers 信令服务器建立 **LAN 直连 / P2P / TURN / WebSocket 中继** 四级降级连接，实现异地组网。
 
-**与 [n2n-termux](https://github.com/goyo123321/n2n-termux)、[n2n-android](https://github.com/goyo123321/n2n-android) 完全互通**——PC 通过 TUN 直接访问其他节点的服务，反之亦然。
+**与 [n2n-termux](https://github.com/goyo123321/n2n-termux)、[n2n-android](https://github.com/goyo123321/n2n-android) 完全互通**——PC 通过 TUN 直接访问其他节点的服务，反之亦然。**支持 TCP / UDP / ICMP（含 ping）**。
 
 ---
 
@@ -24,9 +24,9 @@
          ▼                   ▼                   ▼
    n2n-go-client       n2n-termux          n2n-android
    ┌──────────┐       ┌──────────┐        ┌──────────┐
-   │ TUN 模式  │       │ SOCKS5   │        │ VpnService│
-   │ 系统级路由│       │ 代理模式 │        │ 无 root  │
-   │ 需 root  │       │ 无 root  │        │          │
+   │ TUN 模式  │       │SOCKS5 +  │        │VpnService│
+   │ 系统级路由│       │包转发器  │        │ + SOCKS5 │
+   │ 需 root  │       │ 无 root  │        │ 无 root  │
    └──────────┘       └──────────┘        └──────────┘
      Linux/macOS         Android              Android
      Windows             Termux                APK
@@ -40,12 +40,15 @@
 | 维度 | **n2n-go-client**（本仓库） | n2n-termux | n2n-android |
 |:---|:---|:---|:---|
 | **运行环境** | Linux / macOS / Windows / 路由器 | Android Termux | Android APK |
-| **数据面** | TUN 虚拟网卡 | SOCKS5 代理 | VpnService（TUN） |
+| **数据面** | TUN 虚拟网卡 | SOCKS5 + 包转发器 | VpnService |
 | **权限要求** | root / 管理员 | 无 root | 无 root |
 | **应用透明** | ✅ 系统级 | ⚠️ 需 App 显式配 SOCKS5 | ✅ 系统级 |
-| **协议支持** | TCP / UDP / ICMP | 仅 TCP | TCP / UDP / ICMP |
+| **主动访问** | ✅ TCP/UDP/ICMP | ⚠️ 仅 TCP | ✅ TCP/UDP/ICMP |
+| **被动接受** | ✅ TCP/UDP/ICMP | ✅ TCP/UDP/ICMP | ✅ TCP/UDP/ICMP |
 | **使用方式** | `curl http://10.64.0.X` | `curl --socks5 127.0.0.1:1080 ...` | 同 TUN |
-| **适用场景** | 服务器 / 桌面 / 路由器 | 临时测试 / 无 root 设备 | 日常使用（手机） |
+| **适用场景** | 服务器 / 桌面 / 路由器 | 无 root 设备 / 临时调试 | 日常使用（手机） |
+
+**PC 端优势**：**唯一的完全 root/admin 权限的 TUN 数据面**——支持所有协议，无 SOCKS5 代理层开销，是**性能最强**的客户端。
 
 ---
 
@@ -53,6 +56,7 @@
 
 - **跨平台** — Linux / macOS / Windows / 路由器全支持
 - **TUN 虚拟网卡** — 内核原生 TCP/IP 栈，性能高
+- **完整协议支持** — **TCP / UDP / ICMP（含 ping）**
 - **四级降级** — `LAN → P2P → TURN → WS`，连接永远可用
 - **LAN 直连** — 同 WiFi 场景自动发现 LAN 地址，绕过 NAT 直接内网通信
 - **P2P 直连** — STUN 探测 + NAT 打洞，延迟低至 5ms
@@ -89,6 +93,12 @@
 │   └─────────┘    └──────────┘            │
 └──────────────────────────────────────────┘
 ```
+
+**与 Termux / Android 的差异**：
+
+- **PC**：TUN 内核栈 → 应用无感知，**TCP/UDP/ICMP 全支持**
+- **Termux**：SOCKS5 代理 → 应用**必须显式配代理**，主动访问仅 TCP
+- **Android APK**：VpnService → 应用无感知，**TCP/UDP/ICMP 全支持**
 
 ---
 
@@ -211,35 +221,46 @@ $env:NODE_NAME="A的PC"
 
 ---
 
-## 🔗 与 Termux 互通
+## 🔗 与 Termux / Android 互通
 
-### PC 访问 Termux 上的服务
+### PC 访问 Termux / Android 上的服务
 
-**Termux 端起服务**：
+**Termux / Android 端起服务**：
 
 ```bash
-# Termux-A
-python3 -m http.server 8080
-# 或
-sshd    # SSH 服务监听 8022
+# Termux 端
+python3 -m http.server 8080 &
+sshd  # 默认监听 8022
+
+# Android 端（VpnService 模式）
+# 起 HTTP / SSH / 任意 TCP/UDP 服务
 ```
 
 **PC 端直接访问**（走 TUN）：
 
 ```bash
-# 通过虚拟 IP
-curl http://10.64.0.2:8080/
-ssh -p 8022 u0_aXXX@10.64.0.2
+# ICMP
+ping 10.64.0.3
+
+# TCP
+curl http://10.64.0.3:8080/
+ssh -p 8022 u0_aXXX@10.64.0.3
+
+# UDP
+echo "hello" | nc -u 10.64.0.3 5353
 ```
 
-**前提**：服务必须监听 `0.0.0.0` 或对应接口（不能只听 `127.0.0.1`）。
+**前提**：服务必须监听 `0.0.0.0` 或 `127.0.0.1`（不能只听某个具体 IP）。
 
 ```bash
 # ✅ 可以
 python3 -m http.server 8080 --bind 0.0.0.0
 
-# ❌ 不行（只监听 loopback）
+# ✅ 也可以（packet_forwarder 会 dial 127.0.0.1）
 python3 -m http.server 8080 --bind 127.0.0.1
+
+# ❌ 不行（只监听某个具体 IP）
+python3 -m http.server 8080 --bind 192.168.1.100
 ```
 
 ### Termux 访问 PC 上的服务
@@ -258,53 +279,52 @@ python -m http.server 8080 --bind 0.0.0.0
 
 ```bash
 # Termux-B
-curl --socks5 127.0.0.1:1080 http://10.64.0.4:8080/
-ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@10.64.0.4
+curl --socks5 127.0.0.1:1080 http://10.64.0.2:8080/
+ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@10.64.0.2
+```
+
+### Android 访问 PC 上的服务
+
+Android 端也是 TUN 数据面，直接访问虚拟 IP：
+
+```bash
+# Android 上跑（Termux 或 App 内）
+curl http://10.64.0.2:8080/
 ```
 
 ### 数据面差异
 
-| 维度 | n2n-go-client | n2n-termux |
-|:---|:---|:---|
-| 数据面 | TUN 虚拟网卡（内核 TCP/IP 栈） | SOCKS5 + `N2NS` 帧 |
-| 应用透明 | ✅ 系统级路由，无需配置 | ⚠️ 需要应用显式配 SOCKS5 |
-| 协议支持 | TCP / UDP / ICMP | 仅 TCP |
-| 权限要求 | root / 管理员 | 无 root |
-| 使用方式 | `curl http://10.64.0.X` | `curl --socks5 127.0.0.1:1080 http://10.64.0.X` |
+| 维度 | **n2n-go-client** | n2n-termux | n2n-android |
+|:---|:---|:---|:---|
+| 数据面 | TUN 虚拟网卡（内核 TCP/IP 栈） | SOCKS5 + 包转发器 | VpnService |
+| 应用透明 | ✅ 系统级路由 | ⚠️ 需应用显式配 SOCKS5 | ✅ 系统级 |
+| 主动协议 | TCP / UDP / ICMP | 仅 TCP | TCP / UDP / ICMP |
+| 被动协议 | TCP / UDP / ICMP | TCP / UDP / ICMP | TCP / UDP / ICMP |
+| 权限要求 | root / 管理员 | 无 root | 无 root |
+| 使用方式 | `curl http://10.64.0.X` | `curl --socks5 127.0.0.1:1080 ...` | 同 TUN |
 
-**关键**：**两端的数据面协议完全独立**——PC 端 TUN 里发出的 IPv4 包会被 n2n-go-client 打包走 P2P/TURN/WS；Termux 端的 SOCKS5 连接会被 n2n-termux 打包走 P2P/TURN/WS。**它们在服务端和 P2P 通道层用同一套协议**（N2NS 帧 + 打洞 + TURN 中继），所以完全互通。
+**关键**：**三端的数据面协议完全独立**，但**在服务端和 P2P 通道层用同一套协议**（N2NS 帧 + 打洞 + TURN 中继），所以完全互通。
 
 ### 打洞行为
 
-**PC ↔ Termux 打洞**与 **Termux ↔ Termux 打洞**行为一致：
+**PC ↔ Termux**、**PC ↔ Android**、**PC ↔ PC** 打洞行为一致：
 
 - 双端都上报 `lanEndpoints` → LAN 直连优先
 - 双端都上报 `assistedEndpoints` → STUN 反射多端点
 - 打洞指令由同一个 `coordinator.js` 生成
 - 状态机（`P2PAvailable` → `P2P`）完全相同
 
-**唯一区别**：PC 端还有 `peer.UDPAddr` 直发路径（TUN 里发包到虚拟 IP），Termux 端只能通过 SOCKS5 触发。
+### 已 P2P 时的主动上报
 
----
+**场景**：PC 收到 `nat_hole_instruction` 前已经通过 PING/PONG 建立了 P2P。
 
-## 🔗 与 Android APK 互通
+**修复**：客户端**主动上报** `p2p_status=3`，让服务端 `punchState` 记录成功状态，**停止每 15 秒重发指令**。
 
-**Android APK（n2n-android）也是 TUN 数据面**，与 PC 端**完全等价**：
+**验证日志**：
 
-- 双端都是 VpnService / TUN
-- 双端都监听同一虚拟网段
-- 双端数据面直接走 N2NS 帧
-
-**PC → Android**：
-
-```bash
-curl http://10.64.0.3:8080/       # Android 上跑 HTTP 服务
-ssh user@10.64.0.3
 ```
-
-**Android → PC**：
-
-Android 端通过 TUN 直接访问 `10.64.0.2`，无需额外配置。
+[NAT-HOLE] 跳过指令 target=xxx（已 P2P），上报 p2p_status=3    ← 只出现一次
+```
 
 ---
 
@@ -451,6 +471,21 @@ Unknown → P2PAvailable → P2P
 
 **P2PAvailable 30 秒超时**：打洞握手成功但 30 秒内没升到 P2P → 强制降级到 TURN/WS，避免永远卡在中间态。
 
+### LAN 优先保护（30 秒窗口）
+
+**问题**：同 WiFi 场景下，peer 的 `UDPAddr` 可能在 LAN 和公网之间抖动，导致 ping 从 5ms 跳 200ms。
+
+**修复**：
+
+- **新建 peer 时**：优先用 LAN 端点初始化 `UDPAddr`
+- **更新 UDPAddr 时**：
+  - `!oldIsLAN && newIsLAN` → 立即更新（切到 LAN）
+  - `oldIsLAN && !newIsLAN` → **只有 LAN 侧连续 30 秒无流量**才切到公网
+  - `oldIsLAN && newIsLAN` → 同类型，端口变了才更新
+- **发送数据时**：如果 peer 有 LAN 端点，**先发 LAN**，全失败才回退 `UDPAddr`
+
+**效果**：同 WiFi 场景稳定走 LAN 直达（8-15ms），不再有 200ms 尖峰。
+
 ### P2P 数据帧格式（21 字节头 + payload）
 
 ```
@@ -538,6 +573,7 @@ ssh -p 8022 u0_aXXX@10.64.0.3
 
 ```bash
 curl http://10.64.0.4:8080/       # Android 走 TUN
+ping 10.64.0.4                    # ICMP 也支持
 ```
 
 **Termux → PC**：
@@ -625,14 +661,14 @@ Actions → Build n2n-go Client → Run workflow
 n2n-go-client/
 ├── main.go                       # 主程序（含 UDP 保活 + P2P 通道保活 + LAN 收集）
 ├── ws_transport.go               # WebSocket 传输层（断线重连 + 90s 读超时 + 早期消息缓冲）
-├── relay_fallback.go             # 四级降级管理器（含 ForceFallback）
+├── relay_fallback.go             # 四级降级管理器（含 ForceFallback + LAN 优先发送）
 ├── turn_client.go                # TURN 客户端
 ├── turn_lite.go                  # TURN-Lite 实现（UDP + TCP）
 ├── turn_lite_tcp.go              # TURN over TCP / RFC 6062
 ├── nat_probe.go                  # NAT 类型探测
-├── nathole_executor.go           # 打洞指令执行（分阶段扫描）
+├── nathole_executor.go           # 打洞指令执行（分阶段扫描 + 30s LAN 窗口）
 ├── p2p_stream.go                 # N2NS 可靠流协议
-├── p2p_support.go                # P2P stream 依赖方法
+├── p2p_support.go                # P2P stream 依赖方法（LAN 优先 + 30s 窗口）
 ├── punch.go                      # Punch/ACK 定义
 ├── socks5.go                     # SOCKS5 入口
 ├── app_stream.go                 # WS 应用层隧道（app_stream）
@@ -708,6 +744,8 @@ UDP_PORT=50001 ./n2n-client ...
 | TURN 中继 | 30~100ms | Cloudflare TURN 配额 |
 | WebSocket 中继 | 100~300ms | Worker 请求配额 |
 
+**PC 端性能最优**——直接走 TUN 内核栈，无 SOCKS5 代理层开销。
+
 ---
 
 ## 🐛 常见问题
@@ -738,30 +776,59 @@ python3 -m http.server 8080
 curl -v --max-time 5 http://10.64.0.3:8080/
 ```
 
-### Q: PC 能 ping 通 Termux 吗？
+### Q: ping Termux 不通？
 
-**Termux 端不支持 TUN，无法响应 ICMP**。所以 PC 端 `ping 10.64.0.X` **一定失败**。
+**Termux 端支持 ICMP 响应**——通过内置 `packet_forwarder.go` 处理 Echo Request。
 
-**要测 PC → Termux 连通性**，用 TCP：
+**如果 ping 不通**：
+
+**情况 1：单向 P2P（最常见）**
+
+日志里会看到 **每秒一次** 的 `[FWD-ICMP] Echo Request from 10.64.0.2`（PC 一直重发）。
+
+**原因**：CGNAT 打洞单向——PC 的包能到 Termux，但 Termux 的包被 PC 侧 CGNAT 丢弃。
+
+**修复**：Termux 端最新版已将 **ICMP 强制走 WS 中继**（牺牲延迟换可靠）。RTT 会变成 100-300ms，但**一定能通**。
+
+**情况 2：Termux 客户端未运行**
+
+检查 Termux 端：
 
 ```bash
-# Termux-A 端起服务
-python3 -m http.server 8080 --bind 0.0.0.0
-
-# PC 端测
-curl http://10.64.0.2:8080/
+ps aux | grep n2n-client
+tail -f ~/n2n.log | grep FWD
 ```
+
+应该有 `[FWD] 已启动（TCP 中继 + UDP 转发 + ICMP 响应）`。
+
+### Q: ping Android 不通？
+
+**Android 的 TUN 对 ICMP 支持完整**——如果 ping 不通，可能是：
+
+1. **打洞失败** → 服务端面板显示 `TURN-BD` 或 `ws-BD`
+2. **Android 端 App 未启动** → 检查通知栏图标
+3. **路由问题** → `adb shell ip route` 检查是否有 `10.64.0.0/24`
+
+### Q: PC 能 ping 通 Termux 吗？
+
+**能**（最新版）。走 `packet_forwarder.go` 的 ICMP 响应路径。
+
+- P2P 双向 → 直接走 UDP，RTT 5-15ms
+- P2P 单向 → 走 WS 中继，RTT 100-300ms
+- 打洞失败 → 走 TURN 或 WS 中继
 
 ### Q: Termux 能 ping 通 PC 吗？
 
-**Termux 端 SOCKS5 只代理 TCP**，`ping`（ICMP）和 `curl http://` 走的是不同协议栈。
+**不能**。**Termux 端 SOCKS5 只代理 TCP**，不支持 ICMP。
+
+**用 TCP 测**：
 
 ```bash
-# ❌ 不行（ICMP 不走 SOCKS5）
-ping 10.64.0.4
+# PC 端起服务
+python3 -m http.server 8080 --bind 0.0.0.0
 
-# ✅ 可以（TCP 走 SOCKS5）
-curl --socks5 127.0.0.1:1080 http://10.64.0.4:8080/
+# Termux 端测
+curl --socks5 127.0.0.1:1080 http://10.64.0.2:8080/
 ```
 
 ### Q: 如何判断走的是 LAN / P2P / TURN / WS？
@@ -801,6 +868,18 @@ curl --socks5 127.0.0.1:1080 http://10.64.0.4:8080/
    - 相同 → 同 CGNAT，需要 hairpin（多半失败）
    - 不同 → 正常跨 NAT，大概率成功
 
+### Q: 客户端每 15 秒收到一次 `nat_hole_instruction`？
+
+**已 P2P 但没告诉服务端**。
+
+**修复**：最新版代码在跳过指令时**主动上报** `p2p_status=3`：
+
+```
+[NAT-HOLE] 跳过指令 target=xxx（已 P2P），上报 p2p_status=3    ← 只出现一次
+```
+
+如果日志里每 15 秒出现一次 `跳过指令`，说明客户端版本太旧，需要升级。
+
 ### Q: LAN 地址收集不到？
 
 **检查启动日志**：
@@ -831,6 +910,18 @@ python3 -c "import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.
 
 - 输出 `192.168.x.x` → Go 也能拿到 LAN
 - 输出 `10.x` / `100.64.x` → 默认路由不在 WiFi
+
+### Q: 同 WiFi 延迟波动很大（100ms+）？
+
+**已修复**（v1.2.0+）。原因是两端同时向 LAN + 公网发包，导致对端 `peer.UDPAddr` 被公网地址覆盖，回程走 CGNAT 回环。
+
+**修复后**：
+
+- 新建 peer 时优先用 LAN 初始化 `UDPAddr`
+- 收到包更新 `UDPAddr` 时 **LAN 优先**，30 秒窗口
+- 发送数据时 **LAN 优先**，只失败才回退
+
+现在同 WiFi 场景延迟稳定在 **8~15ms**，标准差 <2ms。
 
 ### Q: P2P 建立后过一段时间断了？
 
@@ -941,7 +1032,7 @@ MIT
 |:---|:---|:---|:---|
 | [edge-signal](https://github.com/goyo123321/edge-signal) | Cloudflare Workers | 信令服务器 | — |
 | **n2n-go-client** | Linux / macOS / Windows | **TUN** | ✅ 全部 |
-| [n2n-termux](https://github.com/goyo123321/n2n-termux) | Android Termux | **SOCKS5** | ✅ 全部 |
+| [n2n-termux](https://github.com/goyo123321/n2n-termux) | Android Termux | **SOCKS5 + 包转发** | ✅ 全部 |
 | [n2n-android](https://github.com/goyo123321/n2n-android) | Android APK | VpnService | ✅ 全部 |
 
 **三端互通**：n2n-termux ↔ n2n-go-client ↔ n2n-android 可以互相访问。
