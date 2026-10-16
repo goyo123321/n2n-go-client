@@ -27,7 +27,6 @@ var (
 
 const DefaultVirtualCIDR = "10.64.0.0/24"
 
-// LAN 缓存：reportMetadata 实时收集为空时回退用上次成功结果
 var (
 	lanCacheMu   sync.Mutex
 	lanCache     []string
@@ -62,7 +61,7 @@ type PeerInfo struct {
 	TurnRelayAddr     string
 	UDPAddr           *net.UDPAddr
 	lastRecvAt        int64
-	lastLANRecvAt     int64 // ★ 最近一次收到 LAN 帧的时间
+	lastLANRecvAt     int64
 	loggedReady       bool
 	hasRealData       bool
 	probeReplied      bool
@@ -127,7 +126,6 @@ func (e *Edge) Done() <-chan struct{} { return e.doneCh }
 
 const keepaliveInterval = 5 * time.Second
 
-// ★ 修复：STUN 服务器从 3 个扩到 5 个
 var keepaliveServers = []string{
 	"74.125.250.129:19302",
 	"74.125.204.127:19302",
@@ -152,7 +150,6 @@ func buildSTUNBindingRequest() []byte {
 	return buf
 }
 
-// startKeepalive 无条件发送 STUN Binding Request（保 CGNAT 映射）。
 func (e *Edge) startKeepalive() {
 	if e.udpConn == nil {
 		return
@@ -1079,6 +1076,21 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			log.Printf("[NAT-HOLE] 忽略指令 target=%s（peer 不在线）", instr.TargetMac)
 			return
 		}
+
+		// ★★★ 新增（本次修复）：已 P2P 时，主动上报 p2p_status=3，
+		//     让服务端 punchState 里的 aState/bState 变成 3，
+		//     anySucceeded 分支生效，停止每 15 秒重发 nat_hole_instruction。
+		//
+		// 场景：客户端在收到指令前就已经通过 PING/PONG 建立了 P2P（比如两端
+		// 同时连接、或 NAT 友好不需要打洞）。旧版直接 return，服务端不知道
+		// 客户端已经 P2P，会一直重发指令（日志里每 15 秒一次"跳过指令"）。
+		if e.relayMgr != nil && e.relayMgr.GetState(instr.TargetMac) == ConnP2P {
+			log.Printf("[NAT-HOLE] 跳过指令 target=%s（已 P2P），上报 p2p_status=3",
+				instr.TargetMac)
+			e.reportP2PStatus(instr.TargetMac, 3)
+			return
+		}
+
 		e.ensureTargetPeer(&instr)
 		e.scheduleFallbackTimer(instr.TargetMac)
 		instrCopy := instr
@@ -1249,7 +1261,14 @@ func (e *Edge) peerExists(peerID string) bool {
 
 // registerPeer 注册/更新一个 peer。
 //
-// ★ 修复：LAN 优先保护 UDPAddr
+// ★ LAN 优先保护 UDPAddr
+//
+// ★★ 补丁 3（本次修复）：新建 peer 时，若对端有 LAN 端点，初始 UDPAddr 用 LAN。
+//
+//	旧版新建 peer 时 UDPAddr 直接用服务端下发的公网地址（pubIP:pubPort），
+//	导致连接刚建立时前几个包走 CGNAT hairpin（200-400ms + DUP），
+//	直到收到第一个 LAN 帧才切回 LAN。
+//	新版优先用 sortedLAN[0] 初始化，LAN 不可达时回退公网地址。
 func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natType string, assisted, lanEndpoints []string) {
 	log.Printf("[registerPeer] %s: 收到 assisted=%d 个 %v lanEndpoints=%d 个 %v",
 		peerID, len(assisted), assisted, len(lanEndpoints), lanEndpoints)
@@ -1297,12 +1316,27 @@ func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natTyp
 			p.LanEndpoints = sortedLAN
 		}
 	} else {
+		// ★★ 补丁 3：新建 peer 时优先用 LAN 初始化 UDPAddr
+		var initialUDP *net.UDPAddr
+		if len(sortedLAN) > 0 {
+			for _, lan := range sortedLAN {
+				if ra, err := net.ResolveUDPAddr("udp", lan); err == nil && ra != nil && ra.IP != nil {
+					initialUDP = ra
+					log.Printf("[P2P] %s 新建 peer，初始 UDPAddr 用 LAN: %s", peerID, lan)
+					break
+				}
+			}
+		}
+		if initialUDP == nil {
+			initialUDP = udpAddr
+		}
+
 		e.peers[peerID] = &PeerInfo{
 			ClientID:          peerID,
 			VirtualIP:         virtualIP,
 			PubIP:             pubIP,
 			PubPort:           pubPort,
-			UDPAddr:           udpAddr,
+			UDPAddr:           initialUDP,
 			NATType:           natType,
 			AssistedEndpoints: assisted,
 			LanEndpoints:      sortedLAN,
@@ -1317,7 +1351,9 @@ func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natTyp
 
 // ensureTargetPeer 记录指令里的目标 peer 信息。
 //
-// ★ 修复：LAN 优先保护 UDPAddr
+// ★ LAN 优先保护 UDPAddr
+//
+// ★★ 补丁 3（本次修复）：新建时优先用 LAN 端点初始化 UDPAddr。
 func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 	if instr.TargetMac == "" {
 		return
@@ -1340,10 +1376,27 @@ func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 			p.VirtualIP = instr.TargetVirtualIp
 		}
 	} else {
+		// ★★ 补丁 3：优先使用 LAN 端点
+		var initialUDP *net.UDPAddr
+		if len(instr.TargetLanEndpoints) > 0 {
+			for _, lan := range instr.TargetLanEndpoints {
+				if ra, err := net.ResolveUDPAddr("udp", lan); err == nil && ra != nil && ra.IP != nil {
+					initialUDP = ra
+					log.Printf("[P2P] %s 新建 peer（ensureTargetPeer），初始 UDPAddr 用 LAN: %s",
+						instr.TargetMac, lan)
+					break
+				}
+			}
+		}
+		if initialUDP == nil {
+			initialUDP = udpAddr
+		}
+
 		e.peers[instr.TargetMac] = &PeerInfo{
-			ClientID:  instr.TargetMac,
-			VirtualIP: instr.TargetVirtualIp,
-			UDPAddr:   udpAddr,
+			ClientID:     instr.TargetMac,
+			VirtualIP:    instr.TargetVirtualIp,
+			UDPAddr:      initialUDP,
+			LanEndpoints: instr.TargetLanEndpoints,
 		}
 	}
 }
@@ -1383,6 +1436,46 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 					"punchResult":        res,
 					"punchResultPeerMac": instr.TargetMac,
 					"p2pStatus":          p2pStatus,
+				},
+			},
+		},
+	})
+}
+
+// reportP2PStatus 主动上报当前 P2P 状态，让服务端停止重发 nat_hole_instruction。
+//
+// ★★★ 新增（本次修复）：
+//
+// 场景：客户端在收到指令前就已经通过 PING/PONG 建立了 P2P（比如两端同时连接，
+// 或 NAT 友好不需要打洞）。此时客户端会跳过打洞指令，但服务端不知道——
+// punchState 里 aState/bState 一直是 0，anySucceeded = false，服务端每 15 秒
+// 重发一次 nat_hole_instruction。日志里会看到大量
+// "[NAT-HOLE] 跳过指令 target=...（已 P2P）"。
+//
+// 主动上报 state=3 + p2pStatus=3 后，服务端 recordPunchResult：
+//   - state=3 → 交叉校验（self >= P2P_AVAILABLE(2) 通过）
+//   - entry.aState = 3 → anySucceeded = true → 停止重发
+//
+// status 参数：
+//   3 — ConnP2P（数据面已验证）
+//   2 — ConnP2PAvailable（握手成功，数据面未验证）
+func (e *Edge) reportP2PStatus(peerID string, status int) {
+	if e.ws == nil || peerID == "" {
+		return
+	}
+	_ = e.ws.Send(map[string]interface{}{
+		"type": "p2p_state_info",
+		"payload": map[string]interface{}{
+			"to": []map[string]interface{}{
+				{
+					"macAddr": peerID,
+					"punchResult": map[string]interface{}{
+						"state":    3,
+						"attempts": 0,
+						"detail":   "already-p2p",
+					},
+					"punchResultPeerMac": peerID,
+					"p2pStatus":          status,
 				},
 			},
 		},
@@ -1495,7 +1588,9 @@ func (e *Edge) notePeerTrafficTURN(addr *net.UDPAddr) {
 
 // notePeerCommon 是打洞握手路径的统一入口。
 //
-// ★ 修复：更新 peer.UDPAddr 时采用"LAN 优先"策略，与 handleP2PFrame 保持一致。
+// ★ LAN 优先 + 30 秒窗口 + lastLANRecvAt > 0 检查
+//
+// ★★ 补丁 2（本次修复）：LAN→公网切换窗口 300000（5 分钟）→ 30000（30 秒）。
 func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, isAck bool) {
 	now := time.Now().UnixMilli()
 
@@ -1568,9 +1663,10 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 	} else if !oldIsLAN && newIsLAN {
 		shouldUpdate = true
 	} else if oldIsLAN && !newIsLAN {
-		if best.lastLANRecvAt > 0 && now-best.lastLANRecvAt > 300000 {
+		// ★★ 补丁 2：5 分钟 → 30 秒
+		if best.lastLANRecvAt > 0 && now-best.lastLANRecvAt > 30000 {
 			shouldUpdate = true
-			log.Printf("[P2P] %s (note) LAN 超过 300s 无流量，改用公网地址", best.ClientID)
+			log.Printf("[P2P] %s (note) LAN 超过 30s 无流量，改用公网地址", best.ClientID)
 		}
 	} else {
 		if best.UDPAddr.Port != addrPort {
