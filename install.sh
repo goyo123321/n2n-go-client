@@ -13,26 +13,34 @@
 #   NODE_NAME         显示名，默认 hostname
 #   VERSION           指定版本（如 v1.2.0）；留空自动获取最新
 #   INSTALL_DIR       安装目录，默认 ~/.n2n-go
-#   FORCE_UPDATE      =1 强制重装（即使已是最新）
+#   FORCE_UPDATE      =1 强制重装
 #   NO_LAUNCH         =1 只安装不启动
-#   AUTO_START        =1 静默自动启动（不停下来问）
+#   AUTO_START        =1 静默自动启动
 #   CHECK_ONLY        =1 只检查版本不下载
 #
 
 set -euo pipefail
 
+# ★ 修复：set -u 下未定义变量会报错，统一给空默认值
 REPO="goyo123321/n2n-go-client"
 BIN_NAME="n2n-client"
-INSTALL_DIR="${INSTALL_DIR:-$HOME/.n2n-go}"
-BIN_PATH="$INSTALL_DIR/$BIN_NAME"
-VERSION_FILE="$INSTALL_DIR/.version"
-CONFIG_FILE="$INSTALL_DIR/config.env"
-LAUNCHER="$INSTALL_DIR/start.sh"
 
+SIGNALING_URL="${SIGNALING_URL:-}"
+CONNECT_TOKEN="${CONNECT_TOKEN:-}"
+ROOM_ID="${ROOM_ID:-}"
+CLIENT_ID="${CLIENT_ID:-}"
+NODE_NAME="${NODE_NAME:-}"
+VERSION="${VERSION:-}"
 FORCE_UPDATE="${FORCE_UPDATE:-0}"
 NO_LAUNCH="${NO_LAUNCH:-0}"
 AUTO_START="${AUTO_START:-0}"
 CHECK_ONLY="${CHECK_ONLY:-0}"
+INSTALL_DIR="${INSTALL_DIR:-$HOME/.n2n-go}"
+
+BIN_PATH="$INSTALL_DIR/$BIN_NAME"
+VERSION_FILE="$INSTALL_DIR/.version"
+CONFIG_FILE="$INSTALL_DIR/config.env"
+LAUNCHER="$INSTALL_DIR/start.sh"
 
 GITHUB_API="https://api.github.com/repos/${REPO}"
 GITHUB_DL="https://github.com/${REPO}/releases/download"
@@ -40,7 +48,7 @@ FALLBACK_VERSION="v1.2.0"
 
 # 非交互式（curl | bash）时把 stdin 重定向到 tty
 if [ ! -t 0 ] && [ -r /dev/tty ]; then
-    exec < /dev/tty
+    exec < /dev/tty || true
 fi
 
 # 颜色
@@ -96,7 +104,7 @@ detect_env() {
 }
 
 # ============================================================
-# ★ 版本管理
+# 版本管理
 # ============================================================
 read_installed_version() {
     if [ -f "$VERSION_FILE" ]; then
@@ -112,7 +120,7 @@ write_installed_version() {
 }
 
 resolve_latest_version() {
-    if [ -n "${VERSION:-}" ]; then
+    if [ -n "$VERSION" ]; then
         echo "$VERSION"
         return 0
     fi
@@ -137,7 +145,7 @@ resolve_latest_version() {
 }
 
 # ============================================================
-# 停止运行中的客户端（避免二进制被占用）
+# 停止运行中的客户端
 # ============================================================
 stop_running_client() {
     if ! command -v pgrep >/dev/null 2>&1; then
@@ -145,7 +153,7 @@ stop_running_client() {
     fi
 
     local pids
-    pids=$(pgrep -f "${INSTALL_DIR}/bin/${BIN_NAME}|${INSTALL_DIR}/${BIN_NAME}|${BIN_PATH}" 2>/dev/null || true)
+    pids=$(pgrep -f "${INSTALL_DIR}/${BIN_NAME}" 2>/dev/null || true)
     if [ -z "$pids" ]; then
         return 0
     fi
@@ -155,8 +163,7 @@ stop_running_client() {
     kill $pids 2>/dev/null || true
     sleep 1
 
-    # 还没退就强杀
-    pids=$(pgrep -f "${INSTALL_DIR}/bin/${BIN_NAME}|${INSTALL_DIR}/${BIN_NAME}|${BIN_PATH}" 2>/dev/null || true)
+    pids=$(pgrep -f "${INSTALL_DIR}/${BIN_NAME}" 2>/dev/null || true)
     if [ -n "$pids" ]; then
         warn "进程未响应 SIGTERM，使用 SIGKILL"
         # shellcheck disable=SC2086
@@ -167,7 +174,7 @@ stop_running_client() {
 }
 
 # ============================================================
-# 下载并安装
+# 下载二进制
 # ============================================================
 install_binary() {
     local version="$1"
@@ -214,7 +221,7 @@ prompt_config() {
     fi
 
     # 已有 config.env 且没传 SIGNALING_URL → 用现成的
-    if [ -f "$CONFIG_FILE" ] && [ -z "${SIGNALING_URL:-}" ]; then
+    if [ -f "$CONFIG_FILE" ] && [ -z "$SIGNALING_URL" ]; then
         log "使用已有配置: $CONFIG_FILE"
         set -a
         # shellcheck disable=SC1090
@@ -226,37 +233,37 @@ prompt_config() {
     echo ""
     log "配置客户端（直接回车用默认值）"
 
-    if [ -z "${SIGNALING_URL:-}" ]; then
+    if [ -z "$SIGNALING_URL" ]; then
         printf "SIGNALING_URL (wss://xxx.workers.dev): "
         read -r SIGNALING_URL || true
     fi
 
-    if [ -z "${SIGNALING_URL:-}" ]; then
+    if [ -z "$SIGNALING_URL" ]; then
         warn "未填写 SIGNALING_URL，跳过启动"
         NO_LAUNCH=1
         return 0
     fi
 
-    if [ -z "${ROOM_ID:-}" ]; then
+    if [ -z "$ROOM_ID" ]; then
         printf "ROOM_ID [default-room]: "
         read -r input || true
         ROOM_ID="${input:-default-room}"
     fi
 
-    if [ -z "${CLIENT_ID:-}" ]; then
+    if [ -z "$CLIENT_ID" ]; then
         printf "CLIENT_ID [自动生成]: "
         read -r input || true
         CLIENT_ID="$input"
     fi
 
-    if [ -z "${NODE_NAME:-}" ]; then
+    if [ -z "$NODE_NAME" ]; then
         hostname_default=$(hostname 2>/dev/null || echo "n2n-node")
         printf "NODE_NAME [$hostname_default]: "
         read -r input || true
         NODE_NAME="${input:-$hostname_default}"
     fi
 
-    if [ -z "${CONNECT_TOKEN:-}" ]; then
+    if [ -z "$CONNECT_TOKEN" ]; then
         printf "CONNECT_TOKEN [留空]: "
         read -rs input || true
         echo
@@ -339,7 +346,7 @@ launch_client() {
         esac
     fi
 
-    if [ -z "${SIGNALING_URL:-}" ]; then
+    if [ -z "$SIGNALING_URL" ]; then
         err "未设置 SIGNALING_URL，无法启动"
         info "手动: SIGNALING_URL=wss://... $LAUNCHER"
         return 1
@@ -383,7 +390,6 @@ main() {
 
     detect_env
 
-    # 1. 检查已装版本
     local installed latest need_update
     installed="$(read_installed_version)"
 
@@ -397,7 +403,6 @@ main() {
     fi
     log "远端最新: $latest"
 
-    # 2. 决策
     need_update=1
     if [ -n "$installed" ] && [ "$installed" = "$latest" ] && [ "$FORCE_UPDATE" != "1" ]; then
         need_update=0
@@ -406,7 +411,7 @@ main() {
     if [ "$CHECK_ONLY" = "1" ]; then
         echo ""
         if [ "$need_update" = "1" ]; then
-            ok "有新版本可更新: $installed → $latest"
+            ok "有新版本可更新: ${installed:-无} → $latest"
             info "运行不带 CHECK_ONLY=1 即可升级"
         else
             ok "已是最新版本: $latest"
@@ -423,22 +428,17 @@ main() {
             log "首次安装: $latest"
         fi
 
-        # 停旧进程
         stop_running_client
-
-        # 下载
         install_binary "$latest"
         write_installed_version "$latest"
         ok "版本已更新: $latest"
     fi
 
-    # 3. 配置（保留已有）
     prompt_config
-    if [ -n "${SIGNALING_URL:-}" ]; then
+    if [ -n "$SIGNALING_URL" ]; then
         save_config
     fi
 
-    # 4. 生成启动脚本（幂等）
     write_launcher
 
     echo ""
@@ -450,7 +450,6 @@ main() {
     info "启动:    sudo $LAUNCHER"
     echo ""
 
-    # 5. 启动
     launch_client
 }
 
