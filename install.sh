@@ -27,7 +27,7 @@ INSTALL_DIR="${INSTALL_DIR:-$HOME/.n2n-go}"
 # 更新新版本发布后，把 FALLBACK_VERSION 改成最新的 tag 即可
 # （作为 API 限流/断网时的兜底）
 # ============================================================
-FALLBACK_VERSION="v1.0.27"
+FALLBACK_VERSION="v1.0.28"
 
 GITHUB_API="https://api.github.com/repos/${REPO}"
 GITHUB_DL="https://github.com/${REPO}/releases/download"
