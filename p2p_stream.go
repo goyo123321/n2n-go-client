@@ -1,5 +1,8 @@
 package main
 
+// N2NS 可靠 UDP 流协议（PC / Termux 通用）。
+// 底层使用 *net.UDPConn，发送时使用 WriteToUDP。
+
 import (
 	"encoding/binary"
 	"errors"
@@ -133,7 +136,11 @@ type P2PStreamManager struct {
 }
 
 func NewP2PStreamManager(edge *Edge) *P2PStreamManager {
-	m := &P2PStreamManager{byID: make(map[uint32]*P2PStream), next: 2, edge: edge}
+	m := &P2PStreamManager{
+		byID: make(map[uint32]*P2PStream),
+		next: 2,
+		edge: edge,
+	}
 	safeGo("p2p-reaper", m.reaper)
 	return m
 }
@@ -204,7 +211,12 @@ func (m *P2PStreamManager) dropPeer(peerID string) {
 func (m *P2PStreamManager) reaper() {
 	t := time.NewTicker(30 * time.Second)
 	defer t.Stop()
-	for range t.C {
+	for {
+		select {
+		case <-m.edge.doneCh:
+			return
+		case <-t.C:
+		}
 		now := time.Now()
 		m.mu.RLock()
 		var stale []*P2PStream
@@ -297,7 +309,7 @@ func (e *Edge) collectN2NSTargets(s *P2PStream) []*net.UDPAddr {
 
 // sendP2PFrame 发送一帧到对端的所有候选地址。
 //
-// ★ 修复 1：LAN 优先（窗口 300s）。
+// ★ 修复 1：LAN 优先（窗口 30s）。
 // ★ 修复 2：控制帧全发（保 CGNAT 映射 + 探测 LAN 恢复）。
 // ★ 修复 3：TURN 模式下控制帧也尝试直连。
 //
@@ -314,6 +326,18 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 
 	if viaTURN {
 		if e.turnClient == nil || !e.turnClient.IsReady() {
+			if forceDual && e.udpConn != nil {
+				targets := e.collectN2NSTargets(s)
+				sent := 0
+				for _, addr := range targets {
+					if _, err := e.udpConn.WriteToUDP(buf, addr); err == nil {
+						sent++
+					}
+				}
+				if sent > 0 {
+					return nil
+				}
+			}
 			return errors.New("turn down")
 		}
 
@@ -335,7 +359,6 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 			return e.turnClient.Send(buf, ra)
 		}
 
-		// 控制帧在 TURN 模式：TURN + 直连试探
 		var lastErr error
 
 		if e.udpConn != nil {
@@ -375,7 +398,7 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 	var lanPreferred bool
 	if p := e.peers[peerID]; p != nil {
 		if p.lastLANRecvAt > 0 &&
-			time.Now().UnixMilli()-p.lastLANRecvAt < 300000 {
+			time.Now().UnixMilli()-p.lastLANRecvAt < 30000 {
 			lanPreferred = true
 		}
 	}
