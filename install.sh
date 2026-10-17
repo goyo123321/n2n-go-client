@@ -6,6 +6,14 @@
 #   curl -fsSL https://raw.githubusercontent.com/goyo123321/n2n-go-client/main/install.sh -o ~/install_n2n.sh
 #   bash ~/install_n2n.sh
 #
+# 安装路径：默认在当前工作目录下创建 .n2n-go（可用 INSTALL_DIR 覆盖）
+#
+# 重新配置：
+#   bash ~/install_n2n.sh                  # 交互式询问
+#   RECONFIG=1 bash ~/install_n2n.sh       # 强制重新配置
+#   KEEP_CONFIG=1 bash ~/install_n2n.sh    # 强制使用现有配置
+#   RESET=1 bash ~/install_n2n.sh          # 完全重置（删 config.env + client_id）
+#
 # 适用场景：
 #   ✅ Linux 服务器 / 树莓派 / 路由器（有 TUN + root）
 #   ✅ macOS（有 utun + sudo）
@@ -13,24 +21,19 @@
 #   ✅ Termux + root（有 /dev/net/tun + tsu/su）
 #   ❌ Termux 无 root（没有 TUN） → 请用 n2n-termux
 #
-# ★ 安装路径：默认在当前工作目录下创建 .n2n-go（可用 INSTALL_DIR 覆盖）
-#   例如在 /opt 运行 → /opt/.n2n-go/
-#   在 ~ 运行 → ~/.n2n-go/
-#
 
 set -eu
 
 REPO="goyo123321/n2n-go-client"
 BIN_NAME="n2n-go-client"
 
-# ★ 安装路径：默认在当前工作目录下（绝对值，避免后续 cd 影响）
+# ★ 安装目录：默认当前工作目录下的 .n2n-go
 if [ -z "${INSTALL_DIR:-}" ]; then
     INSTALL_DIR="$(pwd)/.n2n-go"
 fi
-# 确保是绝对路径
 case "$INSTALL_DIR" in
-    /*) ;;  # 已是绝对路径
-    *)  INSTALL_DIR="$(pwd)/$INSTALL_DIR" ;;  # 相对路径转绝对
+    /*) ;;
+    *)  INSTALL_DIR="$(pwd)/$INSTALL_DIR" ;;
 esac
 
 SIGNALING_URL="${SIGNALING_URL:-}"
@@ -48,6 +51,9 @@ NO_LAUNCH="${NO_LAUNCH:-0}"
 AUTO_START="${AUTO_START:-0}"
 CHECK_ONLY="${CHECK_ONLY:-0}"
 ALLOW_TERMUX="${ALLOW_TERMUX:-0}"
+RECONFIG="${RECONFIG:-0}"
+KEEP_CONFIG="${KEEP_CONFIG:-0}"
+RESET="${RESET:-0}"
 
 BIN_PATH="$INSTALL_DIR/$BIN_NAME"
 VERSION_FILE="$INSTALL_DIR/.version"
@@ -56,7 +62,7 @@ LAUNCHER="$INSTALL_DIR/start.sh"
 
 GITHUB_API="https://api.github.com/repos/${REPO}"
 GITHUB_DL="https://github.com/${REPO}/releases/download"
-FALLBACK_VERSION="v1.0.30"
+FALLBACK_VERSION="v1.3.0"
 
 IS_TERMUX=0
 IS_LINUX=0
@@ -148,14 +154,10 @@ detect_env() {
 }
 
 check_tun_capability() {
-    if [ "$(id -u)" = "0" ]; then
-        HAS_ROOT=1
-    elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-        HAS_ROOT=1
-    elif command -v tsu >/dev/null 2>&1; then
-        HAS_ROOT=1
-    elif command -v su >/dev/null 2>&1 && su -c "id -u" 2>/dev/null | grep -q "^0$"; then
-        HAS_ROOT=1
+    if [ "$(id -u)" = "0" ]; then HAS_ROOT=1
+    elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then HAS_ROOT=1
+    elif command -v tsu >/dev/null 2>&1; then HAS_ROOT=1
+    elif command -v su >/dev/null 2>&1 && su -c "id -u" 2>/dev/null | grep -q "^0$"; then HAS_ROOT=1
     fi
 
     if [ -e "/dev/net/tun" ]; then
@@ -184,8 +186,6 @@ check_tun_capability() {
             warn "ALLOW_TERMUX=1 已设置，继续安装（启动可能失败）"
             return 0
         fi
-        echo "  你的手机可能有两种状态："
-        echo ""
         echo "  ┌─ 未 root ─────────────────────────────────"
         echo "  │ 请用 n2n-termux（SOCKS5 模式，无需 root）"
         echo "  │   bash <(curl -fsSL https://raw.githubusercontent.com/goyo123321/n2n-termux/main/install.sh)"
@@ -197,8 +197,7 @@ check_tun_capability() {
         echo "  │ 2. 如不存在，加载 tun 模块："
         echo "  │    su -c 'insmod /system/lib/modules/tun.ko'"
         echo "  │ 3. 重新运行本脚本"
-        echo "  │ 4. 或用 ALLOW_TERMUX=1 强制跳过检查："
-        echo "  │    ALLOW_TERMUX=1 bash install_n2n.sh"
+        echo "  │ 4. 或用 ALLOW_TERMUX=1 强制跳过检查"
         echo "  └────────────────────────────────────────────"
         echo ""
         exit 1
@@ -208,24 +207,6 @@ check_tun_capability() {
         info "  sudo modprobe tun"
         info "  ls -la /dev/net/tun"
         exit 1
-    fi
-}
-
-fix_termux_dns() {
-    if [ "$IS_TERMUX" != "1" ]; then return 0; fi
-    local resolv="${PREFIX:-/data/data/com.termux/files/usr}/etc/resolv.conf"
-
-    if [ -f "$resolv" ] && grep -q "nameserver ::1" "$resolv" 2>/dev/null; then
-        warn "Termux DNS 指向 [::1]，正在修复..."
-        echo "nameserver 8.8.8.8" > "$resolv"
-        echo "nameserver 1.1.1.1" >> "$resolv"
-        ok "DNS 已修复: $resolv"
-    elif [ ! -f "$resolv" ] || ! grep -q "nameserver" "$resolv" 2>/dev/null; then
-        warn "Termux 缺少 DNS 配置，正在创建..."
-        mkdir -p "$(dirname "$resolv")"
-        echo "nameserver 8.8.8.8" > "$resolv"
-        echo "nameserver 1.1.1.1" >> "$resolv"
-        ok "DNS 配置已创建: $resolv"
     fi
 }
 
@@ -331,21 +312,72 @@ install_binary() {
     ok "已安装: $BIN_PATH ($(du -h "$BIN_PATH" 2>/dev/null | cut -f1 || echo '?'))"
 }
 
+# ============================================================
+# 交互式配置（含重新配置选项）
+# ============================================================
 prompt_config() {
-    if [ "$NO_LAUNCH" = "1" ]; then return 0; fi
-
-    if [ -f "$CONFIG_FILE" ] && [ -z "$SIGNALING_URL" ]; then
-        log "使用已有配置: $CONFIG_FILE"
-        set -a
-        # shellcheck disable=SC1090
-        source "$CONFIG_FILE"
-        set +a
-        normalize_signaling_url
+    if [ "$NO_LAUNCH" = "1" ]; then
         return 0
     fi
 
+    # ★ 已有配置时的处理
+    if [ -f "$CONFIG_FILE" ] && [ -z "$SIGNALING_URL" ]; then
+        # 方式 1：RESET=1 完全重置
+        if [ "$RESET" = "1" ]; then
+            warn "RESET=1，完全重置配置"
+            rm -f "$CONFIG_FILE"
+            rm -f "$INSTALL_DIR/client_id"
+            log "已删除 config.env 和 client_id"
+        fi
+
+        # 方式 2：KEEP_CONFIG=1 强制用旧配置
+        if [ -f "$CONFIG_FILE" ] && [ "$KEEP_CONFIG" = "1" ]; then
+            log "KEEP_CONFIG=1，强制使用已有配置"
+            set -a
+            # shellcheck disable=SC1090
+            source "$CONFIG_FILE"
+            set +a
+            normalize_signaling_url
+            return 0
+        fi
+
+        # 方式 3：RECONFIG=1 强制重新配置
+        if [ -f "$CONFIG_FILE" ] && [ "$RECONFIG" = "1" ]; then
+            log "RECONFIG=1，强制重新配置"
+            # 不 source 旧配置，走下面的交互流程
+        elif [ -f "$CONFIG_FILE" ]; then
+            # 方式 4：默认交互式询问
+            log "检测到已有配置: $CONFIG_FILE"
+            echo ""
+            info "当前配置摘要："
+            grep -E '^(SIGNALING_URL|ROOM_ID|CLIENT_ID|NODE_NAME|TUN_NAME)=' "$CONFIG_FILE" 2>/dev/null \
+                | sed 's/^/    /' || true
+            if grep -q '^CONNECT_TOKEN="[^"]\+"' "$CONFIG_FILE" 2>/dev/null; then
+                echo '    CONNECT_TOKEN="***"（已设置）'
+            fi
+            echo ""
+
+            local answer=""
+            read_tty answer "是否重新配置？(Y=重新配置 / n=使用现有) [y/N] "
+            case "$answer" in
+                y|Y|yes|Yes|YES)
+                    log "重新配置..."
+                    ;;
+                *)
+                    log "使用现有配置"
+                    set -a
+                    # shellcheck disable=SC1090
+                    source "$CONFIG_FILE"
+                    set +a
+                    normalize_signaling_url
+                    return 0
+                    ;;
+            esac
+        fi
+    fi
+
     echo ""
-    log "配置客户端（直接回车用默认值）"
+    log "配置客户端（直接回车用默认值，输入 - 清空该字段）"
 
     if [ -z "$SIGNALING_URL" ]; then
         read_tty SIGNALING_URL "SIGNALING_URL (wss://xxx.workers.dev): "
@@ -359,12 +391,18 @@ prompt_config() {
 
     if [ -z "$ROOM_ID" ]; then
         read_tty input "ROOM_ID [default-room]: "
-        ROOM_ID="${input:-default-room}"
+        if [ "$input" = "-" ]; then ROOM_ID="default-room"
+        else ROOM_ID="${input:-default-room}"; fi
     fi
 
     if [ -z "$CLIENT_ID" ]; then
         if [ -f "$INSTALL_DIR/client_id" ]; then
-            CLIENT_ID=$(tr -d '[:space:]' < "$INSTALL_DIR/client_id" 2>/dev/null || echo "")
+            local existing_cid
+            existing_cid=$(tr -d '[:space:]' < "$INSTALL_DIR/client_id" 2>/dev/null || echo "")
+            if [ -n "$existing_cid" ]; then
+                log "复用已有 CLIENT_ID: $existing_cid"
+                CLIENT_ID="$existing_cid"
+            fi
         fi
         if [ -z "$CLIENT_ID" ]; then
             local default_cid
@@ -374,7 +412,8 @@ prompt_config() {
                 default_cid="$(hostname 2>/dev/null || echo 'n2n-node')-$(date +%s | tail -c 6)"
             fi
             read_tty input "CLIENT_ID [$default_cid]: "
-            CLIENT_ID="${input:-$default_cid}"
+            if [ "$input" = "-" ]; then CLIENT_ID="$default_cid"
+            else CLIENT_ID="${input:-$default_cid}"; fi
         fi
     fi
 
@@ -382,12 +421,14 @@ prompt_config() {
         local hostname_default
         hostname_default="$(hostname 2>/dev/null || echo 'n2n-node')"
         read_tty input "NODE_NAME [$hostname_default]: "
-        NODE_NAME="${input:-$hostname_default}"
+        if [ "$input" = "-" ]; then NODE_NAME="$hostname_default"
+        else NODE_NAME="${input:-$hostname_default}"; fi
     fi
 
     if [ -z "$CONNECT_TOKEN" ]; then
         read_tty input "CONNECT_TOKEN [留空]: " 1
-        CONNECT_TOKEN="$input"
+        if [ "$input" = "-" ]; then CONNECT_TOKEN=""
+        else CONNECT_TOKEN="$input"; fi
     fi
 
     if [ -z "$TUN_NAME" ]; then
@@ -420,19 +461,12 @@ EOF
     ok "配置已保存: $CONFIG_FILE"
 }
 
-# ============================================================
-# ★ start.sh 里的 INSTALL_DIR 用「自身所在目录」自动推导
-#   - 用户从任意目录调用 start.sh 都能正确工作
-#   - 不需要硬编码绝对路径
-#   - 如果用户显式设置 INSTALL_DIR 环境变量，优先用用户值
-# ============================================================
 write_launcher() {
     cat > "$LAUNCHER" <<EOF
 #!/usr/bin/env bash
 set -eu
 
-# ★ 自动推导安装目录（start.sh 所在目录），而不是当前工作目录
-#   这样从任意路径调用 start.sh 都能找到 config.env 和二进制
+# 自动推导安装目录（start.sh 所在目录），从任意目录调用都能工作
 if [ -z "\${INSTALL_DIR:-}" ]; then
     INSTALL_DIR="\$(cd "\$(dirname "\$0")" && pwd)"
 fi
@@ -493,7 +527,6 @@ launch_client() {
         else
             err "Termux 下有 TUN 但无提权工具"
             info "安装 tsu：pkg install tsu"
-            info "或手动：su -c '$LAUNCHER'"
             exit 1
         fi
     elif [ "$IS_DARWIN" = "1" ] || [ "$IS_LINUX" = "1" ]; then
@@ -502,7 +535,6 @@ launch_client() {
             exec sudo -E "$LAUNCHER"
         else
             err "需要 root，但 sudo 不可用"
-            info "切换到 root 后运行：$LAUNCHER"
             exit 1
         fi
     fi
@@ -518,9 +550,19 @@ main() {
     log "安装目录: $INSTALL_DIR"
     echo ""
 
+    # RESET 确认
+    if [ "$RESET" = "1" ] && [ -f "$CONFIG_FILE" ]; then
+        warn "RESET=1：将删除 $CONFIG_FILE 和 client_id"
+        local confirm=""
+        read_tty confirm "确认重置？[y/N] "
+        case "$confirm" in
+            y|Y|yes|Yes|YES) ;;
+            *) err "已取消"; exit 1 ;;
+        esac
+    fi
+
     detect_env
     check_tun_capability
-    fix_termux_dns
 
     local installed latest need_update
     installed="$(read_installed_version)"
