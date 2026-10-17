@@ -56,7 +56,7 @@ LAUNCHER="$INSTALL_DIR/start.sh"
 
 GITHUB_API="https://api.github.com/repos/${REPO}"
 GITHUB_DL="https://github.com/${REPO}/releases/download"
-FALLBACK_VERSION="v1.3.0"
+FALLBACK_VERSION="v1.0.30"
 
 IS_TERMUX=0
 IS_LINUX=0
