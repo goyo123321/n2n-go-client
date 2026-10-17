@@ -66,12 +66,67 @@
 - **P2P 通道保活** — 每 15 秒往对端发 N2NS PING 多目标探针，防止空闲时通道被回收
 - **TURN 中继** — 支持 Cloudflare TURN + 自定义 TURN，不消耗 Worker 配额
 - **中继回退** — TURN 失败自动降级到 WebSocket 中继
+- **N2NW 二进制传输** — WS 中继数据面用二进制帧，比 base64 省 33% 带宽
 - **断线重连** — WebSocket 自动重连（指数退避）+ 90 秒读超时检测下行僵死
 - **连接密码** — 支持 `CONNECT_TOKEN` 保护 Worker
 - **ID 持久化** — 未指定 `CLIENT_ID` 时自动生成并保存，重启复用
 - **虚拟网段可配** — 服务端通过 `VIRTUAL_NETWORK` 下发网段，客户端自动适配
 - **无依赖** — Windows 版内嵌 wintun.dll
 - **三端互通** — 与 [n2n-termux](https://github.com/goyo123321/n2n-termux)、[n2n-android](https://github.com/goyo123321/n2n-android) 无缝互通
+
+---
+
+## 📂 二进制路径速查（⚠️ 最容易踩的坑）
+
+**两种安装方式，二进制路径完全不同**，先看清楚再启动：
+
+| 安装方式 | 二进制位置 | 启动命令 |
+|:---|:---|:---|
+| **方式 A：`install.sh` 自动安装** | `~/.n2n-go/n2n-go-client`<br>（**带点的隐藏目录**） | `sudo ~/.n2n-go/start.sh` |
+| **方式 B：手动下载** | `~/n2n-go-client`<br>（`curl -o ~/n2n-go-client` 下载到的位置） | `sudo ~/n2n-go-client` |
+
+**常见错误对照**：
+
+```bash
+# ❌ 错误：install.sh 装的，却用 ~/n2n-go-client 启动
+sudo ~/n2n-go-client
+# sudo: /home/user/n2n-go-client: command not found
+
+# ✅ 正确：install.sh 装的用带点目录
+sudo ~/.n2n-go/n2n-go-client
+# 或直接
+sudo ~/.n2n-go/start.sh
+
+# ✅ 正确：手动下载到 ~/ 的用这个
+sudo ~/n2n-go-client
+```
+
+**验证二进制在哪**：
+
+```bash
+ls -lh ~/.n2n-go/n2n-go-client    # install.sh 装的（存在 → 用这个）
+ls -lh ~/n2n-go-client            # 手动下载的（存在 → 用这个）
+```
+
+---
+
+## 📦 二进制命名说明
+
+从 **v1.3.0** 起，Release 二进制名带 `n2n-go-client-` 前缀，与 `n2n-termux` 区分：
+
+| 项目 | 二进制名 |
+|:---|:---|
+| **n2n-go-client**（本仓库） | `n2n-go-client-linux-amd64` / `n2n-go-client-linux-arm64` / `n2n-go-client-linux-armv7` / `n2n-go-client-darwin-amd64` / `n2n-go-client-darwin-arm64` / `n2n-go-client-windows-amd64.exe` |
+| n2n-termux | `n2n-termux-linux-arm64` / `n2n-termux-linux-armv7` / `n2n-termux-linux-amd64` |
+
+**好处**：下载后一眼看出是哪个，两个项目放同一目录也不冲突，`install.sh` 的 pgrep 也不会误杀。
+
+**历史版本**（v1.2.x 及之前）的二进制名是 `n2n-client-linux-*`，与 n2n-termux 同名——如果还在用旧版，下载后手动改个名：
+
+```bash
+mv n2n-client-linux-amd64 n2n-go-client
+chmod +x n2n-go-client
+```
 
 ---
 
@@ -154,7 +209,13 @@ CGNAT（运营商级 NAT）的 UDP 映射**不是永久的**。当 socket 空闲
 
 ## 🚀 快速开始
 
-一键脚本，支持 Linux / macOS / Termux(proot)：
+> ⚠️ **三个前置注意**：
+>
+> 1. **`SIGNALING_URL` 必须带 `wss://` 前缀**（或 `ws://` 用于本地调试）。漏写会报 `malformed ws or wss URL`。
+> 2. **PC 端需要 `sudo`**（`/dev/net/tun` / macOS `utun` 都需要 root 权限）。
+> 3. **二进制路径**：`install.sh` 装的是 `~/.n2n-go/n2n-go-client`（带点的隐藏目录）；手动下载的是 `~/n2n-go-client`。详见 [📂 二进制路径速查](#-二进制路径速查-最容易踩的坑)。
+
+### 方式 A：一键安装脚本（推荐）
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/goyo123321/n2n-go-client/main/install.sh)
@@ -168,56 +229,70 @@ curl -fsSL https://raw.githubusercontent.com/goyo123321/n2n-go-client/main/insta
 
 > 部署脚本执行完后默认**自动启动客户端**，直接回车即可。
 
-### 1. 下载
+**安装位置**：`~/.n2n-go/n2n-go-client`
+
+**日常操作**：
+
+```bash
+sudo ~/.n2n-go/start.sh                # 前台启动
+sudo ~/.n2n-go/start.sh                # 查看日志
+```
+
+**macOS 额外**：`TUN_NAME=utun9 sudo ~/.n2n-go/start.sh`（`n2n0` 在 macOS 上无效）
+
+### 方式 B：手动下载
 
 从 [Releases](https://github.com/goyo123321/n2n-go-client/releases) 下载对应平台：
 
 | 平台 | 文件 |
 |:---|:---|
-| Linux x64 | `n2n-client-linux-amd64` |
-| Linux ARM64 | `n2n-client-linux-arm64` |
-| macOS Intel | `n2n-client-darwin-amd64` |
-| macOS Apple Silicon | `n2n-client-darwin-arm64` |
-| Windows x64 | `n2n-client-windows-amd64.exe` |
+| Linux x64 | `n2n-go-client-linux-amd64` |
+| Linux ARM64 | `n2n-go-client-linux-arm64` |
+| Linux ARMv7 | `n2n-go-client-linux-armv7` |
+| macOS Intel | `n2n-go-client-darwin-amd64` |
+| macOS Apple Silicon | `n2n-go-client-darwin-arm64` |
+| Windows x64 | `n2n-go-client-windows-amd64.exe` |
 
-### 2. 启动
+**安装位置**：`~/n2n-go-client`（**没有点，直接在 home 下**）
 
 #### Linux
 
 ```bash
-chmod +x n2n-client-linux-amd64
+chmod +x n2n-go-client-linux-amd64
 
-sudo SIGNALING_URL="wss://edge-signal.xxx.workers.dev" \
+sudo SIGNALING_URL="wss://<你的-worker-域名>" \
      ROOM_ID="myroom" \
      CLIENT_ID="pc-a" \
      NODE_NAME="A的电脑" \
-     ./n2n-client-linux-amd64
+     ./n2n-go-client-linux-amd64
 ```
 
 #### macOS
 
 ```bash
-chmod +x n2n-client-darwin-arm64
-xattr -d com.apple.quarantine ./n2n-client-darwin-arm64
+chmod +x n2n-go-client-darwin-arm64
+xattr -d com.apple.quarantine ./n2n-go-client-darwin-arm64
 
-sudo SIGNALING_URL="wss://edge-signal.xxx.workers.dev" \
+sudo SIGNALING_URL="wss://<你的-worker-域名>" \
      ROOM_ID="myroom" \
      CLIENT_ID="mac-a" \
      NODE_NAME="A的Mac" \
      TUN_NAME="utun9" \
-     ./n2n-client-darwin-arm64
+     ./n2n-go-client-darwin-arm64
 ```
 
 #### Windows（管理员 PowerShell）
 
 ```powershell
-$env:SIGNALING_URL="wss://edge-signal.xxx.workers.dev"
+$env:SIGNALING_URL="wss://<你的-worker-域名>"
 $env:ROOM_ID="myroom"
 $env:CLIENT_ID="win-a"
 $env:NODE_NAME="A的PC"
 
-.\n2n-client-windows-amd64.exe
+.\n2n-go-client-windows-amd64.exe
 ```
+
+> ⚠️ **注意**：方式 B 下载的二进制是 `~/n2n-go-client-*`，和 install.sh 的 `~/.n2n-go/n2n-go-client` **不是同一个位置**。不要混用。
 
 ---
 
@@ -305,34 +380,13 @@ curl http://10.64.0.2:8080/
 
 **关键**：**三端的数据面协议完全独立**，但**在服务端和 P2P 通道层用同一套协议**（N2NS 帧 + 打洞 + TURN 中继），所以完全互通。
 
-### 打洞行为
-
-**PC ↔ Termux**、**PC ↔ Android**、**PC ↔ PC** 打洞行为一致：
-
-- 双端都上报 `lanEndpoints` → LAN 直连优先
-- 双端都上报 `assistedEndpoints` → STUN 反射多端点
-- 打洞指令由同一个 `coordinator.js` 生成
-- 状态机（`P2PAvailable` → `P2P`）完全相同
-
-### 已 P2P 时的主动上报
-
-**场景**：PC 收到 `nat_hole_instruction` 前已经通过 PING/PONG 建立了 P2P。
-
-**修复**：客户端**主动上报** `p2p_status=3`，让服务端 `punchState` 记录成功状态，**停止每 15 秒重发指令**。
-
-**验证日志**：
-
-```
-[NAT-HOLE] 跳过指令 target=xxx（已 P2P），上报 p2p_status=3    ← 只出现一次
-```
-
 ---
 
 ## ⚙️ 环境变量
 
 | 变量 | 必填 | 默认值 | 说明 |
 |:---|:---|:---|:---|
-| `SIGNALING_URL` | ✅ | — | edge-signal 的 WSS 地址 |
+| `SIGNALING_URL` | ✅ | — | edge-signal 的 WSS 地址，**必须带 `wss://` 前缀**（或 `ws://`） |
 | `CONNECT_TOKEN` | ⚠️ | `""` | 连接密码（Worker 配了才需要）|
 | `CLIENT_ID` | ❌ | 自动生成并持久化 | 客户端唯一 ID。未设置时首次启动生成 `hostname-随机数`，保存在 `$INSTALL_DIR/client_id`，重启复用 |
 | `ROOM_ID` | ❌ | `default-room` | 房间名。只允许 `[A-Za-z0-9_-]+` |
@@ -341,6 +395,7 @@ curl http://10.64.0.2:8080/
 | `UDP_PORT` | ❌ | `0` | P2P UDP 端口。`0`=内核自动分配（推荐），指定端口被占用时自动回退 |
 | `STUN_SERVERS` | ❌ | Google + Cloudflare | STUN 服务器 |
 | `SOCKS5_LISTEN` | ❌ | `127.0.0.1:1080` | SOCKS5 监听地址（额外入口，可选）|
+| `INSTALL_DIR` | ❌ | `~/.n2n-go` | install.sh 的安装目录 |
 
 **虚拟网段**由服务端 `wrangler.toml` 的 `VIRTUAL_NETWORK` 决定，客户端从 `ready` 消息自动接收，无需配置。默认 `10.64.0.0/24`。
 
@@ -351,23 +406,23 @@ curl http://10.64.0.2:8080/
 启动成功后：
 
 ```
-n2n-go-client v1.2.0 启动
+n2n-go-client v1.3.0 启动
 [配置] 未设置 CONNECT_TOKEN
 [配置] 生成并持久化 CLIENT_ID: pc-a-1704067200 -> /home/user/.n2n-go/client_id
 [P2P] UDP 监听端口 54321
 [NAT] 启动预收集 LAN: [192.168.1.100:54321]
-[NAT] STUN 74.125.250.129:19302 → 120.239.134.13:19190
-[NAT] HardNAT（对称），ports_diff=0 pub=120.239.134.13:19190
-[WS] 连接 wss://edge-signal.xxx.workers.dev/ws/myroom?cid=pc-a
+[NAT] STUN 74.125.250.129:19302 → x.x.x.x:19190
+[NAT] HardNAT（对称），ports_diff=0 pub=x.x.x.x:19190
+[WS] 连接 wss://<你的-worker-域名>/ws/myroom?cid=pc-a
 已连接信令，Client ID: pc-a-1704067200，节点名: A的电脑
 [WS] 重放 1 条早期文本消息
 分配虚拟 IP: 10.64.0.2（网段 10.64.0.0/24）
-[信令] 服务端看到的本机出口 IP: 120.229.199.61（WS/TCP 出口，仅参考）
+[信令] 服务端看到的本机出口 IP: x.x.x.x（WS/TCP 出口，仅参考）
 [NAT] 上报 LAN 地址: [192.168.1.100:54321]
-[信令] 上报 p2p_metadata: natType=HardNAT publicEndpoint="120.239.134.13:19190" multiExit=true assisted=2 lan=1
+[信令] 上报 p2p_metadata: natType=HardNAT publicEndpoint="x.x.x.x:19190" multiExit=true assisted=2 lan=1
 [TUN] n2n0 已启动，IP: 10.64.0.2/24，网段: 10.64.0.0/24
 [TURN] 获取到 custom TURN 服务器: turn:xxx:3478
-[TURN] 中继地址: 5.6.7.8:50000
+[TURN] 中继地址: x.x.x.x:50000
 [Keepalive] 启动，每 5s 刷新 3 个 STUN 服务器
 [P2P-Keepalive] 启动，每 15s 刷新 P2P 通道
 [SOCKS5] 监听 127.0.0.1:1080（用 curl --socks5 或 ALL_PROXY 访问虚拟 IP）
@@ -381,14 +436,23 @@ n2n-go-client v1.2.0 启动
 ==========================================
 ```
 
+**关键检查点**：
+
+| 日志 | 含义 |
+|:---|:---|
+| `[NAT] 上报 LAN 地址: [...]` 非空 | LAN 收集成功（LAN 优先前提） |
+| `[TUN] n2n0 已启动` | **PC 独有**（不是 Termux 版） |
+| `[WS] 连接 wss://...` | **URL 带了 wss://**（不是 `malformed`） |
+| `[P2P] xxx 新建 peer，初始 UDPAddr 用 LAN: ...` | LAN 优先修复生效 |
+
 当其他节点上线时（**LAN 直连命中**）：
 
 ```
 ========== 节点就绪: termux-b ==========
   虚拟 IP   : 10.64.0.3
-  公网地址  : 1.2.3.4:54322
+  公网地址  : x.x.x.x:54322
   LAN 地址  : [192.168.1.101:54322]
-  STUN 端点 : [1.2.3.4:54322 1.2.3.4:54335]
+  STUN 端点 : [x.x.x.x:54322 x.x.x.x:54335]
 ==========================================
 
 [registerPeer] termux-b: 收到 assisted=2 个 [...] lanEndpoints=1 个 [192.168.1.101:54322]
@@ -404,8 +468,8 @@ n2n-go-client v1.2.0 启动
 **打洞失败时**：
 
 ```
-[NAT-HOLE] ❌ 失败 role=0 target=1.2.3.4 attempts=110
-[连接] termux-b → TURN 中继 (5.6.7.8:50000)
+[NAT-HOLE] ❌ 失败 role=0 target=x.x.x.x attempts=110
+[连接] termux-b → TURN 中继 (x.x.x.x:50000)
 ```
 
 **TURN 也不可用时**：
@@ -475,7 +539,7 @@ Unknown → P2PAvailable → P2P
 
 **问题**：同 WiFi 场景下，peer 的 `UDPAddr` 可能在 LAN 和公网之间抖动，导致 ping 从 5ms 跳 200ms。
 
-**修复**：
+**修复**（v1.3.0+）：
 
 - **新建 peer 时**：优先用 LAN 端点初始化 `UDPAddr`
 - **更新 UDPAddr 时**：
@@ -508,6 +572,21 @@ Unknown → P2PAvailable → P2P
 - 未 ACK 200ms 重传，最多 8 次
 - 滑动窗口 16 帧
 - 乱序缓存后按序交付
+
+### N2NW 二进制传输（WS 中继）
+
+WS 中继数据面使用 **N2NW 二进制帧**（6 字节头 + peerId + 裸 IPv4 包）：
+
+```
+  0    1    2    3    4     5      6..6+N        6+N..
+┌────┬────┬────┬────┬─────┬──────┬─────────────┬────────────┐
+│ 'N'│ '2'│ 'N'│ 'W'│flags│len(N)│ peerId(NB)  │  IPv4 包   │
+└────┴────┴────┴────┴─────┴──────┴─────────────┴────────────┘
+   客户端→服务端: peerId = 目标 clientId
+   服务端→客户端: peerId = 发送方 clientId（服务端重写）
+```
+
+**⚠️ 兼容性**：三端客户端和 edge-signal 服务端**必须同步升级**。旧服务端遇到 N2NW magic 会静默丢弃（`data[0]>>4 != 4`），导致 WS 中继数据面不通。
 
 ### 多目标发送
 
@@ -623,12 +702,12 @@ cd n2n-go-client
 go mod tidy
 
 # 当前平台
-go build -o n2n-client .
+go build -o n2n-go-client .
 
 # 交叉编译
-GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -o n2n-client-linux-amd64 .
-GOOS=darwin  GOARCH=arm64 CGO_ENABLED=0 go build -o n2n-client-darwin-arm64 .
-GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o n2n-client-windows-amd64.exe .
+GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -o n2n-go-client-linux-amd64 .
+GOOS=darwin  GOARCH=arm64 CGO_ENABLED=0 go build -o n2n-go-client-darwin-arm64 .
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o n2n-go-client-windows-amd64.exe .
 ```
 
 **Windows 构建特殊说明**：需要先下载 `wintun.dll`：
@@ -639,7 +718,7 @@ curl -L -o wintun.zip "https://www.wintun.net/builds/wintun-${WINTUN_VERSION}.zi
 unzip -q wintun.zip -d wintun-extract
 cp wintun-extract/wintun/bin/amd64/wintun.dll ./wintun.dll
 
-GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o n2n-client-windows-amd64.exe .
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o n2n-go-client-windows-amd64.exe .
 ```
 
 ### GitHub Actions 自动构建
@@ -647,8 +726,8 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o n2n-client-windows-amd64.exe
 手动触发：
 
 ```
-Actions → Build n2n-go Client → Run workflow
-  version: v1.2.0
+Actions → Build n2n-go-client → Run workflow
+  version: v1.3.0
   publish: ✓
   platforms: （留空=全部5个平台）
 ```
@@ -667,7 +746,7 @@ n2n-go-client/
 ├── turn_lite_tcp.go              # TURN over TCP / RFC 6062
 ├── nat_probe.go                  # NAT 类型探测
 ├── nathole_executor.go           # 打洞指令执行（分阶段扫描 + 30s LAN 窗口）
-├── p2p_stream.go                 # N2NS 可靠流协议
+├── p2p_stream.go                 # N2NS 可靠流协议 + N2NW 二进制帧
 ├── p2p_support.go                # P2P stream 依赖方法（LAN 优先 + 30s 窗口）
 ├── punch.go                      # Punch/ACK 定义
 ├── socks5.go                     # SOCKS5 入口
@@ -721,7 +800,7 @@ Windows 防火墙可能拦截 TUN 接口的 ICMP。如无法 ping 通：
 需要固定端口（比如为了防火墙规则）时显式指定：
 
 ```bash
-UDP_PORT=50001 ./n2n-client ...
+UDP_PORT=50001 ./n2n-go-client ...
 ```
 
 指定的端口被占用时，客户端会**自动回退**到内核分配，不会启动失败。
@@ -749,6 +828,63 @@ UDP_PORT=50001 ./n2n-client ...
 ---
 
 ## 🐛 常见问题
+
+### Q: 启动报错 `No such file or directory`，找不到二进制？
+
+**原因**：**路径写错了**。`install.sh` 装的和手动下载的路径完全不同。
+
+**快速判断**：
+
+```bash
+# 用 install.sh 装的 → 二进制在 ~/.n2n-go/n2n-go-client
+ls -lh ~/.n2n-go/n2n-go-client
+
+# 手动下载的 → 二进制在 ~/n2n-go-client
+ls -lh ~/n2n-go-client
+```
+
+**哪个存在就用哪个**：
+
+```bash
+# install.sh 装的
+sudo ~/.n2n-go/n2n-go-client
+# 或直接
+sudo ~/.n2n-go/start.sh
+
+# 手动下载的
+sudo ~/n2n-go-client
+```
+
+**详细对照**：
+
+| 场景 | 错误命令 | 正确命令 |
+|:---|:---|:---|
+| install.sh 装完，手动跑 | `~/n2n-go-client` | `~/.n2n-go/n2n-go-client` |
+| install.sh 装完，正常启动 | — | `sudo ~/.n2n-go/start.sh` |
+| 手动下载到 home | `~/.n2n-go/n2n-go-client` | `~/n2n-go-client` |
+
+### Q: 启动报错 `连接信令失败: malformed ws or wss URL`？
+
+**原因**：`SIGNALING_URL` 漏了 `wss://`（或 `ws://`）协议前缀。
+
+**修复**：
+
+```bash
+sudo SIGNALING_URL="wss://<你的-worker-域名>" \
+     ROOM_ID="myroom" \
+     CLIENT_ID="pc-a" \
+     ~/.n2n-go/n2n-go-client
+```
+
+**正确的 SIGNALING_URL 格式**：
+
+| 输入 | 结果 |
+|:---|:---|
+| `wss://your-worker.example.com` | ✅ 正确 |
+| `ws://localhost:8080` | ✅ 正确（本地调试） |
+| `https://your-worker.example.com` | ⚠️ 会被自动转成 `wss://` |
+| `your-worker.example.com` | ❌ 缺前缀 |
+| `wss://your-worker.example.com/ws/myroom` | ❌ 不要带路径，只填域名 |
 
 ### Q: ping 不通怎么办？
 
@@ -795,7 +931,7 @@ curl -v --max-time 5 http://10.64.0.3:8080/
 检查 Termux 端：
 
 ```bash
-ps aux | grep n2n-client
+ps aux | grep n2n-termux
 tail -f ~/n2n.log | grep FWD
 ```
 
@@ -808,14 +944,6 @@ tail -f ~/n2n.log | grep FWD
 1. **打洞失败** → 服务端面板显示 `TURN-BD` 或 `ws-BD`
 2. **Android 端 App 未启动** → 检查通知栏图标
 3. **路由问题** → `adb shell ip route` 检查是否有 `10.64.0.0/24`
-
-### Q: PC 能 ping 通 Termux 吗？
-
-**能**（最新版）。走 `packet_forwarder.go` 的 ICMP 响应路径。
-
-- P2P 双向 → 直接走 UDP，RTT 5-15ms
-- P2P 单向 → 走 WS 中继，RTT 100-300ms
-- 打洞失败 → 走 TURN 或 WS 中继
 
 ### Q: Termux 能 ping 通 PC 吗？
 
@@ -837,8 +965,8 @@ curl --socks5 127.0.0.1:1080 http://10.64.0.2:8080/
 
 ```
 [P2P] 从 termux-b (192.168.1.101) 收到 Punch      ← LAN
-[P2P] 从 termux-b (1.2.3.4) 收到 Punch             ← 公网 P2P
-[连接] termux-b → TURN 中继 (5.6.7.8:50000)        ← TURN
+[P2P] 从 termux-b (x.x.x.x) 收到 Punch             ← 公网 P2P
+[连接] termux-b → TURN 中继 (x.x.x.x:50000)        ← TURN
 [连接] termux-b → WS 中继 (最后兜底)               ← WS
 ```
 
@@ -860,7 +988,7 @@ curl --socks5 127.0.0.1:1080 http://10.64.0.2:8080/
 
 1. **看 LAN 候选有没有命中**
    - `[P2P] 从 xxx (192.168.x.x) 收到 Punch` → LAN 命中
-   - `[P2P] 从 xxx (1.2.3.4) 收到 Punch` → 公网命中
+   - `[P2P] 从 xxx (x.x.x.x) 收到 Punch` → 公网命中
 2. **看两端 pubSocket 端口差**
    - 差距小（< 10）→ 保活生效
    - 差距大（> 100）→ CGNAT 映射漂移严重
@@ -880,40 +1008,9 @@ curl --socks5 127.0.0.1:1080 http://10.64.0.2:8080/
 
 如果日志里每 15 秒出现一次 `跳过指令`，说明客户端版本太旧，需要升级。
 
-### Q: LAN 地址收集不到？
-
-**检查启动日志**：
-
-```
-[NAT] 启动预收集 LAN: [...]   ← 有这行说明能收集
-[NAT] 启动预收集 LAN 为空（可能蜂窝网络，或 WiFi 未就绪）  ← 收集失败
-```
-
-**常见原因**：
-
-1. **纯蜂窝网络** —— 没有 LAN 接口，正常现象
-2. **蜂窝启动后切 WiFi** —— 后台重试补齐
-3. **默认路由不在 WiFi 上** —— 检查 `detectOutboundIP` 输出
-
-**手工验证**（在目标设备上）：
-
-```bash
-# Linux
-ip route get 8.8.8.8 | head -1
-
-# macOS
-route -n get 8.8.8.8 | grep interface
-
-# Python 跨平台
-python3 -c "import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.connect(('8.8.8.8',80)); print(s.getsockname()[0])"
-```
-
-- 输出 `192.168.x.x` → Go 也能拿到 LAN
-- 输出 `10.x` / `100.64.x` → 默认路由不在 WiFi
-
 ### Q: 同 WiFi 延迟波动很大（100ms+）？
 
-**已修复**（v1.2.0+）。原因是两端同时向 LAN + 公网发包，导致对端 `peer.UDPAddr` 被公网地址覆盖，回程走 CGNAT 回环。
+**已修复**（v1.3.0+）。原因是两端同时向 LAN + 公网发包，导致对端 `peer.UDPAddr` 被公网地址覆盖，回程走 CGNAT 回环。
 
 **修复后**：
 
@@ -923,50 +1020,34 @@ python3 -c "import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.
 
 现在同 WiFi 场景延迟稳定在 **8~15ms**，标准差 <2ms。
 
-### Q: P2P 建立后过一段时间断了？
+### Q: 如何确认二进制是 PC 版而不是 Termux 版？
 
-**CGNAT 映射或会话被回收**。检查：
+**方法 1：看启动日志**
 
-1. **日志里 `[P2P-Keepalive] 启动` 有没有？**
-   - 没有 → 二进制太旧
-2. **端口是不是又漂移了？**
-   - `[信令] 上报 p2p_metadata` 的 `publicEndpoint` 变了 → 保活无效
-   - STUN 服务器被封 → 换国内 STUN
-3. **P2P 通道保活生效了吗？**
-   - 每 15 秒会往对端发 1 个 N2NS PING 多目标探针
+| 日志 | 判断 |
+|:---|:---|
+| `[TUN] n2n0 已启动` | ✅ PC 版 |
+| `[SOCKS5] 监听 127.0.0.1:1080` + `[FWD] 已启动` | ❌ Termux 版（跑错平台了） |
 
-### Q: `[WS] 重放 1 条早期文本消息` 是什么意思？
+**方法 2：看文件名**
 
-**正常信息**——`ready` 消息在 handler 设置前到达，被缓冲后重放。
+```bash
+ls -lh ~/.n2n-go/n2n-go-client     # ✅ PC 版（install.sh 装的）
+ls -lh ~/n2n-go-client             # ✅ PC 版（手动下载的）
+ls -lh ~/.n2n-termux/n2n-termux   # Termux 版
+```
 
-**旧版会丢这条消息**，导致 `virtualIP` 和 `serverSeenIP` 拿不到。
+**方法 3：strings 检查**
+
+```bash
+strings ~/.n2n-go/n2n-go-client | grep -i "wintun\|n2n0" | head -3
+```
 
 ### Q: 一直显示 `natType=EasyNAT`？
 
 **旧版客户端的 bug**——单样本时判 EasyNAT。
 
 **最新版**：单样本 → `unknown`，不猜。
-
-### Q: `[信令] 服务端看到的本机出口 IP` 和 `[NAT] STUN` 结果不一致？
-
-**CGNAT 池化**——运营商有多个公网出口，TCP 和 UDP 从不同出口出去。
-
-**这是网络限制，不是 bug**。客户端会自动按 LAN → hairpin → TURN → WS 降级。
-
-**保活生效后**，两端 UDP 出口端口保持稳定，hairpin 成功率显著提升。
-
-### Q: TURN 初始化失败？
-
-```
-[TURN] 初始化失败: allocate: ...
-```
-
-原因：
-- TURN 服务器不可达
-- TURN 凭证错误
-- TURN 服务器额度用尽
-
-**客户端会自动降级到 WS 中继**，不影响使用。
 
 ### Q: 重启后虚拟 IP 变了？
 
@@ -993,19 +1074,6 @@ cat ~/.n2n-go/client_id
 ```
 
 重连后会自动重新上报 NAT 元数据。
-
-### Q: 面板显示 `p2p-avail` 不是 `p2p`？
-
-**`p2p-avail`** = 打洞握手成功，但 PONG 或真实数据帧还没到，尚未确认双向通道。
-
-**正常情况 1-2 秒内**会升级到 `p2p`：
-
-```
-[P2P] 从 termux-b 收到 Punch → P2PAvailable（等待数据帧验证）
-[P2P] 收到 PONG → P2P 直连（双向通道已验证）       ← 这行出现就升 P2P
-```
-
-**如果一直停在 `p2p-avail`**：30 秒后会超时降级到 TURN/WS。
 
 ---
 
@@ -1034,5 +1102,3 @@ MIT
 | **n2n-go-client** | Linux / macOS / Windows | **TUN** | ✅ 全部 |
 | [n2n-termux](https://github.com/goyo123321/n2n-termux) | Android Termux | **SOCKS5 + 包转发** | ✅ 全部 |
 | [n2n-android](https://github.com/goyo123321/n2n-android) | Android APK | VpnService | ✅ 全部 |
-
-**三端互通**：n2n-termux ↔ n2n-go-client ↔ n2n-android 可以互相访问。
