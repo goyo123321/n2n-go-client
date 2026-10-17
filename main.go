@@ -599,9 +599,16 @@ func main() {
 	edge.relayMgr = NewRelayManager(ws, edge.turnClient, edge)
 	edge.relayMgr.Report(10 * time.Second)
 
+	// ★ 改动 1：ws.SetHandlers 的 onBinary 回调加 N2NW 拦截
 	ws.SetHandlers(
 		edge.handleSignaling,
 		func(data []byte) {
+			// 拦截 N2NW 二进制帧（WS 中继数据面）
+			if len(data) >= 4 && string(data[:4]) == "N2NW" {
+				edge.handleAppStreamBinary(data)
+				return
+			}
+			// 裸 IPv4 包（兼容旧服务端 / 无目标 ID 的广播）
 			edge.enqueueTUN(data)
 		},
 	)
@@ -1077,13 +1084,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			return
 		}
 
-		// ★★★ 新增（本次修复）：已 P2P 时，主动上报 p2p_status=3，
-		//     让服务端 punchState 里的 aState/bState 变成 3，
-		//     anySucceeded 分支生效，停止每 15 秒重发 nat_hole_instruction。
-		//
-		// 场景：客户端在收到指令前就已经通过 PING/PONG 建立了 P2P（比如两端
-		// 同时连接、或 NAT 友好不需要打洞）。旧版直接 return，服务端不知道
-		// 客户端已经 P2P，会一直重发指令（日志里每 15 秒一次"跳过指令"）。
 		if e.relayMgr != nil && e.relayMgr.GetState(instr.TargetMac) == ConnP2P {
 			log.Printf("[NAT-HOLE] 跳过指令 target=%s（已 P2P），上报 p2p_status=3",
 				instr.TargetMac)
@@ -1259,16 +1259,6 @@ func (e *Edge) peerExists(peerID string) bool {
 	return ok
 }
 
-// registerPeer 注册/更新一个 peer。
-//
-// ★ LAN 优先保护 UDPAddr
-//
-// ★★ 补丁 3（本次修复）：新建 peer 时，若对端有 LAN 端点，初始 UDPAddr 用 LAN。
-//
-//	旧版新建 peer 时 UDPAddr 直接用服务端下发的公网地址（pubIP:pubPort），
-//	导致连接刚建立时前几个包走 CGNAT hairpin（200-400ms + DUP），
-//	直到收到第一个 LAN 帧才切回 LAN。
-//	新版优先用 sortedLAN[0] 初始化，LAN 不可达时回退公网地址。
 func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natType string, assisted, lanEndpoints []string) {
 	log.Printf("[registerPeer] %s: 收到 assisted=%d 个 %v lanEndpoints=%d 个 %v",
 		peerID, len(assisted), assisted, len(lanEndpoints), lanEndpoints)
@@ -1298,7 +1288,6 @@ func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natTyp
 			p.PubPort = pubPort
 		}
 
-		// ★ LAN 优先保护
 		if udpAddr != nil {
 			oldIsLAN := p.UDPAddr != nil && isPrivateIPv4(p.UDPAddr.IP)
 			if !oldIsLAN {
@@ -1316,7 +1305,6 @@ func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natTyp
 			p.LanEndpoints = sortedLAN
 		}
 	} else {
-		// ★★ 补丁 3：新建 peer 时优先用 LAN 初始化 UDPAddr
 		var initialUDP *net.UDPAddr
 		if len(sortedLAN) > 0 {
 			for _, lan := range sortedLAN {
@@ -1349,11 +1337,6 @@ func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natTyp
 	}
 }
 
-// ensureTargetPeer 记录指令里的目标 peer 信息。
-//
-// ★ LAN 优先保护 UDPAddr
-//
-// ★★ 补丁 3（本次修复）：新建时优先用 LAN 端点初始化 UDPAddr。
 func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 	if instr.TargetMac == "" {
 		return
@@ -1365,7 +1348,6 @@ func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 	e.peersMu.Lock()
 	defer e.peersMu.Unlock()
 	if p, ok := e.peers[instr.TargetMac]; ok {
-		// ★ LAN 优先保护
 		if udpAddr != nil {
 			oldIsLAN := p.UDPAddr != nil && isPrivateIPv4(p.UDPAddr.IP)
 			if !oldIsLAN {
@@ -1376,7 +1358,6 @@ func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 			p.VirtualIP = instr.TargetVirtualIp
 		}
 	} else {
-		// ★★ 补丁 3：优先使用 LAN 端点
 		var initialUDP *net.UDPAddr
 		if len(instr.TargetLanEndpoints) > 0 {
 			for _, lan := range instr.TargetLanEndpoints {
@@ -1442,23 +1423,6 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 	})
 }
 
-// reportP2PStatus 主动上报当前 P2P 状态，让服务端停止重发 nat_hole_instruction。
-//
-// ★★★ 新增（本次修复）：
-//
-// 场景：客户端在收到指令前就已经通过 PING/PONG 建立了 P2P（比如两端同时连接，
-// 或 NAT 友好不需要打洞）。此时客户端会跳过打洞指令，但服务端不知道——
-// punchState 里 aState/bState 一直是 0，anySucceeded = false，服务端每 15 秒
-// 重发一次 nat_hole_instruction。日志里会看到大量
-// "[NAT-HOLE] 跳过指令 target=...（已 P2P）"。
-//
-// 主动上报 state=3 + p2pStatus=3 后，服务端 recordPunchResult：
-//   - state=3 → 交叉校验（self >= P2P_AVAILABLE(2) 通过）
-//   - entry.aState = 3 → anySucceeded = true → 停止重发
-//
-// status 参数：
-//   3 — ConnP2P（数据面已验证）
-//   2 — ConnP2PAvailable（握手成功，数据面未验证）
 func (e *Edge) reportP2PStatus(peerID string, status int) {
 	if e.ws == nil || peerID == "" {
 		return
@@ -1482,6 +1446,16 @@ func (e *Edge) reportP2PStatus(peerID string, status int) {
 	})
 }
 
+// tunReadLoop 从 TUN 读出 IPv4 包，按 peer 状态选择 P2P / TURN / WS 中继发送。
+//
+// ★ 改动 2：WS 中继路径改用 N2NW 帧（显式携带目标 clientId），而非裸 IPv4：
+//   - 服务端无需解析 IPv4 头，直接按 peerId 精确路由
+//   - 多 peer 房间下不会广播，节省带宽
+//   - 帧头 peerId 由服务端重写为发送方 ID，接收方能识别来源
+//
+// 保留裸 IPv4 的唯一场景：target == nil（本机 VIP 表里没有该 dstIP，
+// 通常是小 UDP 包探测），此时拿不到目标 clientId，只能让服务端按
+// dstIP 查表。
 func (e *Edge) tunReadLoop(tun *TUNDevice) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -1521,6 +1495,8 @@ func (e *Edge) tunReadLoop(tun *TUNDevice) {
 		}
 		e.peersMu.RUnlock()
 
+		// ★ 无目标：仍发裸 IPv4，服务端按 dstIP 查表
+		//   限制 UDP 小包（ping/探测），避免误广播大流量
 		if target == nil {
 			proto := 0
 			if n >= 10 {
@@ -1545,7 +1521,10 @@ func (e *Edge) tunReadLoop(tun *TUNDevice) {
 			e.logTunForward(target.ClientID, dstIP, n, int(buf[9]), ok, state)
 		}
 		if !ok {
-			_ = e.ws.SendBinary(buf[:n])
+			// ★ 改：WS 中继发 N2NW 帧（显式携带目标 clientId），
+			//   而非裸 IPv4，服务端无需解析 IPv4 头即可精确路由
+			frame := buildN2NWFrame(target.ClientID, buf[:n])
+			_ = e.ws.SendBinary(frame)
 		}
 	}
 }
@@ -1586,11 +1565,6 @@ func (e *Edge) notePeerTrafficTURN(addr *net.UDPAddr) {
 	e.notePeerCommon(addr, true, true, false)
 }
 
-// notePeerCommon 是打洞握手路径的统一入口。
-//
-// ★ LAN 优先 + 30 秒窗口 + lastLANRecvAt > 0 检查
-//
-// ★★ 补丁 2（本次修复）：LAN→公网切换窗口 300000（5 分钟）→ 30000（30 秒）。
 func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, isAck bool) {
 	now := time.Now().UnixMilli()
 
@@ -1653,7 +1627,6 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 		return
 	}
 
-	// ★ LAN 优先更新 UDPAddr
 	newIsLAN := isPrivateIPv4(addr.IP)
 	oldIsLAN := best.UDPAddr != nil && isPrivateIPv4(best.UDPAddr.IP)
 
@@ -1663,7 +1636,6 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 	} else if !oldIsLAN && newIsLAN {
 		shouldUpdate = true
 	} else if oldIsLAN && !newIsLAN {
-		// ★★ 补丁 2：5 分钟 → 30 秒
 		if best.lastLANRecvAt > 0 && now-best.lastLANRecvAt > 30000 {
 			shouldUpdate = true
 			log.Printf("[P2P] %s (note) LAN 超过 30s 无流量，改用公网地址", best.ClientID)
