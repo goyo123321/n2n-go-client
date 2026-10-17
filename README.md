@@ -50,6 +50,11 @@
 
 **PC 端优势**：**唯一的完全 root/admin 权限的 TUN 数据面**——支持所有协议，无 SOCKS5 代理层开销，是**性能最强**的客户端。
 
+> **关于 Termux + root**：本客户端的判断维度是 **TUN 权限**，与运行环境无关。
+> - ✅ Linux / macOS / Windows / 路由器（有 TUN，必有 root）
+> - ✅ **Termux + root**（有 `/dev/net/tun` + `tsu`/`su`）—— 完全可以跑，获得完整 TCP/UDP/ICMP 支持
+> - ❌ Termux 无 root（没有 TUN）—— 请用 [n2n-termux](https://github.com/goyo123321/n2n-termux)
+
 ---
 
 ## ✨ 特性
@@ -63,49 +68,63 @@
 - **多目标打洞** — LAN + STUN 反射 + 观测 raddr 同时扫描，命中率大幅提升
 - **CGNAT hairpin** — 同 STUN 出口 IP 时尝试端口扫描 + probe 回发
 - **UDP 保活** — 每 5 秒刷新 STUN 映射，防止 CGNAT 端口漂移
-- **P2P 通道保活** — 每 15 秒往对端发 N2NS PING 多目标探针，防止空闲时通道被回收
-- **TURN 中继** — 支持 Cloudflare TURN + 自定义 TURN，不消耗 Worker 配额
+- **P2P 通道保活** — 每 15 秒往对端发 N2NS PING 多目标探针
+- **TURN 中继** — 支持 Cloudflare TURN + 自定义 TURN
 - **中继回退** — TURN 失败自动降级到 WebSocket 中继
 - **N2NW 二进制传输** — WS 中继数据面用二进制帧，比 base64 省 33% 带宽
-- **断线重连** — WebSocket 自动重连（指数退避）+ 90 秒读超时检测下行僵死
-- **连接密码** — 支持 `CONNECT_TOKEN` 保护 Worker
+- **断线重连** — WebSocket 自动重连 + 90 秒读超时检测下行僵死
 - **ID 持久化** — 未指定 `CLIENT_ID` 时自动生成并保存，重启复用
 - **虚拟网段可配** — 服务端通过 `VIRTUAL_NETWORK` 下发网段，客户端自动适配
 - **无依赖** — Windows 版内嵌 wintun.dll
-- **三端互通** — 与 [n2n-termux](https://github.com/goyo123321/n2n-termux)、[n2n-android](https://github.com/goyo123321/n2n-android) 无缝互通
+- **三端互通** — 与 n2n-termux、n2n-android 无缝互通
 
 ---
 
-## 📂 二进制路径速查（⚠️ 最容易踩的坑）
+## 📂 安装路径（默认当前目录）
 
-**两种安装方式，二进制路径完全不同**，先看清楚再启动：
+**从 v1.3.0 起，安装目录默认是「当前工作目录下的 `.n2n-go`」**，不再是 `~/.n2n-go`。
 
-| 安装方式 | 二进制位置 | 启动命令 |
-|:---|:---|:---|
-| **方式 A：`install.sh` 自动安装** | `~/.n2n-go/n2n-go-client`<br>（**带点的隐藏目录**） | `sudo ~/.n2n-go/start.sh` |
-| **方式 B：手动下载** | `~/n2n-go-client`<br>（`curl -o ~/n2n-go-client` 下载到的位置） | `sudo ~/n2n-go-client` |
+| 用户在哪个目录运行 `install.sh` | 实际安装到 |
+|:---|:---|
+| `~` | `~/.n2n-go/` |
+| `/opt` | `/opt/.n2n-go/` |
+| `~/my-project` | `~/my-project/.n2n-go/` |
+| 任意目录 `P` | `P/.n2n-go/` |
 
-**常见错误对照**：
+**可以用 `INSTALL_DIR` 环境变量覆盖**：
 
 ```bash
-# ❌ 错误：install.sh 装的，却用 ~/n2n-go-client 启动
-sudo ~/n2n-go-client
-# sudo: /home/user/n2n-go-client: command not found
-
-# ✅ 正确：install.sh 装的用带点目录
-sudo ~/.n2n-go/n2n-go-client
-# 或直接
-sudo ~/.n2n-go/start.sh
-
-# ✅ 正确：手动下载到 ~/ 的用这个
-sudo ~/n2n-go-client
+INSTALL_DIR=/opt/n2n bash install.sh            # 直接装到 /opt/n2n
+INSTALL_DIR="$(pwd)" bash install.sh            # 不建子目录，直接装当前目录
 ```
 
-**验证二进制在哪**：
+**安装完成后的目录**：
+
+```
+<当前工作目录>/.n2n-go/
+├── n2n-go-client       # 二进制
+├── config.env          # 配置
+├── start.sh            # 启动脚本
+├── .version            # 当前版本号
+└── client_id           # 持久化的 Client ID
+```
+
+**`start.sh` 会自动推导安装目录**——你可以从任意目录调用它：
 
 ```bash
-ls -lh ~/.n2n-go/n2n-go-client    # install.sh 装的（存在 → 用这个）
-ls -lh ~/n2n-go-client            # 手动下载的（存在 → 用这个）
+# 以下所有方式都能正确工作
+cd ~/.n2n-go && ./start.sh
+bash ~/.n2n-go/start.sh
+sudo /opt/.n2n-go/start.sh
+cd /tmp && sudo ~/my-project/.n2n-go/start.sh
+```
+
+**手动下载**（不走 `install.sh`）的二进制位置由你决定：
+
+```bash
+curl -L -o ./n2n-go-client https://github.com/goyo123321/n2n-go-client/releases/latest/download/n2n-go-client-linux-amd64
+chmod +x ./n2n-go-client
+sudo ./n2n-go-client
 ```
 
 ---
@@ -152,7 +171,8 @@ chmod +x n2n-go-client
 **与 Termux / Android 的差异**：
 
 - **PC**：TUN 内核栈 → 应用无感知，**TCP/UDP/ICMP 全支持**
-- **Termux**：SOCKS5 代理 → 应用**必须显式配代理**，主动访问仅 TCP
+- **Termux（无 root）**：SOCKS5 代理 → 应用**必须显式配代理**，主动访问仅 TCP
+- **Termux（有 root）**：TUN 内核栈 → 与本客户端行为完全一致
 - **Android APK**：VpnService → 应用无感知，**TCP/UDP/ICMP 全支持**
 
 ---
@@ -190,12 +210,8 @@ CGNAT（运营商级 NAT）的 UDP 映射**不是永久的**。当 socket 空闲
 | **UDP 保活** | 5 秒 | 3 个 STUN 服务器 | 保 socket 的 CGNAT 映射 |
 | **P2P 通道保活** | 15 秒 | 每个 P2P 对端 | 保 A→B 会话（多目标 N2NS PING）|
 
-**两者互补**：
+### 流量代价
 
-- **UDP 保活**：让 CGNAT 认为"这个 socket 活跃"，不回收端口
-- **P2P 通道保活**：走 `collectN2NSTargets` 多目标发送（LAN + STUN 反射 + 观测 raddr + 注册地址），命中率远高于单目标
-
-**流量代价**：
 - UDP 保活：每设备每 5 秒 3 个 20 字节包 → 一天 ~50 MB
 - P2P 保活：每 P2P 对端每 15 秒 1 个 21 字节包 → 一天 ~120 KB × 对端数
 
@@ -212,33 +228,34 @@ CGNAT（运营商级 NAT）的 UDP 映射**不是永久的**。当 socket 空闲
 > ⚠️ **三个前置注意**：
 >
 > 1. **`SIGNALING_URL` 必须带 `wss://` 前缀**（或 `ws://` 用于本地调试）。漏写会报 `malformed ws or wss URL`。
-> 2. **PC 端需要 `sudo`**（`/dev/net/tun` / macOS `utun` 都需要 root 权限）。
-> 3. **二进制路径**：`install.sh` 装的是 `~/.n2n-go/n2n-go-client`（带点的隐藏目录）；手动下载的是 `~/n2n-go-client`。详见 [📂 二进制路径速查](#-二进制路径速查-最容易踩的坑)。
+> 2. **需要 root / sudo**（`/dev/net/tun` 或 macOS `utun` 都需要 root 权限）。
+> 3. **需要 TUN 设备存在**：Linux `modprobe tun`；Termux + root 需要 `/dev/net/tun`；无 TUN 会主动拦截并引导用 n2n-termux。
 
 ### 方式 A：一键安装脚本（推荐）
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/goyo123321/n2n-go-client/main/install.sh)
+# 推荐方式：下载到任意位置，再用 bash 执行
+curl -fsSL https://raw.githubusercontent.com/goyo123321/n2n-go-client/main/install.sh -o ~/install_n2n.sh
+bash ~/install_n2n.sh
 ```
 
-或：
+> **不推荐** `bash <(curl ...)` 方式：`进程替换` 在某些环境下失败会静默退出（尤其 Termux / 容器）。下载后 `bash` 执行更稳定。
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/goyo123321/n2n-go-client/main/install.sh | bash
-```
-
-> 部署脚本执行完后默认**自动启动客户端**，直接回车即可。
-
-**安装位置**：`~/.n2n-go/n2n-go-client`
+**安装位置**：`<当前工作目录>/.n2n-go/`
 
 **日常操作**：
 
 ```bash
-sudo ~/.n2n-go/start.sh                # 前台启动
-sudo ~/.n2n-go/start.sh                # 查看日志
+# 前台启动（会看到日志）
+sudo ~/.n2n-go/start.sh              # 假设在 ~ 下安装
+sudo /opt/.n2n-go/start.sh           # 假设在 /opt 下安装
+sudo ~/proj/.n2n-go/start.sh         # 假设在 ~/proj 下安装
+
+# 从任意目录调用 start.sh 都能工作（用自身所在目录推导）
+cd /tmp && sudo ~/.n2n-go/start.sh
 ```
 
-**macOS 额外**：`TUN_NAME=utun9 sudo ~/.n2n-go/start.sh`（`n2n0` 在 macOS 上无效）
+**macOS 额外**：`TUN_NAME` 会在交互配置时自动设为 `utun9`（`n2n0` 在 macOS 上无效）。
 
 ### 方式 B：手动下载
 
@@ -252,8 +269,6 @@ sudo ~/.n2n-go/start.sh                # 查看日志
 | macOS Intel | `n2n-go-client-darwin-amd64` |
 | macOS Apple Silicon | `n2n-go-client-darwin-arm64` |
 | Windows x64 | `n2n-go-client-windows-amd64.exe` |
-
-**安装位置**：`~/n2n-go-client`（**没有点，直接在 home 下**）
 
 #### Linux
 
@@ -292,7 +307,32 @@ $env:NODE_NAME="A的PC"
 .\n2n-go-client-windows-amd64.exe
 ```
 
-> ⚠️ **注意**：方式 B 下载的二进制是 `~/n2n-go-client-*`，和 install.sh 的 `~/.n2n-go/n2n-go-client` **不是同一个位置**。不要混用。
+### 方式 C：Termux + root（tsu/su）
+
+如果你在 Termux 环境，且已经有 root 权限并加载了 TUN 模块：
+
+```bash
+# 1. 确认 TUN
+su -c "ls -la /dev/net/tun"
+# 如不存在：su -c "insmod /system/lib/modules/tun.ko" 或 modprobe tun
+
+# 2. 下载并运行
+curl -fsSL https://raw.githubusercontent.com/goyo123321/n2n-go-client/main/install.sh -o ~/install_n2n.sh
+bash ~/install_n2n.sh
+
+# 3. 脚本会自动用 tsu 提权启动（也可以手动）
+tsu -c ~/.n2n-go/start.sh
+# 或
+sudo ~/.n2n-go/start.sh
+```
+
+**启动后应该看到**：
+
+```
+[TUN] n2n0 已启动，IP: 10.64.0.3/24，网段: 10.64.0.0/24
+```
+
+**看到 `[TUN] n2nX 已启动` 就是 TUN 版成功了**，这是和 n2n-termux 的 `[SOCKS5] 监听` 最直接的区别。
 
 ---
 
@@ -304,11 +344,8 @@ $env:NODE_NAME="A的PC"
 
 ```bash
 # Termux 端
-python3 -m http.server 8080 &
+python3 -m http.server 8080 --bind 0.0.0.0 &
 sshd  # 默认监听 8022
-
-# Android 端（VpnService 模式）
-# 起 HTTP / SSH / 任意 TCP/UDP 服务
 ```
 
 **PC 端直接访问**（走 TUN）：
@@ -326,17 +363,6 @@ echo "hello" | nc -u 10.64.0.3 5353
 ```
 
 **前提**：服务必须监听 `0.0.0.0` 或 `127.0.0.1`（不能只听某个具体 IP）。
-
-```bash
-# ✅ 可以
-python3 -m http.server 8080 --bind 0.0.0.0
-
-# ✅ 也可以（packet_forwarder 会 dial 127.0.0.1）
-python3 -m http.server 8080 --bind 127.0.0.1
-
-# ❌ 不行（只监听某个具体 IP）
-python3 -m http.server 8080 --bind 192.168.1.100
-```
 
 ### Termux 访问 PC 上的服务
 
@@ -358,15 +384,6 @@ curl --socks5 127.0.0.1:1080 http://10.64.0.2:8080/
 ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@10.64.0.2
 ```
 
-### Android 访问 PC 上的服务
-
-Android 端也是 TUN 数据面，直接访问虚拟 IP：
-
-```bash
-# Android 上跑（Termux 或 App 内）
-curl http://10.64.0.2:8080/
-```
-
 ### 数据面差异
 
 | 维度 | **n2n-go-client** | n2n-termux | n2n-android |
@@ -376,9 +393,8 @@ curl http://10.64.0.2:8080/
 | 主动协议 | TCP / UDP / ICMP | 仅 TCP | TCP / UDP / ICMP |
 | 被动协议 | TCP / UDP / ICMP | TCP / UDP / ICMP | TCP / UDP / ICMP |
 | 权限要求 | root / 管理员 | 无 root | 无 root |
-| 使用方式 | `curl http://10.64.0.X` | `curl --socks5 127.0.0.1:1080 ...` | 同 TUN |
 
-**关键**：**三端的数据面协议完全独立**，但**在服务端和 P2P 通道层用同一套协议**（N2NS 帧 + 打洞 + TURN 中继），所以完全互通。
+**关键**：三端的**数据面协议完全独立**，但在**服务端和 P2P 通道层用同一套协议**（N2NS 帧 + 打洞 + TURN 中继），所以完全互通。
 
 ---
 
@@ -388,16 +404,15 @@ curl http://10.64.0.2:8080/
 |:---|:---|:---|:---|
 | `SIGNALING_URL` | ✅ | — | edge-signal 的 WSS 地址，**必须带 `wss://` 前缀**（或 `ws://`） |
 | `CONNECT_TOKEN` | ⚠️ | `""` | 连接密码（Worker 配了才需要）|
-| `CLIENT_ID` | ❌ | 自动生成并持久化 | 客户端唯一 ID。未设置时首次启动生成 `hostname-随机数`，保存在 `$INSTALL_DIR/client_id`，重启复用 |
+| `CLIENT_ID` | ❌ | 自动生成并持久化 | 客户端唯一 ID，保存在 `$INSTALL_DIR/client_id` |
 | `ROOM_ID` | ❌ | `default-room` | 房间名。只允许 `[A-Za-z0-9_-]+` |
 | `NODE_NAME` | ❌ | hostname | 显示名 |
-| `TUN_NAME` | ❌ | `n2n0` | 虚拟网卡名（macOS 用 `utun9`）|
-| `UDP_PORT` | ❌ | `0` | P2P UDP 端口。`0`=内核自动分配（推荐），指定端口被占用时自动回退 |
+| `TUN_NAME` | ❌ | `n2n0` | 虚拟网卡名（macOS 自动 `utun9`）|
+| `UDP_PORT` | ❌ | `0` | P2P UDP 端口。`0`=内核自动分配 |
 | `STUN_SERVERS` | ❌ | Google + Cloudflare | STUN 服务器 |
-| `SOCKS5_LISTEN` | ❌ | `127.0.0.1:1080` | SOCKS5 监听地址（额外入口，可选）|
-| `INSTALL_DIR` | ❌ | `~/.n2n-go` | install.sh 的安装目录 |
+| `INSTALL_DIR` | ❌ | `$(pwd)/.n2n-go` | 安装目录，默认当前工作目录 |
 
-**虚拟网段**由服务端 `wrangler.toml` 的 `VIRTUAL_NETWORK` 决定，客户端从 `ready` 消息自动接收，无需配置。默认 `10.64.0.0/24`。
+**虚拟网段**由服务端 `wrangler.toml` 的 `VIRTUAL_NETWORK` 决定，客户端从 `ready` 消息自动接收。
 
 ---
 
@@ -408,42 +423,29 @@ curl http://10.64.0.2:8080/
 ```
 n2n-go-client v1.3.0 启动
 [配置] 未设置 CONNECT_TOKEN
-[配置] 生成并持久化 CLIENT_ID: pc-a-1704067200 -> /home/user/.n2n-go/client_id
+[配置] 生成并持久化 CLIENT_ID: pc-a-1704067200 -> /opt/.n2n-go/client_id
 [P2P] UDP 监听端口 54321
 [NAT] 启动预收集 LAN: [192.168.1.100:54321]
 [NAT] STUN 74.125.250.129:19302 → x.x.x.x:19190
 [NAT] HardNAT（对称），ports_diff=0 pub=x.x.x.x:19190
 [WS] 连接 wss://<你的-worker-域名>/ws/myroom?cid=pc-a
 已连接信令，Client ID: pc-a-1704067200，节点名: A的电脑
-[WS] 重放 1 条早期文本消息
 分配虚拟 IP: 10.64.0.2（网段 10.64.0.0/24）
-[信令] 服务端看到的本机出口 IP: x.x.x.x（WS/TCP 出口，仅参考）
 [NAT] 上报 LAN 地址: [192.168.1.100:54321]
 [信令] 上报 p2p_metadata: natType=HardNAT publicEndpoint="x.x.x.x:19190" multiExit=true assisted=2 lan=1
 [TUN] n2n0 已启动，IP: 10.64.0.2/24，网段: 10.64.0.0/24
-[TURN] 获取到 custom TURN 服务器: turn:xxx:3478
-[TURN] 中继地址: x.x.x.x:50000
 [Keepalive] 启动，每 5s 刷新 3 个 STUN 服务器
 [P2P-Keepalive] 启动，每 15s 刷新 P2P 通道
-[SOCKS5] 监听 127.0.0.1:1080（用 curl --socks5 或 ALL_PROXY 访问虚拟 IP）
-
-================= 本机信息 =================
-  Client ID   : pc-a-1704067200
-  节点名       : A的电脑
-  虚拟 IP     : 10.64.0.2
-  虚拟网段    : 10.64.0.0/24
-  P2P 端口    : 54321
-==========================================
 ```
 
 **关键检查点**：
 
 | 日志 | 含义 |
 |:---|:---|
-| `[NAT] 上报 LAN 地址: [...]` 非空 | LAN 收集成功（LAN 优先前提） |
+| `[NAT] 上报 LAN 地址: [...]` 非空 | LAN 收集成功 |
 | `[TUN] n2n0 已启动` | **PC 独有**（不是 Termux 版） |
 | `[WS] 连接 wss://...` | **URL 带了 wss://**（不是 `malformed`） |
-| `[P2P] xxx 新建 peer，初始 UDPAddr 用 LAN: ...` | LAN 优先修复生效 |
+| `[P2P] xxx 新建 peer，初始 UDPAddr 用 LAN: ...` | LAN 优先生效 |
 
 当其他节点上线时（**LAN 直连命中**）：
 
@@ -452,17 +454,12 @@ n2n-go-client v1.3.0 启动
   虚拟 IP   : 10.64.0.3
   公网地址  : x.x.x.x:54322
   LAN 地址  : [192.168.1.101:54322]
-  STUN 端点 : [x.x.x.x:54322 x.x.x.x:54335]
 ==========================================
 
-[registerPeer] termux-b: 收到 assisted=2 个 [...] lanEndpoints=1 个 [192.168.1.101:54322]
-[registerPeer] termux-b: sortedLAN=[192.168.1.101:54322] (prefixes=1)
 [NAT-HOLE] 开始打洞 role=0 target=192.168.1.101:54322 rung=0 mode=3 ttl=7
-[collectScanTargets] 去重后 4 个候选: [...]
 [P2P] 从 termux-b (192.168.1.101) 收到 Punch → P2PAvailable（等待数据帧验证）
 [P2P] 收到 PONG → P2P 直连（双向通道已验证）
 [连接] termux-b → P2P 直连（prev=p2p-avail，数据面已验证）
-[NAT-HOLE] ✅ 成功 role=0 target=192.168.1.101 attempts=4 tier=±3
 ```
 
 **打洞失败时**：
@@ -472,74 +469,22 @@ n2n-go-client v1.3.0 启动
 [连接] termux-b → TURN 中继 (x.x.x.x:50000)
 ```
 
-**TURN 也不可用时**：
-
-```
-[连接] termux-b → WS 中继 (TURN 未就绪，最后兜底)
-```
-
 ---
 
 ## 🔍 P2P 数据流原理
 
 ### LAN 地址发现（双路径）
 
-**路径 1：UDP connect 骗内核**
+1. **UDP connect 骗内核**：`net.Dial("udp4", "8.8.8.8:80")` 后取 `LocalAddr()`，不真正发包
+2. **遍历 `net.Interfaces()`**：覆盖多网卡场景
 
-```go
-conn, _ := net.Dial("udp4", "8.8.8.8:80")
-localIP := conn.LocalAddr().(*net.UDPAddr).IP
-```
-
-connect UDP **不真正发包**，只更新内核路由缓存。`getsockname()` 返回内核为该 socket 选定的出口 IP —— 即"出网卡"的 IP。
-
-- WiFi 下返回 `192.168.x.x` —— 直接可用
-- 蜂窝下返回运营商内网 IP（`10.x` / `100.64.x`）—— 会被过滤掉
-- 不触发 netlink 权限检查，任何环境都能用
-
-**路径 2：遍历 `net.Interfaces()`**
-
-覆盖多网卡场景（WiFi + USB 网卡）。两条路径结果合并去重。
-
-**上报链路**：`p2p_metadata` 里带 `lanEndpoints` → 服务端存储 → 广播 `joined` → 对端 `registerPeer` 时收到。
-
-### 打洞候选（score 制匹配）
-
-对端可能从**三个不同源地址**发来 Punch/ACK：
-
-| 源 | 分数 | 场景 |
-|:---|:---|:---|
-| `p.UDPAddr` 完全匹配 | 4 | 公网地址未变 |
-| `p.UDPAddr` IP 匹配 | 3 | 端口漂移 |
-| `p.LanEndpoints` 完全匹配 | **5（最高）** | 同 WiFi 直连 |
-| `p.LanEndpoints` IP 匹配 | 2 | LAN 端口漂移 |
-| `p.AssistedEndpoints` 完全匹配 | 4 | STUN 反射 |
-| `p.AssistedEndpoints` IP 匹配 | 1 | 反射端口漂移 |
-
-**最高分匹配**优先。
-
-### P2P 通道状态机
-
-```
-Unknown → P2PAvailable → P2P
-           ↑                ↑
-      收到 Punch/ACK    收到 PONG 或
-      打洞握手成功      真实数据帧
-```
-
-**PING/PONG 语义**（关键）：
-
-- 收到 **PING** → 只回 PONG，**不升级本端状态**（单向证明）
-- 收到 **PONG** → 双向通道已验证 → **升级到 P2P**
-- 收到 **SYN/SYNACK/DATA/ACK/FIN/RST** → **升级到 P2P**（真实数据帧）
-
-**P2PAvailable 30 秒超时**：打洞握手成功但 30 秒内没升到 P2P → 强制降级到 TURN/WS，避免永远卡在中间态。
+两条路径结果合并去重，随 `p2p_metadata.lanEndpoints` 上报。
 
 ### LAN 优先保护（30 秒窗口）
 
 **问题**：同 WiFi 场景下，peer 的 `UDPAddr` 可能在 LAN 和公网之间抖动，导致 ping 从 5ms 跳 200ms。
 
-**修复**（v1.3.0+）：
+**修复**：
 
 - **新建 peer 时**：优先用 LAN 端点初始化 `UDPAddr`
 - **更新 UDPAddr 时**：
@@ -550,6 +495,20 @@ Unknown → P2PAvailable → P2P
 
 **效果**：同 WiFi 场景稳定走 LAN 直达（8-15ms），不再有 200ms 尖峰。
 
+### P2P 通道状态机
+
+```
+Unknown → P2PAvailable → P2P
+           ↑                ↑
+      收到 Punch/ACK    收到 PONG 或
+      打洞握手成功      真实数据帧
+```
+
+- 收到 **PING** → 只回 PONG，**不升级本端状态**
+- 收到 **PONG** → **升级到 P2P**
+- 收到 **SYN/SYNACK/DATA/ACK/FIN/RST** → **升级到 P2P**
+- **P2PAvailable 30 秒超时** → 强制降级到 TURN/WS
+
 ### P2P 数据帧格式（21 字节头 + payload）
 
 ```
@@ -558,7 +517,7 @@ Unknown → P2PAvailable → P2P
 0     4     "N2NS"      魔数
 4     1     ver         版本 1
 5     1     type        SYN=1 SYNACK=2 DATA=3 ACK=4 FIN=5 RST=6 PING=7 PONG=8
-6     4     streamID    大端 uint32（偶数）
+6     4     streamID    大端 uint32
 10    4     seq         本帧序列号
 14    4     ack         确认收到的对方 seq
 18    1     flags       保留
@@ -566,12 +525,7 @@ Unknown → P2PAvailable → P2P
 21    N     payload     数据
 ```
 
-**可靠性机制**：
-
-- 每帧带序列号 + ACK，接收方按序交付
-- 未 ACK 200ms 重传，最多 8 次
-- 滑动窗口 16 帧
-- 乱序缓存后按序交付
+**可靠性机制**：序列号 + ACK + 200ms 重传（最多 8 次）+ 滑动窗口 16 + 乱序缓存。
 
 ### N2NW 二进制传输（WS 中继）
 
@@ -586,19 +540,7 @@ WS 中继数据面使用 **N2NW 二进制帧**（6 字节头 + peerId + 裸 IPv4
    服务端→客户端: peerId = 发送方 clientId（服务端重写）
 ```
 
-**⚠️ 兼容性**：三端客户端和 edge-signal 服务端**必须同步升级**。旧服务端遇到 N2NW magic 会静默丢弃（`data[0]>>4 != 4`），导致 WS 中继数据面不通。
-
-### 多目标发送
-
-`sendP2PFrame` 走 `collectN2NSTargets` 收集所有候选：
-
-1. LAN 地址（同 WiFi 优先）
-2. AssistedEndpoints（STUN 反射多端点）
-3. lastRecvFrom（对端最近发来的源地址）
-4. peerAddr（注册分配）
-5. peer.UDPAddr（观测 raddr）
-
-**一帧同时发往所有候选**，命中率大幅提升。
+**⚠️ 兼容性**：三端客户端和 edge-signal 服务端**必须同步升级**。旧服务端遇到 N2NW magic 会静默丢弃，WS 中继数据面不通。
 
 ---
 
@@ -607,11 +549,7 @@ WS 中继数据面使用 **N2NW 二进制帧**（6 字节头 + peerId + 裸 IPv4
 ### 场景 1：异地办公室组网
 
 ```bash
-# 上海
 CLIENT_ID="sh-gateway" ROOM_ID="office" ...
-
-# 北京
-CLIENT_ID="bj-gateway" ROOM_ID="office" ...
 ```
 
 组网后：`ssh user@10.64.0.x` 直接连。
@@ -619,11 +557,7 @@ CLIENT_ID="bj-gateway" ROOM_ID="office" ...
 ### 场景 2：家庭 NAS 远程访问
 
 ```bash
-# 在家 NAS 上
 CLIENT_ID="nas" ...
-
-# 在外面笔记本上
-CLIENT_ID="laptop" ...
 ```
 
 之后 `http://10.64.0.2:<NAS端口>` 访问 NAS 服务。
@@ -636,9 +570,6 @@ CLIENT_ID="pc-a" NODE_NAME="A的电脑" ...
 
 # Termux（Android 手机）
 CLIENT_ID="termux-a" NODE_NAME="A的手机" ...
-
-# Android APK（另一台手机）
-CLIENT_ID="android-b" NODE_NAME="B的手机" ...
 ```
 
 **PC → Termux**：
@@ -646,13 +577,6 @@ CLIENT_ID="android-b" NODE_NAME="B的手机" ...
 ```bash
 curl http://10.64.0.3:8080/       # PC 走 TUN
 ssh -p 8022 u0_aXXX@10.64.0.3
-```
-
-**PC → Android**：
-
-```bash
-curl http://10.64.0.4:8080/       # Android 走 TUN
-ping 10.64.0.4                    # ICMP 也支持
 ```
 
 **Termux → PC**：
@@ -669,32 +593,9 @@ curl --socks5 127.0.0.1:1080 http://10.64.0.2:8080/
 CLIENT_ID="router-sh" ROOM_ID="office" TUN_NAME="n2n0" ...
 ```
 
-路由器后面的设备可通过 `10.64.0.x` 直接访问其他城市的办公室资源。
-
-### 场景 5：游戏联机
-
-```bash
-# 玩家 A（PC）
-CLIENT_ID="player-a" ROOM_ID="game-night" ...
-
-# 玩家 B（Android APK，也是 TUN）
-CLIENT_ID="android-b" ROOM_ID="game-night" ...
-```
-
-**PC ↔ Android 可以玩 UDP 游戏**（双端 TUN，支持 UDP/ICMP）。
-
-**Termux 端仅 TCP**，不支持游戏常见的 UDP 数据面。
-
 ---
 
 ## 🔧 从源码构建
-
-### 前置要求
-
-- Go 1.21+
-- Git
-
-### 构建
 
 ```bash
 git clone https://github.com/goyo123321/n2n-go-client.git
@@ -710,7 +611,7 @@ GOOS=darwin  GOARCH=arm64 CGO_ENABLED=0 go build -o n2n-go-client-darwin-arm64 .
 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o n2n-go-client-windows-amd64.exe .
 ```
 
-**Windows 构建特殊说明**：需要先下载 `wintun.dll`：
+**Windows 构建**：需要先下载 `wintun.dll`：
 
 ```bash
 WINTUN_VERSION=0.14.1
@@ -721,33 +622,22 @@ cp wintun-extract/wintun/bin/amd64/wintun.dll ./wintun.dll
 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o n2n-go-client-windows-amd64.exe .
 ```
 
-### GitHub Actions 自动构建
-
-手动触发：
-
-```
-Actions → Build n2n-go-client → Run workflow
-  version: v1.3.0
-  publish: ✓
-  platforms: （留空=全部5个平台）
-```
-
 ---
 
 ## 📁 项目结构
 
 ```
 n2n-go-client/
-├── main.go                       # 主程序（含 UDP 保活 + P2P 通道保活 + LAN 收集）
-├── ws_transport.go               # WebSocket 传输层（断线重连 + 90s 读超时 + 早期消息缓冲）
-├── relay_fallback.go             # 四级降级管理器（含 ForceFallback + LAN 优先发送）
+├── main.go                       # 主程序
+├── ws_transport.go               # WebSocket 传输层
+├── relay_fallback.go             # 四级降级管理器
 ├── turn_client.go                # TURN 客户端
-├── turn_lite.go                  # TURN-Lite 实现（UDP + TCP）
+├── turn_lite.go                  # TURN-Lite（UDP + TCP）
 ├── turn_lite_tcp.go              # TURN over TCP / RFC 6062
 ├── nat_probe.go                  # NAT 类型探测
-├── nathole_executor.go           # 打洞指令执行（分阶段扫描 + 30s LAN 窗口）
+├── nathole_executor.go           # 打洞指令执行
 ├── p2p_stream.go                 # N2NS 可靠流协议 + N2NW 二进制帧
-├── p2p_support.go                # P2P stream 依赖方法（LAN 优先 + 30s 窗口）
+├── p2p_support.go                # P2P stream 依赖方法
 ├── punch.go                      # Punch/ACK 定义
 ├── socks5.go                     # SOCKS5 入口
 ├── app_stream.go                 # WS 应用层隧道（app_stream）
@@ -772,10 +662,11 @@ n2n-go-client/
 | Linux | `root` 或 `CAP_NET_ADMIN` |
 | macOS | `sudo` |
 | Windows | 管理员权限 |
+| Termux + root | `tsu` / `su` / `sudo` |
 
 ### 防火墙
 
-Windows 防火墙可能拦截 TUN 接口的 ICMP。如无法 ping 通：
+Windows 防火墙可能拦截 TUN 接口的 ICMP：
 
 ```
 控制面板 → Windows Defender 防火墙 → 高级设置
@@ -784,32 +675,16 @@ Windows 防火墙可能拦截 TUN 接口的 ICMP。如无法 ping 通：
 
 ### CLIENT_ID 稳定性
 
-**可以不手动指定**。未设置时客户端会在 `$INSTALL_DIR/client_id`
-（默认 `~/.n2n-go/client_id`）首次生成并持久化一个 ID，重启复用，虚拟 IP 不会漂移。
+**可以不手动指定**。未设置时客户端会在 `$INSTALL_DIR/client_id` 首次生成并持久化，重启复用，虚拟 IP 不会漂移。
 
 **但手动指定仍然推荐**，尤其在以下场景：
 - 多台设备共用同一个 `$INSTALL_DIR`（如 NFS 挂载）
 - 用 `sudo` 运行时 `$HOME` 会变成 `/root`，导致 ID 文件位置变化
 - 想用可读的 ID（如 `pc-a`、`nas`）方便在面板里识别
-- 迁移机器时想保留原来的虚拟 IP
-
-### UDP 端口
-
-默认 `UDP_PORT=0`，内核自动分配。同一台机器跑多个客户端时不会冲突。
-
-需要固定端口（比如为了防火墙规则）时显式指定：
-
-```bash
-UDP_PORT=50001 ./n2n-go-client ...
-```
-
-指定的端口被占用时，客户端会**自动回退**到内核分配，不会启动失败。
 
 ### 虚拟网段
 
-网段由**服务端** `wrangler.toml` 的 `VIRTUAL_NETWORK` 决定，客户端在连接时从 `ready` 消息接收。
-
-**更换网段需要同时重启所有客户端**——旧的 IP 和路由是旧网段的，连接后会被新网段覆盖。
+网段由**服务端** `wrangler.toml` 的 `VIRTUAL_NETWORK` 决定。**更换网段需要同时重启所有客户端**。
 
 ---
 
@@ -823,49 +698,30 @@ UDP_PORT=50001 ./n2n-go-client ...
 | TURN 中继 | 30~100ms | Cloudflare TURN 配额 |
 | WebSocket 中继 | 100~300ms | Worker 请求配额 |
 
-**PC 端性能最优**——直接走 TUN 内核栈，无 SOCKS5 代理层开销。
-
 ---
 
 ## 🐛 常见问题
 
-### Q: 启动报错 `No such file or directory`，找不到二进制？
+### Q: 启动报错 `No such file or directory`？
 
-**原因**：**路径写错了**。`install.sh` 装的和手动下载的路径完全不同。
+**原因**：路径写错了。**安装目录现在是 `<当前工作目录>/.n2n-go`**，不再是 `~/.n2n-go`。
 
 **快速判断**：
 
 ```bash
-# 用 install.sh 装的 → 二进制在 ~/.n2n-go/n2n-go-client
-ls -lh ~/.n2n-go/n2n-go-client
+# 到之前运行的目录找
+ls -la .n2n-go/n2n-go-client
 
-# 手动下载的 → 二进制在 ~/n2n-go-client
-ls -lh ~/n2n-go-client
+# 或者全局搜
+find ~ -name "n2n-go-client" -type f 2>/dev/null
+find /opt -name "n2n-go-client" -type f 2>/dev/null
 ```
 
-**哪个存在就用哪个**：
-
-```bash
-# install.sh 装的
-sudo ~/.n2n-go/n2n-go-client
-# 或直接
-sudo ~/.n2n-go/start.sh
-
-# 手动下载的
-sudo ~/n2n-go-client
-```
-
-**详细对照**：
-
-| 场景 | 错误命令 | 正确命令 |
-|:---|:---|:---|
-| install.sh 装完，手动跑 | `~/n2n-go-client` | `~/.n2n-go/n2n-go-client` |
-| install.sh 装完，正常启动 | — | `sudo ~/.n2n-go/start.sh` |
-| 手动下载到 home | `~/.n2n-go/n2n-go-client` | `~/n2n-go-client` |
+**建议**：安装时看到脚本输出里的 `安装目录: /实际/绝对/路径/.n2n-go`，直接复制那个路径。
 
 ### Q: 启动报错 `连接信令失败: malformed ws or wss URL`？
 
-**原因**：`SIGNALING_URL` 漏了 `wss://`（或 `ws://`）协议前缀。
+**原因**：`SIGNALING_URL` 漏了 `wss://` 前缀。
 
 **修复**：
 
@@ -873,18 +729,82 @@ sudo ~/n2n-go-client
 sudo SIGNALING_URL="wss://<你的-worker-域名>" \
      ROOM_ID="myroom" \
      CLIENT_ID="pc-a" \
-     ~/.n2n-go/n2n-go-client
+     ./start.sh
 ```
 
-**正确的 SIGNALING_URL 格式**：
+**格式说明**：
 
 | 输入 | 结果 |
 |:---|:---|
-| `wss://your-worker.example.com` | ✅ 正确 |
-| `ws://localhost:8080` | ✅ 正确（本地调试） |
+| `wss://your-worker.example.com` | ✅ |
+| `ws://localhost:8080` | ✅ |
 | `https://your-worker.example.com` | ⚠️ 会被自动转成 `wss://` |
 | `your-worker.example.com` | ❌ 缺前缀 |
-| `wss://your-worker.example.com/ws/myroom` | ❌ 不要带路径，只填域名 |
+| `wss://your-worker.example.com/ws/myroom` | ❌ 不要带路径 |
+
+### Q: 启动报错 `permission denied: /dev/net/tun`？
+
+**原因**：**没有 root 权限**。TUN 需要 root。
+
+**修复**：
+
+```bash
+# 加 sudo
+sudo ./start.sh
+
+# 或者切换到 root
+su -
+./start.sh
+```
+
+**Termux + root**：
+
+```bash
+tsu -c ./start.sh
+# 或
+sudo ./start.sh
+```
+
+### Q: 启动报错 `未找到 /dev/net/tun`？
+
+**原因**：系统没有加载 tun 模块。
+
+**修复**：
+
+```bash
+# Linux
+sudo modprobe tun
+ls -la /dev/net/tun
+
+# 如果 modprobe 失败，安装内核模块
+sudo apt install linux-modules-extra-$(uname -r)
+
+# Termux + root
+su -c "insmod /system/lib/modules/tun.ko" 2>/dev/null
+su -c "modprobe tun" 2>/dev/null
+# 有些手机需要重启后才有 /dev/net/tun
+```
+
+### Q: 在 Termux 里装 n2n-go-client 提示「Termux 环境但没有 TUN」？
+
+**原因**：**这是正常的**。Termux 无 root 时没有 TUN 权限，这个客户端跑不起来。
+
+**两个选择**：
+
+**选择 A（推荐）**：用 [n2n-termux](https://github.com/goyo123321/n2n-termux)——SOCKS5 模式，无需 root：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/goyo123321/n2n-termux/main/install.sh -o ~/install_n2n_termux.sh
+bash ~/install_n2n_termux.sh
+```
+
+**选择 B**：手机已 root，先加载 tun 模块再装：
+
+```bash
+su -c "ls -la /dev/net/tun"               # 确认存在
+su -c "insmod /system/lib/modules/tun.ko"  # 不存在时加载
+bash ~/install_n2n.sh                     # 重新运行安装
+```
 
 ### Q: ping 不通怎么办？
 
@@ -902,61 +822,10 @@ ip route | grep 10.64   # Linux
 netstat -rn | grep 10.64  # macOS
 ```
 
-**Windows 的防火墙可能拦 ICMP**——用 TCP 测更可靠：
+**Windows 防火墙可能拦 ICMP**——用 TCP 测更可靠：
 
 ```bash
-# 对端开服务
-python3 -m http.server 8080
-
-# 本机测
 curl -v --max-time 5 http://10.64.0.3:8080/
-```
-
-### Q: ping Termux 不通？
-
-**Termux 端支持 ICMP 响应**——通过内置 `packet_forwarder.go` 处理 Echo Request。
-
-**如果 ping 不通**：
-
-**情况 1：单向 P2P（最常见）**
-
-日志里会看到 **每秒一次** 的 `[FWD-ICMP] Echo Request from 10.64.0.2`（PC 一直重发）。
-
-**原因**：CGNAT 打洞单向——PC 的包能到 Termux，但 Termux 的包被 PC 侧 CGNAT 丢弃。
-
-**修复**：Termux 端最新版已将 **ICMP 强制走 WS 中继**（牺牲延迟换可靠）。RTT 会变成 100-300ms，但**一定能通**。
-
-**情况 2：Termux 客户端未运行**
-
-检查 Termux 端：
-
-```bash
-ps aux | grep n2n-termux
-tail -f ~/n2n.log | grep FWD
-```
-
-应该有 `[FWD] 已启动（TCP 中继 + UDP 转发 + ICMP 响应）`。
-
-### Q: ping Android 不通？
-
-**Android 的 TUN 对 ICMP 支持完整**——如果 ping 不通，可能是：
-
-1. **打洞失败** → 服务端面板显示 `TURN-BD` 或 `ws-BD`
-2. **Android 端 App 未启动** → 检查通知栏图标
-3. **路由问题** → `adb shell ip route` 检查是否有 `10.64.0.0/24`
-
-### Q: Termux 能 ping 通 PC 吗？
-
-**不能**。**Termux 端 SOCKS5 只代理 TCP**，不支持 ICMP。
-
-**用 TCP 测**：
-
-```bash
-# PC 端起服务
-python3 -m http.server 8080 --bind 0.0.0.0
-
-# Termux 端测
-curl --socks5 127.0.0.1:1080 http://10.64.0.2:8080/
 ```
 
 ### Q: 如何判断走的是 LAN / P2P / TURN / WS？
@@ -980,100 +849,45 @@ curl --socks5 127.0.0.1:1080 http://10.64.0.2:8080/
 
 **中继流量**：如果 LAN/P2P 生效，**TURN 中继流量保持 0 B**。
 
-### Q: 打洞失败？
-
-看日志 `[NAT-HOLE] ❌ 失败`。会自动降级到 TURN 中继（如果配置了）。TURN 也不可用则降级到 WS 中继。
-
-**排查**：
-
-1. **看 LAN 候选有没有命中**
-   - `[P2P] 从 xxx (192.168.x.x) 收到 Punch` → LAN 命中
-   - `[P2P] 从 xxx (x.x.x.x) 收到 Punch` → 公网命中
-2. **看两端 pubSocket 端口差**
-   - 差距小（< 10）→ 保活生效
-   - 差距大（> 100）→ CGNAT 映射漂移严重
-3. **看是否同 STUN 出口 IP**
-   - 相同 → 同 CGNAT，需要 hairpin（多半失败）
-   - 不同 → 正常跨 NAT，大概率成功
-
-### Q: 客户端每 15 秒收到一次 `nat_hole_instruction`？
-
-**已 P2P 但没告诉服务端**。
-
-**修复**：最新版代码在跳过指令时**主动上报** `p2p_status=3`：
-
-```
-[NAT-HOLE] 跳过指令 target=xxx（已 P2P），上报 p2p_status=3    ← 只出现一次
-```
-
-如果日志里每 15 秒出现一次 `跳过指令`，说明客户端版本太旧，需要升级。
-
 ### Q: 同 WiFi 延迟波动很大（100ms+）？
 
-**已修复**（v1.3.0+）。原因是两端同时向 LAN + 公网发包，导致对端 `peer.UDPAddr` 被公网地址覆盖，回程走 CGNAT 回环。
+**已修复**（v1.3.0+）。原因是 `UDPAddr` 在 LAN 和公网之间抖动，导致回程走 CGNAT 回环。
 
-**修复后**：
+**修复后**：同 WiFi 场景延迟稳定在 **8~15ms**，标准差 <2ms。
 
-- 新建 peer 时优先用 LAN 初始化 `UDPAddr`
-- 收到包更新 `UDPAddr` 时 **LAN 优先**，30 秒窗口
-- 发送数据时 **LAN 优先**，只失败才回退
+### Q: 息屏后 ping 有 200-500ms 尖峰？
 
-现在同 WiFi 场景延迟稳定在 **8~15ms**，标准差 <2ms。
+**这是 Android WiFi 芯片的 PS-Poll 省电模式，与 n2n 无关**。即使 PC 直连网关也会有相同尖峰。
 
-### Q: 如何确认二进制是 PC 版而不是 Termux 版？
+**PC 端不受影响**——PC 没有 WiFi 芯片省电问题。
 
-**方法 1：看启动日志**
-
-| 日志 | 判断 |
-|:---|:---|
-| `[TUN] n2n0 已启动` | ✅ PC 版 |
-| `[SOCKS5] 监听 127.0.0.1:1080` + `[FWD] 已启动` | ❌ Termux 版（跑错平台了） |
-
-**方法 2：看文件名**
-
-```bash
-ls -lh ~/.n2n-go/n2n-go-client     # ✅ PC 版（install.sh 装的）
-ls -lh ~/n2n-go-client             # ✅ PC 版（手动下载的）
-ls -lh ~/.n2n-termux/n2n-termux   # Termux 版
-```
-
-**方法 3：strings 检查**
-
-```bash
-strings ~/.n2n-go/n2n-go-client | grep -i "wintun\|n2n0" | head -3
-```
-
-### Q: 一直显示 `natType=EasyNAT`？
-
-**旧版客户端的 bug**——单样本时判 EasyNAT。
-
-**最新版**：单样本 → `unknown`，不猜。
+**Android / Termux 端的应对**：
+1. 路由器关闭 U-APSD
+2. 切 5GHz 频段
+3. DTIM 周期改 1
+4. Android 电池优化白名单
 
 ### Q: 重启后虚拟 IP 变了？
 
-客户端会持久化 `CLIENT_ID` 到 `$INSTALL_DIR/client_id`，正常情况下重启 IP 不变。
-如果 IP 变了，说明 `client_id` 文件被删或换目录了，检查：
+客户端会持久化 `CLIENT_ID` 到 `$INSTALL_DIR/client_id`，正常情况下重启 IP 不变。检查：
 
 ```bash
 cat ~/.n2n-go/client_id
 ```
 
-### Q: WebSocket 断线后需要手动重启吗？
+**如果变了**：可能是不同的安装目录（比如之前装在 `~/.n2n-go`，现在装在 `$(pwd)/.n2n-go`），`client_id` 文件位置不同导致 ID 变了。
 
-不需要。客户端内置**自动重连**（指数退避，最长 5 分钟）+ **90 秒读超时检测下行僵死**。断线期间日志会显示：
+### Q: 从任意目录调用 start.sh 会不会找错配置文件？
 
-```
-[WS] 断线: ..., 1s 后重连
-[WS] 重连成功
-```
+**不会**。`start.sh` 里用**自身所在目录推导 `INSTALL_DIR`**：
 
-**下行僵死**（TCP 表面正常但服务端消息到达不了）也会被检测：
-
-```
-[WS] 读超时 1m30s 未收到任何消息（下行僵死），触发重连
+```bash
+if [ -z "${INSTALL_DIR:-}" ]; then
+    INSTALL_DIR="$(cd "$(dirname "$0")" && pwd)"
+fi
 ```
 
-重连后会自动重新上报 NAT 元数据。
+所以从任意目录调用都能正确找到 `config.env` 和 `n2n-go-client`。
 
 ---
 
@@ -1099,6 +913,6 @@ MIT
 | 项目 | 平台 | 模式 | 互通 |
 |:---|:---|:---|:---|
 | [edge-signal](https://github.com/goyo123321/edge-signal) | Cloudflare Workers | 信令服务器 | — |
-| **n2n-go-client** | Linux / macOS / Windows | **TUN** | ✅ 全部 |
+| **n2n-go-client** | Linux / macOS / Windows / 路由器 | **TUN** | ✅ 全部 |
 | [n2n-termux](https://github.com/goyo123321/n2n-termux) | Android Termux | **SOCKS5 + 包转发** | ✅ 全部 |
 | [n2n-android](https://github.com/goyo123321/n2n-android) | Android APK | VpnService | ✅ 全部 |
