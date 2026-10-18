@@ -12,13 +12,13 @@
 #   bash ~/install_n2n.sh                  # 交互式询问
 #   RECONFIG=1 bash ~/install_n2n.sh       # 强制重新配置
 #   KEEP_CONFIG=1 bash ~/install_n2n.sh    # 强制使用现有配置
-#   RESET=1 bash ~/install_n2n.sh          # 完全重置（删 config.env + client_id）
+#   RESET=1 bash ~/install_n2n.sh          # 完全重置
 #
 # 适用场景：
 #   ✅ Linux 服务器 / 树莓派 / 路由器（有 TUN + root）
 #   ✅ macOS（有 utun + sudo）
 #   ✅ Windows（管理员 + wintun）
-#   ✅ Termux + root（有 /dev/net/tun + tsu/su）
+#   ✅ Termux + root（有 /dev/net/tun + tsu/su）  ← 本版增强
 #   ❌ Termux 无 root（没有 TUN） → 请用 n2n-termux
 #
 
@@ -27,7 +27,6 @@ set -eu
 REPO="goyo123321/n2n-go-client"
 BIN_NAME="n2n-go-client"
 
-# ★ 安装目录：默认当前工作目录下的 .n2n-go
 if [ -z "${INSTALL_DIR:-}" ]; then
     INSTALL_DIR="$(pwd)/.n2n-go"
 fi
@@ -68,6 +67,7 @@ IS_TERMUX=0
 IS_LINUX=0
 IS_DARWIN=0
 HAS_ROOT=0
+ROOT_METHOD=""    # ★ 新增：记录提权方式（tsu/su/sudo/direct）
 HAS_TUN=0
 ARCH=""
 BIN_FILE=""
@@ -153,13 +153,26 @@ detect_env() {
     fi
 }
 
+# ============================================================
+# TUN 能力检测（Termux + root 专项）
+# ============================================================
 check_tun_capability() {
-    if [ "$(id -u)" = "0" ]; then HAS_ROOT=1
-    elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then HAS_ROOT=1
-    elif command -v tsu >/dev/null 2>&1; then HAS_ROOT=1
-    elif command -v su >/dev/null 2>&1 && su -c "id -u" 2>/dev/null | grep -q "^0$"; then HAS_ROOT=1
+    # 1. 检测提权方式（按优先级：已 root → tsu → sudo → su）
+    if [ "$(id -u)" = "0" ]; then
+        HAS_ROOT=1
+        ROOT_METHOD="direct"
+    elif command -v tsu >/dev/null 2>&1; then
+        HAS_ROOT=1
+        ROOT_METHOD="tsu"
+    elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        HAS_ROOT=1
+        ROOT_METHOD="sudo"
+    elif command -v su >/dev/null 2>&1 && su -c "id -u" 2>/dev/null | grep -q "^0$"; then
+        HAS_ROOT=1
+        ROOT_METHOD="su"
     fi
 
+    # 2. 检测 TUN
     if [ -e "/dev/net/tun" ]; then
         HAS_TUN=1
         log "检测到 /dev/net/tun"
@@ -168,36 +181,50 @@ check_tun_capability() {
         log "检测到 /dev/tun"
     fi
 
+    # 3. 有 TUN → 直接通过
     if [ "$HAS_TUN" = "1" ]; then
         ok "TUN 设备可用"
         if [ "$HAS_ROOT" = "1" ]; then
-            log "root 权限可用"
+            log "提权方式: $ROOT_METHOD"
         else
-            warn "TUN 存在但当前无 root，启动时需要提权"
+            warn "TUN 存在但当前无 root，启动时会尝试提权"
         fi
         return 0
     fi
 
+    # 4. 无 TUN
     if [ "$IS_TERMUX" = "1" ]; then
         echo ""
         err "Termux 环境但没有 TUN 设备"
         echo ""
+
         if [ "$ALLOW_TERMUX" = "1" ]; then
             warn "ALLOW_TERMUX=1 已设置，继续安装（启动可能失败）"
             return 0
         fi
+
         echo "  ┌─ 未 root ─────────────────────────────────"
         echo "  │ 请用 n2n-termux（SOCKS5 模式，无需 root）"
         echo "  │   bash <(curl -fsSL https://raw.githubusercontent.com/goyo123321/n2n-termux/main/install.sh)"
         echo "  └────────────────────────────────────────────"
         echo ""
-        echo "  ┌─ 已 root ─────────────────────────────────"
-        echo "  │ 1. 确认 /dev/net/tun 存在："
-        echo "  │    su -c 'ls -la /dev/net/tun'"
-        echo "  │ 2. 如不存在，加载 tun 模块："
-        echo "  │    su -c 'insmod /system/lib/modules/tun.ko'"
-        echo "  │ 3. 重新运行本脚本"
-        echo "  │ 4. 或用 ALLOW_TERMUX=1 强制跳过检查"
+        echo "  ┌─ 已 root（推荐，按以下步骤修复）─────────────"
+        echo "  │ 1. 确认 root："
+        echo "  │    tsu -c 'id'    # 或 su -c 'id'"
+        echo "  │"
+        echo "  │ 2. 检查 /dev/net/tun 是否存在："
+        echo "  │    tsu -c 'ls -la /dev/net/tun'"
+        echo "  │"
+        echo "  │ 3. 如不存在，手动创建（Android 10+ 常见）："
+        echo "  │    tsu -c 'mkdir -p /dev/net'"
+        echo "  │    tsu -c 'mknod /dev/net/tun c 10 200'"
+        echo "  │    tsu -c 'chmod 600 /dev/net/tun'"
+        echo "  │"
+        echo "  │ 4. 或用 modprobe 加载 tun 模块（部分设备）："
+        echo "  │    tsu -c 'modprobe tun'"
+        echo "  │    tsu -c 'insmod /system/lib/modules/tun.ko' 2>/dev/null"
+        echo "  │"
+        echo "  │ 5. 重新运行本脚本"
         echo "  └────────────────────────────────────────────"
         echo ""
         exit 1
@@ -205,7 +232,9 @@ check_tun_capability() {
         err "未找到 /dev/net/tun 或 /dev/tun，无法创建 TUN 虚拟网卡"
         info "Linux 上修复："
         info "  sudo modprobe tun"
-        info "  ls -la /dev/net/tun"
+        info "  sudo mkdir -p /dev/net"
+        info "  sudo mknod /dev/net/tun c 10 200"
+        info "  sudo chmod 600 /dev/net/tun"
         exit 1
     fi
 }
@@ -276,31 +305,54 @@ stop_running_client() {
 install_binary() {
     local version="$1"
     mkdir -p "$INSTALL_DIR"
-    local url="${GITHUB_DL}/${version}/${BIN_FILE}"
-    log "下载: $url"
+
+    local primary_url="${GITHUB_DL}/${version}/${BIN_FILE}"
+    local legacy_bin="${BIN_FILE/n2n-go-client/n2n-client}"
+    legacy_bin="${legacy_bin/n2n-termux/n2n-client}"
+    local legacy_url="${GITHUB_DL}/${version}/${legacy_bin}"
 
     local tmp="${INSTALL_DIR}/.${BIN_NAME}.tmp.$$"
     trap 'rm -f "$tmp"' EXIT
 
+    local downloaded=0
+    local final_url=""
+
+    log "下载: $primary_url"
     if command -v curl >/dev/null 2>&1; then
-        if ! curl -fL --connect-timeout 10 --max-time 300 -o "$tmp" "$url" 2>&1; then
-            err "下载失败: $url"
-            err "请检查: https://github.com/${REPO}/releases"
-            exit 1
+        if curl -fL --connect-timeout 10 --max-time 300 -o "$tmp" "$primary_url" 2>/dev/null; then
+            downloaded=1; final_url="$primary_url"
         fi
     elif command -v wget >/dev/null 2>&1; then
-        if ! wget -O "$tmp" "$url"; then
-            err "下载失败: $url"
-            exit 1
+        if wget -q -O "$tmp" "$primary_url" 2>/dev/null; then
+            downloaded=1; final_url="$primary_url"
         fi
     else
         err "curl 和 wget 都不可用"
         exit 1
     fi
 
+    if [ "$downloaded" = "0" ] && [ "$legacy_bin" != "$BIN_FILE" ]; then
+        warn "新文件名 404，尝试旧文件名..."
+        log "下载: $legacy_url"
+        if command -v curl >/dev/null 2>&1; then
+            if curl -fL --connect-timeout 10 --max-time 300 -o "$tmp" "$legacy_url" 2>/dev/null; then
+                downloaded=1; final_url="$legacy_url"
+                warn "已回退到旧文件名"
+            fi
+        fi
+    fi
+
+    if [ "$downloaded" = "0" ]; then
+        err "下载失败"
+        err "  新名: $primary_url"
+        [ "$legacy_bin" != "$BIN_FILE" ] && err "  旧名: $legacy_url"
+        err "请检查: https://github.com/${REPO}/releases"
+        exit 1
+    fi
+
     if command -v file >/dev/null 2>&1; then
         if ! file "$tmp" | grep -q "ELF\|Mach-O"; then
-            err "下载的文件不是可执行文件，可能是 404 页面"
+            err "下载的文件不是可执行文件: $final_url"
             rm -f "$tmp"
             exit 1
         fi
@@ -312,41 +364,25 @@ install_binary() {
     ok "已安装: $BIN_PATH ($(du -h "$BIN_PATH" 2>/dev/null | cut -f1 || echo '?'))"
 }
 
-# ============================================================
-# 交互式配置（含重新配置选项）
-# ============================================================
 prompt_config() {
-    if [ "$NO_LAUNCH" = "1" ]; then
-        return 0
-    fi
+    if [ "$NO_LAUNCH" = "1" ]; then return 0; fi
 
-    # ★ 已有配置时的处理
     if [ -f "$CONFIG_FILE" ] && [ -z "$SIGNALING_URL" ]; then
-        # 方式 1：RESET=1 完全重置
         if [ "$RESET" = "1" ]; then
             warn "RESET=1，完全重置配置"
-            rm -f "$CONFIG_FILE"
-            rm -f "$INSTALL_DIR/client_id"
-            log "已删除 config.env 和 client_id"
+            rm -f "$CONFIG_FILE" "$INSTALL_DIR/client_id"
         fi
 
-        # 方式 2：KEEP_CONFIG=1 强制用旧配置
         if [ -f "$CONFIG_FILE" ] && [ "$KEEP_CONFIG" = "1" ]; then
             log "KEEP_CONFIG=1，强制使用已有配置"
-            set -a
-            # shellcheck disable=SC1090
-            source "$CONFIG_FILE"
-            set +a
+            set -a; source "$CONFIG_FILE"; set +a
             normalize_signaling_url
             return 0
         fi
 
-        # 方式 3：RECONFIG=1 强制重新配置
         if [ -f "$CONFIG_FILE" ] && [ "$RECONFIG" = "1" ]; then
             log "RECONFIG=1，强制重新配置"
-            # 不 source 旧配置，走下面的交互流程
         elif [ -f "$CONFIG_FILE" ]; then
-            # 方式 4：默认交互式询问
             log "检测到已有配置: $CONFIG_FILE"
             echo ""
             info "当前配置摘要："
@@ -356,19 +392,13 @@ prompt_config() {
                 echo '    CONNECT_TOKEN="***"（已设置）'
             fi
             echo ""
-
             local answer=""
             read_tty answer "是否重新配置？(Y=重新配置 / n=使用现有) [y/N] "
             case "$answer" in
-                y|Y|yes|Yes|YES)
-                    log "重新配置..."
-                    ;;
+                y|Y|yes|Yes|YES) log "重新配置..." ;;
                 *)
                     log "使用现有配置"
-                    set -a
-                    # shellcheck disable=SC1090
-                    source "$CONFIG_FILE"
-                    set +a
+                    set -a; source "$CONFIG_FILE"; set +a
                     normalize_signaling_url
                     return 0
                     ;;
@@ -487,11 +517,22 @@ EOF
     ok "启动脚本: $LAUNCHER"
 }
 
+# ============================================================
+# 启动（Termux + root 专项处理）
+# ============================================================
 launch_client() {
     if [ "$NO_LAUNCH" = "1" ]; then
         echo ""
         ok "安装完成（未启动）"
         info "启动: $LAUNCHER"
+        if [ "$HAS_ROOT" = "1" ] && [ "$IS_TERMUX" = "1" ]; then
+            case "$ROOT_METHOD" in
+                tsu)  info "Termux + root 启动: tsu -c $LAUNCHER" ;;
+                su)   info "Termux + root 启动: su -c $LAUNCHER" ;;
+                sudo) info "Termux + root 启动: sudo -E $LAUNCHER" ;;
+                direct) info "已是 root，直接: $LAUNCHER" ;;
+            esac
+        fi
         return 0
     fi
 
@@ -512,29 +553,42 @@ launch_client() {
         return 1
     fi
 
+    # 已经是 root：直接启动
     if [ "$(id -u)" = "0" ]; then
-        ok "启动中（root）..."
+        ok "启动中（root 直连 TUN 模式）..."
         exec "$LAUNCHER"
     fi
 
+    # Termux + root
     if [ "$IS_TERMUX" = "1" ]; then
-        if command -v tsu >/dev/null 2>&1; then
-            ok "启动中（tsu 提权）..."
-            exec tsu -c "$LAUNCHER"
-        elif command -v sudo >/dev/null 2>&1; then
-            ok "启动中（sudo 提权）..."
-            exec sudo -E "$LAUNCHER"
-        else
-            err "Termux 下有 TUN 但无提权工具"
-            info "安装 tsu：pkg install tsu"
-            exit 1
-        fi
+        case "$ROOT_METHOD" in
+            tsu)
+                ok "启动中（Termux TUN 模式，tsu 提权）..."
+                exec tsu -c "$LAUNCHER"
+                ;;
+            su)
+                ok "启动中（Termux TUN 模式，su 提权）..."
+                exec su -c "$LAUNCHER"
+                ;;
+            sudo)
+                ok "启动中（Termux TUN 模式，sudo 提权）..."
+                exec sudo -E "$LAUNCHER"
+                ;;
+            *)
+                err "Termux 下有 TUN 但无提权工具"
+                info "安装 tsu: pkg install tsu"
+                info "或手动: su -c '$LAUNCHER'"
+                info "或: tsu -c '$LAUNCHER'"
+                exit 1
+                ;;
+        esac
     elif [ "$IS_DARWIN" = "1" ] || [ "$IS_LINUX" = "1" ]; then
         if command -v sudo >/dev/null 2>&1; then
             warn "需要 root 权限创建 TUN，使用 sudo"
             exec sudo -E "$LAUNCHER"
         else
             err "需要 root，但 sudo 不可用"
+            info "切换到 root 后运行：$LAUNCHER"
             exit 1
         fi
     fi
@@ -550,7 +604,6 @@ main() {
     log "安装目录: $INSTALL_DIR"
     echo ""
 
-    # RESET 确认
     if [ "$RESET" = "1" ] && [ -f "$CONFIG_FILE" ]; then
         warn "RESET=1：将删除 $CONFIG_FILE 和 client_id"
         local confirm=""
