@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -195,8 +196,9 @@ func (e *Edge) startKeepalive() {
 
 // ============ P2P 通道保活 + 活性检测 ============
 
-const p2pKeepaliveInterval = 15 * time.Second
-const p2pIdleDeadMs = 60000
+// ★ 修复：15s → 10s，60s → 30s
+const p2pKeepaliveInterval = 10 * time.Second
+const p2pIdleDeadMs = 30000
 
 func (e *Edge) startP2PKeepalive() {
 	log.Printf("[P2P-Keepalive] 启动，每 %v 刷新 P2P 通道", p2pKeepaliveInterval)
@@ -234,6 +236,7 @@ func (e *Edge) sendP2PKeepalive() {
 
 		if st == ConnP2P || st == ConnP2PAvailable {
 			idleMs := now - p.lastRecvAt
+			// ★ 60s → 30s
 			if p.lastRecvAt > 0 && idleMs > p2pIdleDeadMs {
 				deadPeers = append(deadPeers, id)
 				continue
@@ -245,8 +248,10 @@ func (e *Edge) sendP2PKeepalive() {
 	e.peersMu.RUnlock()
 
 	for _, id := range deadPeers {
-		log.Printf("[P2P] %s 60s 无任何流量，判定 P2P 失效，强制降级", id)
-		e.relayMgr.ForceFallback(id, "no-traffic-60s")
+		// ★ 日志用常量
+		log.Printf("[P2P] %s %ds 无任何流量，判定 P2P 失效，强制降级",
+			id, p2pIdleDeadMs/1000)
+		e.relayMgr.ForceFallback(id, "no-traffic-30s")
 	}
 
 	for _, id := range alivePeers {
@@ -340,6 +345,7 @@ func (e *Edge) cancelFallbackTimer(peerID string) {
 	}
 }
 
+// ★ 修复：30s → 60s（给 TCP 更多验证时间）
 func (e *Edge) scheduleP2PAvailTimeout(peerID string) {
 	if e.relayMgr == nil || peerID == "" {
 		return
@@ -350,7 +356,7 @@ func (e *Edge) scheduleP2PAvailTimeout(peerID string) {
 		t.Stop()
 	}
 
-	t := time.AfterFunc(30*time.Second, func() {
+	t := time.AfterFunc(60*time.Second, func() {
 		e.p2pAvailTimersMu.Lock()
 		delete(e.p2pAvailTimers, peerID)
 		e.p2pAvailTimersMu.Unlock()
@@ -359,7 +365,7 @@ func (e *Edge) scheduleP2PAvailTimeout(peerID string) {
 			return
 		}
 		if e.relayMgr.GetState(peerID) == ConnP2PAvailable {
-			log.Printf("[P2P] %s P2PAvailable 超时 30s 未验证数据面，强制降级", peerID)
+			log.Printf("[P2P] %s P2PAvailable 超时 60s 未验证数据面，强制降级", peerID)
 			e.relayMgr.ForceFallback(peerID, "p2p-avail-timeout")
 		}
 	})
@@ -599,16 +605,14 @@ func main() {
 	edge.relayMgr = NewRelayManager(ws, edge.turnClient, edge)
 	edge.relayMgr.Report(10 * time.Second)
 
-	// ★ 改动 1：ws.SetHandlers 的 onBinary 回调加 N2NW 拦截
+	// ★ N2NW 二进制拦截
 	ws.SetHandlers(
 		edge.handleSignaling,
 		func(data []byte) {
-			// 拦截 N2NW 二进制帧（WS 中继数据面）
 			if len(data) >= 4 && string(data[:4]) == "N2NW" {
 				edge.handleAppStreamBinary(data)
 				return
 			}
-			// 裸 IPv4 包（兼容旧服务端 / 无目标 ID 的广播）
 			edge.enqueueTUN(data)
 		},
 	)
@@ -1305,6 +1309,7 @@ func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natTyp
 			p.LanEndpoints = sortedLAN
 		}
 	} else {
+		// 新建 peer 时优先用 LAN 初始化 UDPAddr
 		var initialUDP *net.UDPAddr
 		if len(sortedLAN) > 0 {
 			for _, lan := range sortedLAN {
@@ -1448,14 +1453,8 @@ func (e *Edge) reportP2PStatus(peerID string, status int) {
 
 // tunReadLoop 从 TUN 读出 IPv4 包，按 peer 状态选择 P2P / TURN / WS 中继发送。
 //
-// ★ 改动 2：WS 中继路径改用 N2NW 帧（显式携带目标 clientId），而非裸 IPv4：
-//   - 服务端无需解析 IPv4 头，直接按 peerId 精确路由
-//   - 多 peer 房间下不会广播，节省带宽
-//   - 帧头 peerId 由服务端重写为发送方 ID，接收方能识别来源
-//
-// 保留裸 IPv4 的唯一场景：target == nil（本机 VIP 表里没有该 dstIP，
-// 通常是小 UDP 包探测），此时拿不到目标 clientId，只能让服务端按
-// dstIP 查表。
+// ★ 修复：ICMP 分支绕过状态机（LAN → UDPAddr → TURN → WS）。
+//         其他协议（TCP/UDP）走 relayMgr 状态机（已加连续失败计数）。
 func (e *Edge) tunReadLoop(tun *TUNDevice) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -1476,7 +1475,11 @@ func (e *Edge) tunReadLoop(tun *TUNDevice) {
 				return
 			default:
 			}
-			log.Printf("[TUN] 读取错误: %v", err)
+			if isTransientReadError(err) {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			log.Printf("[TUN] 读错误，退出读循环: %v", err)
 			return
 		}
 		if n < 20 || buf[0]>>4 != 4 {
@@ -1495,13 +1498,13 @@ func (e *Edge) tunReadLoop(tun *TUNDevice) {
 		}
 		e.peersMu.RUnlock()
 
+		proto := 0
+		if n >= 10 {
+			proto = int(buf[9])
+		}
+
 		// ★ 无目标：仍发裸 IPv4，服务端按 dstIP 查表
-		//   限制 UDP 小包（ping/探测），避免误广播大流量
 		if target == nil {
-			proto := 0
-			if n >= 10 {
-				proto = int(buf[9])
-			}
 			if proto == 17 && n < 200 {
 				if e.ws != nil {
 					_ = e.ws.SendBinary(buf[:n])
@@ -1512,20 +1515,105 @@ func (e *Edge) tunReadLoop(tun *TUNDevice) {
 			continue
 		}
 
+		// ★★ ICMP 特殊处理：绕过状态机，优先 LAN
+		if proto == 1 {
+			e.sendICMPDirect(target, buf[:n])
+			if n >= 10 {
+				e.logTunForward(target.ClientID, dstIP, n, proto, true, ConnP2P)
+			}
+			continue
+		}
+
+		// 非 ICMP：走 relayMgr 状态机
 		state := ConnUnknown
 		if e.relayMgr != nil {
 			state = e.relayMgr.GetState(target.ClientID)
 		}
-		ok := e.relayMgr.SendToPeer(target.ClientID, buf[:n], target)
-		if n >= 10 {
-			e.logTunForward(target.ClientID, dstIP, n, int(buf[9]), ok, state)
+
+		if state == ConnTURN {
+			pktCopy := make([]byte, n)
+			copy(pktCopy, buf[:n])
+			targetID := target.ClientID
+			targetCopy := target
+			pktLen := n
+
+			safeGo("tun-send-turn", func() {
+				sent := false
+				if e.relayMgr != nil {
+					sent = e.relayMgr.SendToPeer(targetID, pktCopy, targetCopy)
+				}
+				e.logTunForward(targetID, dstIP, pktLen, proto, sent, ConnTURN)
+				if !sent && e.ws != nil {
+					frame := buildN2NWFrame(targetID, pktCopy)
+					_ = e.ws.SendBinary(frame)
+				}
+			})
+			continue
 		}
-		if !ok {
-			// ★ 改：WS 中继发 N2NW 帧（显式携带目标 clientId），
-			//   而非裸 IPv4，服务端无需解析 IPv4 头即可精确路由
+
+		sent := false
+		if e.relayMgr != nil {
+			sent = e.relayMgr.SendToPeer(target.ClientID, buf[:n], target)
+		}
+		if n >= 10 {
+			e.logTunForward(target.ClientID, dstIP, n, proto, sent, state)
+		}
+		if !sent && e.ws != nil {
 			frame := buildN2NWFrame(target.ClientID, buf[:n])
 			_ = e.ws.SendBinary(frame)
 		}
+	}
+}
+
+// sendICMPDirect 是 ICMP 专用的发送路径，绕过 relayMgr 状态机。
+//
+// 顺序：LAN → UDPAddr → TURN → WS
+// 效果：
+//   - LAN 通：稳定 6-10ms（不受 P2P/TURN 状态切换影响）
+//   - LAN 单向不通：60-90ms（公网 hairpin）
+//   - TURN 兜底：100-180ms（稳定，不跳）
+//   - WS 兜底：100-300ms（最后底线）
+//
+// ★ PC 特有：e.udpConn 是 *net.UDPConn，用 WriteToUDP。
+func (e *Edge) sendICMPDirect(target *PeerInfo, pkt []byte) {
+	if target == nil {
+		return
+	}
+
+	// 1. LAN 优先（核心修复）
+	if len(target.LanEndpoints) > 0 && e.udpConn != nil {
+		for _, lan := range target.LanEndpoints {
+			ra, err := net.ResolveUDPAddr("udp", lan)
+			if err != nil || ra == nil || ra.IP == nil {
+				continue
+			}
+			if _, err := e.udpConn.WriteToUDP(pkt, ra); err == nil {
+				return
+			}
+		}
+	}
+
+	// 2. UDPAddr（可能是 LAN，也可能是公网）
+	if target.UDPAddr != nil && e.udpConn != nil {
+		if _, err := e.udpConn.WriteToUDP(pkt, target.UDPAddr); err == nil {
+			return
+		}
+	}
+
+	// 3. TURN 兜底
+	if target.TurnRelayAddr != "" && e.turnClient != nil && e.turnClient.IsReady() {
+		relayAddr, err := net.ResolveUDPAddr("udp", target.TurnRelayAddr)
+		if err == nil {
+			if sendErr := e.turnClient.Send(pkt, relayAddr); sendErr == nil {
+				return
+			}
+		}
+	}
+
+	// 4. WS 中继（最后兜底）
+	if e.ws != nil {
+		frame := buildN2NWFrame(target.ClientID, pkt)
+		_ = e.ws.SendBinary(frame)
 	}
 }
 
@@ -1895,4 +1983,192 @@ func readNameservers(path string) []string {
 		}
 	}
 	return result
+}
+
+// ============ LAN 地址收集（内联） ============
+
+func collectLANEndpoints(port int, selfVIP string) []string {
+	var result []string
+	seen := make(map[string]bool)
+
+	add := func(ip4 net.IP) {
+		if ip4 == nil {
+			return
+		}
+		if selfVIP != "" && ip4.String() == selfVIP {
+			return
+		}
+		if isCGNATOverlay(ip4) {
+			return
+		}
+		if !isPrivateIPv4(ip4) {
+			return
+		}
+		if ip4.IsLoopback() || ip4.IsLinkLocalUnicast() {
+			return
+		}
+		ep := net.JoinHostPort(ip4.String(), strconv.Itoa(port))
+		if seen[ep] {
+			return
+		}
+		seen[ep] = true
+		result = append(result, ep)
+	}
+
+	if ip := detectOutboundIP(); ip != nil {
+		add(ip)
+	}
+
+	ifaces, err := net.Interfaces()
+	if err == nil {
+		for _, iface := range ifaces {
+			if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+				continue
+			}
+			addrs, err := iface.Addrs()
+			if err != nil {
+				continue
+			}
+			for _, addr := range addrs {
+				var ip net.IP
+				switch v := addr.(type) {
+				case *net.IPNet:
+					ip = v.IP
+				case *net.IPAddr:
+					ip = v.IP
+				}
+				if ip == nil || ip.To4() == nil {
+					continue
+				}
+				add(ip.To4())
+			}
+		}
+	}
+
+	return result
+}
+
+func detectOutboundIP() net.IP {
+	targets := []string{
+		"8.8.8.8:80",
+		"1.1.1.1:80",
+		"114.114.114.114:80",
+	}
+	for _, t := range targets {
+		conn, err := net.Dial("udp4", t)
+		if err != nil {
+			continue
+		}
+		localAddr, ok := conn.LocalAddr().(*net.UDPAddr)
+		_ = conn.Close()
+		if !ok || localAddr == nil || localAddr.IP == nil {
+			continue
+		}
+		ip4 := localAddr.IP.To4()
+		if ip4 != nil {
+			return ip4
+		}
+	}
+	return nil
+}
+
+func isPrivateIPv4(ip net.IP) bool {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return false
+	}
+	if ip4[0] == 10 {
+		return true
+	}
+	if ip4[0] == 172 && ip4[1] >= 16 && ip4[1] <= 31 {
+		return true
+	}
+	if ip4[0] == 192 && ip4[1] == 168 {
+		return true
+	}
+	return false
+}
+
+func isCGNATOverlay(ip net.IP) bool {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return false
+	}
+	return ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127
+}
+
+func localPrefixes(selfVIP string) []*net.IPNet {
+	var result []*net.IPNet
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			ipnet, ok := addr.(*net.IPNet)
+			if !ok || ipnet.IP.To4() == nil {
+				continue
+			}
+			ip4 := ipnet.IP.To4()
+			if isCGNATOverlay(ip4) {
+				continue
+			}
+			if selfVIP != "" && ip4.String() == selfVIP {
+				continue
+			}
+			if !isPrivateIPv4(ip4) {
+				continue
+			}
+			if ip4.IsLoopback() || ip4.IsLinkLocalUnicast() {
+				continue
+			}
+			result = append(result, ipnet)
+		}
+	}
+	return result
+}
+
+func sortLANByAffinity(lan []string, prefixes []*net.IPNet) []string {
+	if len(lan) < 2 || len(prefixes) == 0 {
+		return lan
+	}
+	type entry struct {
+		ep    string
+		score int
+	}
+	scored := make([]entry, len(lan))
+	for i, ep := range lan {
+		host, _, err := net.SplitHostPort(ep)
+		if err != nil {
+			host = ep
+		}
+		ip := net.ParseIP(host)
+		score := 0
+		if ip != nil && !isCGNATOverlay(ip) {
+			for _, p := range prefixes {
+				if p.Contains(ip) {
+					ones, _ := p.Mask.Size()
+					if ones > score {
+						score = ones
+					}
+				}
+			}
+		}
+		scored[i] = entry{ep, score}
+	}
+	sort.SliceStable(scored, func(i, j int) bool {
+		return scored[i].score > scored[j].score
+	})
+	out := make([]string, len(scored))
+	for i, s := range scored {
+		out[i] = s.ep
+	}
+	return out
 }
