@@ -67,14 +67,28 @@ func (e *Edge) peerAddrAndMode(peerID string) (*net.UDPAddr, bool) {
 
 // handleP2PFrame 收到 N2NS 帧时的入口。
 //
-// ★ LAN 优先 + 30 秒窗口 + lastLANRecvAt > 0 检查
+// ★ P0 修复：PING/PONG 状态机（与 PC / Termux 对齐）
 //
-// ★★ 补丁 2（本次修复）：LAN→公网切换窗口 300000（5 分钟）→ 30000（30 秒）。
+// 旧 Android 行为：
+//   - 收到 PING → 回 PONG + 自己升 P2P
+//   - 后果：单向 P2P（A→B 通、B→A 断）时 B 误以为双向可达，
+//           向 A 发数据全部丢失，卡在 P2P 丢包，无法降级
 //
-//	旧版 5 分钟窗口意味着 WiFi 一断（信道切换、2.4G 干扰、路由器 buffering），
-//	LAN 侧只要连续 5 分钟没收到包就固化公网，导致 ping 从 5ms 跳 200ms，
-//	并且要等下一个 LAN 帧回来才能切回。
-//	30 秒窗口让 LAN 恢复后能快速切回，符合实际 WiFi 抖动场景。
+// 新行为：
+//   - 收到 PING → 只更新 lastRecvAt（由调用方已完成），不升级、不回 PONG
+//   - 收到 PONG → 升级 P2P（证明双向可达）
+//   - 收到数据帧 → 升级 P2P（数据面已验证）
+//
+// ★ P1 修复（本次）：区分 PONG / 数据帧的 viaTURN 来源
+//
+//   旧版：无论 PONG 从 UDP 直连还是 TURN 到达，都 MarkP2P。
+//         跨网络场景下，PONG 只能通过 TURN 到达，但仍被标记成 P2P，
+//         导致面板显示假 p2p，实际数据走 TURN。
+//
+//   新版：
+//     - viaTURN=false 的 PONG → MarkP2P（真 P2P）
+//     - viaTURN=true  的 PONG → 保持 P2PAvailable（不标记 P2P），
+//                          让 60s 超时自然降级到 TURN
 func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) {
 	if e.p2pStreams == nil {
 		return
@@ -105,7 +119,6 @@ func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) 
 				shouldUpdate = true
 				p.lastLANRecvAt = now
 			} else if oldIsLAN && !newIsLAN {
-				// ★★ 补丁 2：5 分钟 → 30 秒
 				if p.lastLANRecvAt > 0 && now-p.lastLANRecvAt > 30000 {
 					shouldUpdate = true
 					log.Printf("[P2P] %s LAN 地址超过 30s 无流量，改用公网地址", peerID)
@@ -129,19 +142,33 @@ func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) 
 		e.peersMu.Unlock()
 	}
 
+	// ★ P0 + P1 修复：区分 viaTURN 来源
 	if e.relayMgr != nil {
 		switch f.Type {
 		case p2pTypePING:
+			// 静默：只更新 lastRecvAt（上方已完成）
+			// PONG 由 p2pStreams.handleFrame 统一回复
+
 		case p2pTypePONG:
 			if e.relayMgr.GetState(peerID) != ConnP2P {
-				log.Printf("[P2P] 收到 PONG → P2P 直连（双向通道已验证）")
-				e.relayMgr.MarkP2P(peerID)
+				if !viaTURN {
+					log.Printf("[P2P] 收到 PONG（UDP 直连）→ P2P 直连（双向通道已验证）")
+					e.relayMgr.MarkP2P(peerID)
+				} else {
+					log.Printf("[TURN] 通过 TURN 收到 PONG → 保持 P2PAvailable（不标记 P2P，等待直连 PONG）")
+				}
 			}
+
 		default:
 			if e.relayMgr.GetState(peerID) != ConnP2P {
-				log.Printf("[P2P] 收到数据帧（stream=%d type=%d）→ P2P 直连",
-					f.StreamID, f.Type)
-				e.relayMgr.MarkP2P(peerID)
+				if !viaTURN {
+					log.Printf("[P2P] 收到数据帧（stream=%d type=%d）→ P2P 直连",
+						f.StreamID, f.Type)
+					e.relayMgr.MarkP2P(peerID)
+				} else {
+					log.Printf("[TURN] 通过 TURN 收到数据帧（stream=%d type=%d）→ 保持当前状态",
+						f.StreamID, f.Type)
+				}
 			}
 		}
 	}
