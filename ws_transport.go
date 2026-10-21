@@ -13,8 +13,7 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// ★ 新增：读超时。
-//   客户端每 20 秒发一次 ping，服务端立即回 pong。
+// ★ 读超时：客户端每 20 秒发一次 ping，服务端立即回 pong。
 //   90 秒内没收到任何消息（包括 pong）→ 认为下行通道已死 → 主动重连。
 const wsReadTimeout = 90 * time.Second
 
@@ -152,13 +151,11 @@ func maskToken(u string) string {
 	return parts[0] + "token=***"
 }
 
-// readLoop 断线自动重连（指数退避，封顶 5 分钟，无限重试）。
+// readLoop 断线自动重连。
 //
-// ★ 修复：每次读之前设置 90 秒读超时。
-//   场景：客户端网络抖动后，下行通道可能"僵死"——
-//   底层 TCP 表面正常，但服务端发的消息到达不了客户端。
-//   这时客户端发 ping 依然成功（上行 OK），但收不到 pong。
-//   设置读超时后，90 秒无任何消息会触发重连。
+// ★ 修复：每次读之前设置 90 秒读超时，检测下行僵死。
+// ★ P1 修复：重连成功后显式发送 _reconnected 消息，
+//   触发 handleSignaling 里的清理分支，消除死代码。
 func (ws *WSTransport) readLoop() {
 	backoff := 1 * time.Second
 	const maxBackoff = 5 * time.Minute
@@ -200,10 +197,12 @@ func (ws *WSTransport) readLoop() {
 			if ws.onReconnect != nil {
 				ws.onReconnect()
 			}
+			// ★ P1 修复：显式发送 _reconnected 消息，触发 handleSignaling 的清理分支
+			//   与 Android 端 tryReconnect 的行为对齐，消除死代码
+			ws.routeText(map[string]interface{}{"type": "_reconnected"})
 			continue
 		}
 
-		// ★ 设置读超时
 		_ = conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
 		msgType, data, err := conn.ReadMessage()
 		if err != nil {
@@ -230,7 +229,7 @@ func (ws *WSTransport) readLoop() {
 			if err := json.Unmarshal(data, &msg); err != nil {
 				continue
 			}
-			// ★ 服务端主动 ping，立即回 pong
+			// 服务端主动 ping，立即回 pong
 			if t, _ := msg["type"].(string); t == "server_ping" {
 				_ = ws.Send(map[string]interface{}{"type": "server_pong"})
 				continue
