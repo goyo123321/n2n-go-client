@@ -109,6 +109,9 @@ type Edge struct {
 
 	lastMetadataReportAt int64
 
+	// ★ P0-3：最近一次真实数据帧发送时间（用于自适应保活）
+	lastDataFrameAt int64
+
 	streamMgr  *AppStreamManager
 	p2pStreams *P2PStreamManager
 	socks5Srv  *Socks5Server
@@ -174,6 +177,7 @@ func buildSTUNBindingRequest() []byte {
 	return buf
 }
 
+// ★ P0-3 自适应保活：最近 10s 有真实数据帧 → 跳过 STUN
 func (e *Edge) startKeepalive() {
 	if e.udpConn == nil {
 		return
@@ -190,11 +194,16 @@ func (e *Edge) startKeepalive() {
 		return
 	}
 
-	log.Printf("[Keepalive] 启动，每 %v 刷新 %d 个 STUN 服务器（无条件，保 CGNAT 映射）",
+	log.Printf("[Keepalive] 启动，每 %v 刷新 %d 个 STUN 服务器（自适应：有数据时跳过）",
 		keepaliveInterval, len(addrs))
 
 	safeGo("keepalive", func() {
 		sendOnce := func() {
+			// ★ 自适应：10s 内有数据帧 → 跳过（真实数据天然刷新映射）
+			last := atomic.LoadInt64(&e.lastDataFrameAt)
+			if last > 0 && time.Now().UnixMilli()-last < 10000 {
+				return
+			}
 			for _, addr := range addrs {
 				probe := buildSTUNBindingRequest()
 				_, _ = e.udpConn.WriteToUDP(probe, addr)
@@ -452,6 +461,15 @@ func extractIPFromEndpoint(ep string) string {
 		return ep
 	}
 	return ep[:i]
+}
+
+func lastIndexByte(s string, c byte) int {
+	for i := len(s) - 1; i >= 0; i-- {
+		if s[i] == c {
+			return i
+		}
+	}
+	return -1
 }
 
 // ============ 主函数 ============
@@ -1097,6 +1115,18 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 				log.Printf("[信令] 节点上线: %s (vip=%s)", from, pip)
 			}
 			e.logPeerReady(from)
+
+			// ★ P0-2 预连接：立即发一次 PING 试探（不等打洞指令）
+			if e.p2pStreams != nil && e.relayMgr != nil {
+				if e.relayMgr.GetState(from) != ConnP2P {
+					targetID := from
+					safeGo("p2p-preconnect", func() {
+						time.Sleep(200 * time.Millisecond)
+						e.p2pStreams.sendP2PProbe(targetID)
+						log.Printf("[P2P] 预连接试探 → %s", targetID)
+					})
+				}
+			}
 		}
 
 	case "nat_hole_instruction":
@@ -1476,8 +1506,8 @@ func (e *Edge) reportP2PStatus(peerID string, status int) {
 
 // tunReadLoop 从 TUN 读出 IPv4 包，按 peer 状态选择 P2P / TURN / WS 中继发送。
 //
-// ★ 修复：ICMP 分支绕过状态机（LAN → UDPAddr → TURN → WS）。
-//         其他协议（TCP/UDP）走 relayMgr 状态机（已加连续失败计数）。
+// ★ ICMP 分支绕过状态机（LAN → UDPAddr → TURN → WS）。
+// ★ P0-3：发送数据后更新 lastDataFrameAt（自适应保活用）。
 func (e *Edge) tunReadLoop(tun *TUNDevice) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -1541,6 +1571,8 @@ func (e *Edge) tunReadLoop(tun *TUNDevice) {
 		// ★★ ICMP 特殊处理：绕过状态机，优先 LAN
 		if proto == 1 {
 			e.sendICMPDirect(target, buf[:n])
+			// ★ P0-3：ICMP 也算数据帧
+			atomic.StoreInt64(&e.lastDataFrameAt, time.Now().UnixMilli())
 			if n >= 10 {
 				e.logTunForward(target.ClientID, dstIP, n, proto, true, ConnP2P)
 			}
@@ -1566,6 +1598,10 @@ func (e *Edge) tunReadLoop(tun *TUNDevice) {
 					sent = e.relayMgr.SendToPeer(targetID, pktCopy, targetCopy)
 				}
 				e.logTunForward(targetID, dstIP, pktLen, proto, sent, ConnTURN)
+				if sent {
+					// ★ P0-3：更新数据帧时间戳
+					atomic.StoreInt64(&e.lastDataFrameAt, time.Now().UnixMilli())
+				}
 				if !sent && e.ws != nil {
 					frame := buildN2NWFrame(targetID, pktCopy)
 					_ = e.ws.SendBinary(frame)
@@ -1578,12 +1614,17 @@ func (e *Edge) tunReadLoop(tun *TUNDevice) {
 		if e.relayMgr != nil {
 			sent = e.relayMgr.SendToPeer(target.ClientID, buf[:n], target)
 		}
+		if sent {
+			// ★ P0-3：更新数据帧时间戳
+			atomic.StoreInt64(&e.lastDataFrameAt, time.Now().UnixMilli())
+		}
 		if n >= 10 {
 			e.logTunForward(target.ClientID, dstIP, n, proto, sent, state)
 		}
 		if !sent && e.ws != nil {
 			frame := buildN2NWFrame(target.ClientID, buf[:n])
 			_ = e.ws.SendBinary(frame)
+			atomic.StoreInt64(&e.lastDataFrameAt, time.Now().UnixMilli())
 		}
 	}
 }
