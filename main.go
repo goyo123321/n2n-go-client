@@ -28,6 +28,70 @@ var (
 
 const DefaultVirtualCIDR = "10.64.0.0/24"
 
+// ============================================================
+// ★ 方案 C：仅 Termux 环境启用 DNS/TLS 修复
+//
+// 从 n2n-termux 移植：
+//   - initTermuxCA：自动探测 Termux 的 CA 证书，设置 SSL_CERT_FILE
+//   - setupResolver：自动过滤本地回环 DNS，fallback 公网 DNS
+//
+// PC / macOS / Windows 通过 isTermux() 返回 false，
+// 这两个函数都不会执行，100% 零影响。
+// ============================================================
+
+func init() {
+	if isTermux() {
+		initTermuxCA()
+	}
+}
+
+// isTermux 判断是否在 Termux 环境
+func isTermux() bool {
+	prefix := os.Getenv("PREFIX")
+	if prefix == "" {
+		prefix = os.Getenv("TERMUX_PREFIX")
+	}
+	return prefix != "" && strings.Contains(prefix, "com.termux")
+}
+
+func initTermuxCA() {
+	if os.Getenv("SSL_CERT_FILE") != "" {
+		return
+	}
+
+	prefix := os.Getenv("PREFIX")
+	if prefix == "" {
+		prefix = os.Getenv("TERMUX_PREFIX")
+	}
+	if prefix == "" {
+		prefix = "/data/data/com.termux/files/usr"
+	}
+
+	candidates := []string{
+		prefix + "/etc/tls/cert.pem",
+		prefix + "/etc/ca-certificates/ca-bundle.crt",
+		prefix + "/etc/ssl/certs/ca-certificates.crt",
+		prefix + "/etc/ssl/cert.pem",
+		"/data/data/com.termux/files/usr/etc/tls/cert.pem",
+		"/data/data/com.termux/files/usr/etc/ssl/certs/ca-certificates.crt",
+	}
+
+	for _, p := range candidates {
+		if st, err := os.Stat(p); err == nil && !st.IsDir() && st.Size() > 0 {
+			_ = os.Setenv("SSL_CERT_FILE", p)
+			fmt.Fprintf(os.Stderr, "[TLS] CA 证书: %s (%d bytes)\n", p, st.Size())
+			return
+		}
+	}
+
+	fmt.Fprintf(os.Stderr, "[TLS] ⚠️ 未找到 CA 证书，HTTPS/WSS 可能失败\n")
+	fmt.Fprintf(os.Stderr, "[TLS]    修复: pkg install ca-certificates\n")
+}
+
+// ============================================================
+// LAN 缓存
+// ============================================================
+
 var (
 	lanCacheMu   sync.Mutex
 	lanCache     []string
@@ -52,6 +116,10 @@ func loadLANCache() []string {
 	}
 	return append([]string(nil), lanCache...)
 }
+
+// ============================================================
+// 数据结构
+// ============================================================
 
 type PeerInfo struct {
 	ClientID          string
@@ -470,6 +538,12 @@ func lastIndexByte(s string, c byte) int {
 // ============ 主函数 ============
 
 func main() {
+	// ★ 方案 C：只在 Termux 环境启用 DNS 修复
+	//   PC / macOS / Windows 完全跳过，100% 零影响
+	if isTermux() {
+		setupResolver()
+	}
+
 	signalingURL := getEnv("SIGNALING_URL", DefaultSignalingURL)
 	roomId := getEnv("ROOM_ID", "default-room")
 	clientId := getEnv("CLIENT_ID", "")
@@ -793,6 +867,8 @@ func (e *Edge) Stop() {
 	}
 }
 
+// ============ p2p_metadata 上报（含 features） ============
+
 func (e *Edge) reportMetadata() {
 	if e.ws == nil || e.natMeta == nil {
 		return
@@ -940,6 +1016,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 	if t == "_reconnected" {
 		log.Printf("[信令] WebSocket 重连成功，重新上报元数据")
 
+		// ★ P1 修复：同时清空 failCounts 和 natHoleActive
 		natHoleActiveMu.Lock()
 		count := len(failCounts)
 		if count > 0 {
@@ -1283,16 +1360,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 	}
 }
 
-// ★ P0 修复：maybeResetFailCountForPeer 只在 IP 变化时清空连接状态
-//
-// 服务端 room.ts 只在 IP 变化时 clearPairStateFor；Android 端也已经
-// 区分 IP / 端口。PC 和 Termux 之前是无条件 ClearPeer——HardNAT 下
-// 端口漂移频繁时，会导致每次 joined / ready 都清空 P2P 状态，
-// P2P 通道反复断开重连。
-//
-// 修复后：
-//   - IP 变化（可能换了网络环境）→ 清空连接状态，重新打洞
-//   - 仅端口漂移（CGNAT 常见）→ 保留 P2P 状态，P2P 通道通常仍可用
+// ★ P0 修复：只在 IP 变化时清空连接状态，端口漂移保留 P2P 状态
 func (e *Edge) maybeResetFailCountForPeer(peerID, newPubIP string, newPubPort int) {
 	if peerID == "" || newPubIP == "" || newPubPort <= 0 {
 		return
@@ -2013,7 +2081,17 @@ func splitCSV(s string) []string {
 	return out
 }
 
-// ============ DNS 修复（Termux 专用，PC 上无害） ============
+// ============================================================
+// ★ 方案 C：setupResolver 只在 Termux 环境被调用
+//
+// 行为：
+//   1. 读 Termux 的 resolv.conf
+//   2. 过滤本地回环 DNS（::1 / 127.0.0.1）
+//   3. 过滤后为空 → fallback 公网 DNS
+//   4. 过滤后非空 → 用这些 DNS
+//
+// PC / macOS / Windows 不会调用此函数（isTermux() 返回 false）。
+// ============================================================
 
 func setupResolver() {
 	prefix := os.Getenv("PREFIX")
@@ -2041,19 +2119,36 @@ func setupResolver() {
 		}
 	}
 
-	if len(nameservers) == 0 {
-		nameservers = []string{"8.8.8.8:53", "1.1.1.1:53", "114.114.114.114:53"}
-		source = "<fallback>"
+	// ★ 过滤本地回环 DNS
+	filtered := make([]string, 0, len(nameservers))
+	for _, ns := range nameservers {
+		host := ns
+		if h, _, err := net.SplitHostPort(ns); err == nil {
+			host = h
+		}
+		host = strings.Trim(host, "[]")
+		if host == "::1" || host == "127.0.0.1" || host == "localhost" {
+			continue
+		}
+		filtered = append(filtered, ns)
 	}
 
-	log.Printf("[DNS] 使用 %s 的 %d 个 nameserver: %v", source, len(nameservers), nameservers)
+	if len(filtered) == 0 {
+		filtered = []string{"8.8.8.8:53", "1.1.1.1:53", "114.114.114.114:53"}
+		if source == "" {
+			source = "<empty>"
+		}
+		source += " (filtered local, using public)"
+	}
+
+	log.Printf("[DNS] 使用 %s 的 %d 个 nameserver: %v", source, len(filtered), filtered)
 
 	var idx uint32
 	net.DefaultResolver = &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
 			n := atomic.AddUint32(&idx, 1)
-			ns := nameservers[int(n)%len(nameservers)]
+			ns := filtered[int(n)%len(filtered)]
 
 			netProto := "udp"
 			if strings.HasPrefix(network, "tcp") {
