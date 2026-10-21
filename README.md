@@ -131,7 +131,7 @@ sudo ./n2n-go-client
 
 ## 📦 二进制命名说明
 
-从 **v1.3.0** 起，Release 二进制名带 `n2n-go-client-` 前缀，与 `n2n-termux` 区分：
+从 **v1.0.30** 起，Release 二进制名带 `n2n-go-client-` 前缀，与 `n2n-termux` 区分：
 
 | 项目 | 二进制名 |
 |:---|:---|
