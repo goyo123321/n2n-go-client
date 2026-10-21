@@ -6,21 +6,6 @@
 #   curl -fsSL https://raw.githubusercontent.com/goyo123321/n2n-go-client/main/install.sh -o ~/install_n2n.sh
 #   bash ~/install_n2n.sh
 #
-# 安装路径：默认在当前工作目录下创建 .n2n-go（可用 INSTALL_DIR 覆盖）
-#
-# 重新配置：
-#   bash ~/install_n2n.sh                  # 交互式询问
-#   RECONFIG=1 bash ~/install_n2n.sh       # 强制重新配置
-#   KEEP_CONFIG=1 bash ~/install_n2n.sh    # 强制使用现有配置
-#   RESET=1 bash ~/install_n2n.sh          # 完全重置
-#
-# 适用场景：
-#   ✅ Linux 服务器 / 树莓派 / 路由器（有 TUN + root）
-#   ✅ macOS（有 utun + sudo）
-#   ✅ Windows（管理员 + wintun）
-#   ✅ Termux + root（有 /dev/net/tun + tsu/su）  ← 本版增强
-#   ❌ Termux 无 root（没有 TUN） → 请用 n2n-termux
-#
 
 set -eu
 
@@ -67,7 +52,7 @@ IS_TERMUX=0
 IS_LINUX=0
 IS_DARWIN=0
 HAS_ROOT=0
-ROOT_METHOD=""    # ★ 新增：记录提权方式（tsu/su/sudo/direct）
+ROOT_METHOD=""
 HAS_TUN=0
 ARCH=""
 BIN_FILE=""
@@ -154,10 +139,47 @@ detect_env() {
 }
 
 # ============================================================
+# ★ 方案 C：Termux CA 证书自动检测与安装
+#   非 Termux 环境直接跳过，零影响
+# ============================================================
+ensure_ca_certs() {
+    if [ "$IS_TERMUX" != "1" ]; then
+        return 0
+    fi
+
+    local ca_paths=(
+        "${PREFIX:-/data/data/com.termux/files/usr}/etc/tls/cert.pem"
+        "${PREFIX:-/data/data/com.termux/files/usr}/etc/ssl/certs/ca-certificates.crt"
+        "${PREFIX:-/data/data/com.termux/files/usr}/etc/ca-certificates/ca-bundle.crt"
+    )
+
+    for p in "${ca_paths[@]}"; do
+        if [ -f "$p" ] && [ -s "$p" ]; then
+            log "CA 证书已存在: $p"
+            return 0
+        fi
+    done
+
+    warn "未找到 CA 证书（WSS 连接会失败），正在安装 ca-certificates..."
+    if command -v pkg >/dev/null 2>&1; then
+        pkg install -y ca-certificates 2>&1 | tail -3 || true
+    fi
+
+    for p in "${ca_paths[@]}"; do
+        if [ -f "$p" ] && [ -s "$p" ]; then
+            ok "CA 证书安装成功: $p"
+            return 0
+        fi
+    done
+
+    warn "CA 证书安装失败，WSS 可能报 x509 错误"
+    warn "手动修复: pkg install ca-certificates"
+}
+
+# ============================================================
 # TUN 能力检测（Termux + root 专项）
 # ============================================================
 check_tun_capability() {
-    # 1. 检测提权方式（按优先级：已 root → tsu → sudo → su）
     if [ "$(id -u)" = "0" ]; then
         HAS_ROOT=1
         ROOT_METHOD="direct"
@@ -172,7 +194,6 @@ check_tun_capability() {
         ROOT_METHOD="su"
     fi
 
-    # 2. 检测 TUN
     if [ -e "/dev/net/tun" ]; then
         HAS_TUN=1
         log "检测到 /dev/net/tun"
@@ -181,7 +202,6 @@ check_tun_capability() {
         log "检测到 /dev/tun"
     fi
 
-    # 3. 有 TUN → 直接通过
     if [ "$HAS_TUN" = "1" ]; then
         ok "TUN 设备可用"
         if [ "$HAS_ROOT" = "1" ]; then
@@ -192,7 +212,6 @@ check_tun_capability() {
         return 0
     fi
 
-    # 4. 无 TUN
     if [ "$IS_TERMUX" = "1" ]; then
         echo ""
         err "Termux 环境但没有 TUN 设备"
@@ -289,12 +308,10 @@ stop_running_client() {
         pids=$(pgrep -f "${INSTALL_DIR}/${BIN_NAME}" 2>/dev/null || true)
         if [ -n "$pids" ]; then
             log "停止运行中的客户端 (PID: $pids)"
-            # shellcheck disable=SC2086
             kill $pids 2>/dev/null || true
             sleep 1
             pids=$(pgrep -f "${INSTALL_DIR}/${BIN_NAME}" 2>/dev/null || true)
             if [ -n "$pids" ]; then
-                # shellcheck disable=SC2086
                 kill -9 $pids 2>/dev/null || true
             fi
             ok "旧进程已停止"
@@ -491,12 +508,15 @@ EOF
     ok "配置已保存: $CONFIG_FILE"
 }
 
+# ============================================================
+# ★ 方案 C：write_launcher 里注入 SSL_CERT_FILE
+#   只在 Termux 环境生效，PC/macOS/Windows 完全跳过
+# ============================================================
 write_launcher() {
     cat > "$LAUNCHER" <<EOF
 #!/usr/bin/env bash
 set -eu
 
-# 自动推导安装目录（start.sh 所在目录），从任意目录调用都能工作
 if [ -z "\${INSTALL_DIR:-}" ]; then
     INSTALL_DIR="\$(cd "\$(dirname "\$0")" && pwd)"
 fi
@@ -507,8 +527,17 @@ BIN="\$INSTALL_DIR/${BIN_NAME}"
 if [ ! -f "\$CONFIG_FILE" ]; then echo "配置文件不存在: \$CONFIG_FILE"; exit 1; fi
 if [ ! -x "\$BIN" ]; then echo "二进制不存在: \$BIN"; exit 1; fi
 
+# ★ 方案 C：Termux 下强制设置 SSL_CERT_FILE
+if [ -n "\${PREFIX:-}" ] && [[ "\$PREFIX" == *"com.termux"* ]]; then
+    for ca in "\$PREFIX/etc/tls/cert.pem" "\$PREFIX/etc/ssl/certs/ca-certificates.crt" "\$PREFIX/etc/ca-certificates/ca-bundle.crt"; do
+        if [ -f "\$ca" ] && [ -s "\$ca" ]; then
+            export SSL_CERT_FILE="\$ca"
+            break
+        fi
+    done
+fi
+
 set -a
-# shellcheck disable=SC1090
 source "\$CONFIG_FILE"
 set +a
 exec "\$BIN" "\$@"
@@ -517,9 +546,6 @@ EOF
     ok "启动脚本: $LAUNCHER"
 }
 
-# ============================================================
-# 启动（Termux + root 专项处理）
-# ============================================================
 launch_client() {
     if [ "$NO_LAUNCH" = "1" ]; then
         echo ""
@@ -553,13 +579,11 @@ launch_client() {
         return 1
     fi
 
-    # 已经是 root：直接启动
     if [ "$(id -u)" = "0" ]; then
         ok "启动中（root 直连 TUN 模式）..."
         exec "$LAUNCHER"
     fi
 
-    # Termux + root
     if [ "$IS_TERMUX" = "1" ]; then
         case "$ROOT_METHOD" in
             tsu)
@@ -615,6 +639,7 @@ main() {
     fi
 
     detect_env
+    ensure_ca_certs     # ★ 方案 C：Termux CA 检测
     check_tun_capability
 
     local installed latest need_update
