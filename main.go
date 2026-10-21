@@ -68,6 +68,7 @@ type PeerInfo struct {
 	probeReplied      bool
 	AssistedEndpoints []string
 	LanEndpoints      []string
+	Features          []string
 }
 
 type Edge struct {
@@ -109,10 +110,8 @@ type Edge struct {
 
 	lastMetadataReportAt int64
 
-	// ★ P0-3：最近一次真实数据帧发送时间（用于自适应保活）
 	lastDataFrameAt int64
 
-	// ★ Bug 2 修复：已上报 P2P 状态的目标（避免并行指令重复上报 p2p_status=3）
 	p2pStatusReported   map[string]bool
 	p2pStatusReportedMu sync.Mutex
 
@@ -179,7 +178,6 @@ func buildSTUNBindingRequest() []byte {
 	return buf
 }
 
-// ★ P0-3 自适应保活：最近 10s 有真实数据帧 → 跳过 STUN
 func (e *Edge) startKeepalive() {
 	if e.udpConn == nil {
 		return
@@ -531,7 +529,7 @@ func main() {
 		p2pAvailTimers:    make(map[string]*time.Timer),
 		lastNoPeerLog:     make(map[string]int64),
 		tunStateLog:       make(map[string]ConnType),
-		p2pStatusReported: make(map[string]bool), // ★ Bug 2 修复
+		p2pStatusReported: make(map[string]bool),
 		doneCh:            make(chan struct{}),
 	}
 	edge.punchAckLimiter = newPunchAckLimiter()
@@ -593,7 +591,6 @@ func main() {
 			edge.streamMgr.closeAll()
 		}
 
-		// ★ Bug 2 修复：清空去重标记
 		edge.p2pStatusReportedMu.Lock()
 		edge.p2pStatusReported = make(map[string]bool)
 		edge.p2pStatusReportedMu.Unlock()
@@ -605,14 +602,20 @@ func main() {
 		edge.p2pAvailTimers = make(map[string]*time.Timer)
 		edge.p2pAvailTimersMu.Unlock()
 
+		// ★ P1 修复：同时清空 failCounts 和 natHoleActive
 		natHoleActiveMu.Lock()
 		failCount := len(failCounts)
 		if failCount > 0 {
 			failCounts = make(map[string]int)
 		}
+		nActive := len(natHoleActive)
+		if nActive > 0 {
+			natHoleActive = make(map[string]bool)
+		}
 		natHoleActiveMu.Unlock()
-		if failCount > 0 {
-			log.Printf("[NAT-HOLE] WS 重连，清空 %d 个 peer 的失败计数", failCount)
+		if failCount > 0 || nActive > 0 {
+			log.Printf("[NAT-HOLE] WS 重连，清空 %d 个失败计数 / %d 个 in-flight 标记",
+				failCount, nActive)
 		}
 
 		if edge.getVirtualIPLocked() != "" {
@@ -649,13 +652,15 @@ func main() {
 	edge.relayMgr = NewRelayManager(ws, edge.turnClient, edge)
 	edge.relayMgr.Report(10 * time.Second)
 
-	// ★ N2NW 二进制拦截
 	ws.SetHandlers(
 		edge.handleSignaling,
 		func(data []byte) {
-			if len(data) >= 4 && string(data[:4]) == "N2NW" {
-				edge.handleAppStreamBinary(data)
-				return
+			if len(data) >= 4 {
+				magic := string(data[:4])
+				if magic == "N2NW" || magic == "N2NA" {
+					edge.handleAppStreamBinary(data)
+					return
+				}
 			}
 			edge.enqueueTUN(data)
 		},
@@ -720,9 +725,6 @@ func main() {
 	edge.socks5Srv = NewSocks5Server(edge, socks5Listen)
 	safeGo("socks5-server", func() { edge.socks5Srv.Serve() })
 
-	// ============================================================
-	// ★ nat-probe：STUN 探测完成后合并端点（Bug 1 修复）
-	// ============================================================
 	safeGo("turn-init", func() {
 		time.Sleep(2 * time.Second)
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -749,12 +751,6 @@ func main() {
 	log.Println("正在退出...")
 	edge.Stop()
 }
-
-// ============================================================
-// ★ Bug 1 修复：PC 端异步 nat-probe，替换 natMeta 时保留已有 AllEndpoints
-//   这段在 Start 里被调用（这里保留为 main.go 里内联的 probeNAT 调用块，
-//   完整逻辑见 Start() 函数里的 safeGo("nat-probe", ...)）
-// ============================================================
 
 func (e *Edge) Stop() {
 	e.closeMu.Lock()
@@ -824,6 +820,7 @@ func (e *Edge) reportMetadata() {
 		"behavior":           nm.Behavior,
 		"p2pEndpoint":        nm.P2PEndpoint,
 		"multiExit":          nm.MultiExit,
+		"features":           []string{"n2na", "n2nw"},
 	}
 	if nm.PublicEndpoint != "" {
 		metaPayload["publicEndpoint"] = nm.PublicEndpoint
@@ -847,7 +844,7 @@ func (e *Edge) reportMetadata() {
 		log.Printf("[NAT] 上报 LAN 地址: %v", lanEndpoints)
 	}
 
-	log.Printf("[信令] 上报 p2p_metadata: natType=%s publicEndpoint=%q multiExit=%v assisted=%d lan=%d",
+	log.Printf("[信令] 上报 p2p_metadata: natType=%s publicEndpoint=%q multiExit=%v assisted=%d lan=%d features=[n2na,n2nw]",
 		nm.NATType, nm.PublicEndpoint, nm.MultiExit, len(nm.AllEndpoints), len(lanEndpoints))
 
 	_ = e.ws.Send(map[string]interface{}{
@@ -908,6 +905,7 @@ func (e *Edge) logPeerReady(peerID string) {
 	clientID := p.ClientID
 	lans := p.LanEndpoints
 	assisted := p.AssistedEndpoints
+	features := append([]string(nil), p.Features...)
 	e.peersMu.Unlock()
 
 	log.Println("")
@@ -921,6 +919,9 @@ func (e *Edge) logPeerReady(peerID string) {
 	}
 	if len(assisted) > 0 {
 		log.Printf("  STUN 端点 : %v", assisted)
+	}
+	if len(features) > 0 {
+		log.Printf("  features  : %v", features)
 	}
 	log.Println("==========================================")
 	log.Println("")
@@ -944,9 +945,14 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		if count > 0 {
 			failCounts = make(map[string]int)
 		}
+		nActive := len(natHoleActive)
+		if nActive > 0 {
+			natHoleActive = make(map[string]bool)
+		}
 		natHoleActiveMu.Unlock()
-		if count > 0 {
-			log.Printf("[NAT-HOLE] WS 重连，清空 %d 个 peer 的失败计数", count)
+		if count > 0 || nActive > 0 {
+			log.Printf("[NAT-HOLE] WS 重连，清空 %d 个失败计数 / %d 个 in-flight 标记",
+				count, nActive)
 		}
 
 		if e.relayMgr != nil {
@@ -962,7 +968,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			e.streamMgr.closeAll()
 		}
 
-		// ★ Bug 2 修复：清空去重标记
 		e.p2pStatusReportedMu.Lock()
 		e.p2pStatusReported = make(map[string]bool)
 		e.p2pStatusReportedMu.Unlock()
@@ -1059,6 +1064,15 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 					}
 				}
 
+				var features []string
+				if raw, ok := pm["features"].([]interface{}); ok {
+					for _, v := range raw {
+						if s, ok := v.(string); ok && s != "" {
+							features = append(features, s)
+						}
+					}
+				}
+
 				if pid == "" || pip == "" {
 					continue
 				}
@@ -1066,13 +1080,16 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 				e.maybeResetFailCountForPeer(pid, pubIP, pubPort)
 
 				e.registerPeer(pid, pip, pubIP, pubPort, natType, assisted, lanEndpoints)
-				if relayAddr != "" {
-					e.peersMu.Lock()
-					if pi, ok := e.peers[pid]; ok {
+				e.peersMu.Lock()
+				if pi, ok := e.peers[pid]; ok {
+					if relayAddr != "" {
 						pi.TurnRelayAddr = relayAddr
 					}
-					e.peersMu.Unlock()
+					if len(features) > 0 {
+						pi.Features = features
+					}
 				}
+				e.peersMu.Unlock()
 				e.logPeerReady(pid)
 			}
 		}
@@ -1111,6 +1128,15 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			}
 		}
 
+		var features []string
+		if raw, ok := payload["features"].([]interface{}); ok {
+			for _, v := range raw {
+				if s, ok := v.(string); ok && s != "" {
+					features = append(features, s)
+				}
+			}
+		}
+
 		if from != "" && pip != "" {
 			e.peersMu.RLock()
 			p, exists := e.peers[from]
@@ -1120,20 +1146,22 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			e.maybeResetFailCountForPeer(from, pubIP, pubPort)
 
 			e.registerPeer(from, pip, pubIP, pubPort, natType, assisted, lanEndpoints)
-			if relayAddr != "" {
-				e.peersMu.Lock()
-				if pi, ok := e.peers[from]; ok {
+			e.peersMu.Lock()
+			if pi, ok := e.peers[from]; ok {
+				if relayAddr != "" {
 					pi.TurnRelayAddr = relayAddr
 				}
-				e.peersMu.Unlock()
+				if len(features) > 0 {
+					pi.Features = features
+				}
 			}
+			e.peersMu.Unlock()
 
 			if !alreadyReady {
-				log.Printf("[信令] 节点上线: %s (vip=%s)", from, pip)
+				log.Printf("[信令] 节点上线: %s (vip=%s) features=%v", from, pip, features)
 			}
 			e.logPeerReady(from)
 
-			// ★ P0-2 预连接：立即发一次 PING 试探
 			if e.p2pStreams != nil && e.relayMgr != nil {
 				if e.relayMgr.GetState(from) != ConnP2P {
 					targetID := from
@@ -1231,7 +1259,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 
 		e.cancelP2PAvailTimeout(from)
 
-		// ★ Bug 2 修复：清理去重标记
 		e.p2pStatusReportedMu.Lock()
 		delete(e.p2pStatusReported, from)
 		e.p2pStatusReportedMu.Unlock()
@@ -1256,6 +1283,16 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 	}
 }
 
+// ★ P0 修复：maybeResetFailCountForPeer 只在 IP 变化时清空连接状态
+//
+// 服务端 room.ts 只在 IP 变化时 clearPairStateFor；Android 端也已经
+// 区分 IP / 端口。PC 和 Termux 之前是无条件 ClearPeer——HardNAT 下
+// 端口漂移频繁时，会导致每次 joined / ready 都清空 P2P 状态，
+// P2P 通道反复断开重连。
+//
+// 修复后：
+//   - IP 变化（可能换了网络环境）→ 清空连接状态，重新打洞
+//   - 仅端口漂移（CGNAT 常见）→ 保留 P2P 状态，P2P 通道通常仍可用
 func (e *Edge) maybeResetFailCountForPeer(peerID, newPubIP string, newPubPort int) {
 	if peerID == "" || newPubIP == "" || newPubPort <= 0 {
 		return
@@ -1279,12 +1316,16 @@ func (e *Edge) maybeResetFailCountForPeer(peerID, newPubIP string, newPubPort in
 	delete(failCounts, peerID)
 	natHoleActiveMu.Unlock()
 
-	if e.relayMgr != nil {
-		e.relayMgr.ClearPeer(peerID)
+	if oldPubIP != newPubIP {
+		if e.relayMgr != nil {
+			e.relayMgr.ClearPeer(peerID)
+		}
+		log.Printf("[NAT-HOLE] %s 出口 IP 变化 %s → %s，清空连接状态 (was=%d)",
+			peerID, oldPubIP, newPubIP, hadCount)
+	} else {
+		log.Printf("[NAT-HOLE] %s 端口漂移 %s:%d → %s:%d，保留 P2P 状态 (was=%d)",
+			peerID, oldPubIP, oldPubPort, newPubIP, newPubPort, hadCount)
 	}
-
-	log.Printf("[NAT-HOLE] %s 出口变化 %s:%d → %s:%d，重置失败计数 (was=%d)",
-		peerID, oldPubIP, oldPubPort, newPubIP, newPubPort, hadCount)
 }
 
 func (e *Edge) maybeResetOwnFailCounts(newEndpoint string) {
@@ -1502,17 +1543,11 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 	})
 }
 
-// reportP2PStatus 上报 P2P 状态。
-//
-// ★ Bug 2 修复：同一 peer 只上报一次（避免并行打洞导致重复）。
-//   - 首次调用：发消息 + 标记 reported
-//   - 后续调用：跳过（除非 left 后重新清理）
 func (e *Edge) reportP2PStatus(peerID string, status int) {
 	if e.ws == nil || peerID == "" {
 		return
 	}
 
-	// ★ 去重：同一 peer 只上报一次
 	e.p2pStatusReportedMu.Lock()
 	if e.p2pStatusReported[peerID] {
 		e.p2pStatusReportedMu.Unlock()
@@ -1540,8 +1575,6 @@ func (e *Edge) reportP2PStatus(peerID string, status int) {
 	})
 }
 
-// tunReadLoop 从 TUN 读出 IPv4 包，按 peer 状态选择 P2P / TURN / WS 中继发送。
-// ★ ICMP 分支绕过状态机；P0-3：发送后更新 lastDataFrameAt。
 func (e *Edge) tunReadLoop(tun *TUNDevice) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -1657,8 +1690,6 @@ func (e *Edge) tunReadLoop(tun *TUNDevice) {
 	}
 }
 
-// sendICMPDirect 是 ICMP 专用的发送路径，绕过 relayMgr 状态机。
-// 顺序：LAN → UDPAddr → TURN → WS
 func (e *Edge) sendICMPDirect(target *PeerInfo, pkt []byte) {
 	if target == nil {
 		return
@@ -1982,7 +2013,7 @@ func splitCSV(s string) []string {
 	return out
 }
 
-// ============ DNS 修复（Termux 专用） ============
+// ============ DNS 修复（Termux 专用，PC 上无害） ============
 
 func setupResolver() {
 	prefix := os.Getenv("PREFIX")
