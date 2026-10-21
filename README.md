@@ -80,6 +80,7 @@
 - **虚拟网段可配** — 服务端通过 `VIRTUAL_NETWORK` 下发网段，客户端自动适配
 - **无依赖** — Windows 版内嵌 wintun.dll
 - **三端互通** — 与 n2n-termux、n2n-android 无缝互通
+- **Termux 环境自动适配** — DNS 自动修复（过滤本地回环）+ CA 证书自动探测，**PC/macOS/Windows 零影响**
 
 ---
 
@@ -226,6 +227,64 @@ CGNAT（运营商级 NAT）的 UDP 映射**不是永久的**。当 socket 空闲
 
 ---
 
+## 🆕 Termux 环境自动适配
+
+从最新版本起，客户端在 **Termux 环境自动启用** DNS / TLS 修复，**PC / macOS / Windows 完全跳过**。
+
+### 解决的问题
+
+Termux 环境下常见两个问题：
+
+| 问题 | 症状 |
+|:---|:---|
+| **DNS 指向 `[::1]:53`** | `lookup xxx on [::1]:53: read udp ...: connection refused` |
+| **CA 证书缺失** | `tls: failed to verify certificate: x509: certificate signed by unknown authority` |
+
+### 自动修复机制
+
+| 修复项 | 触发条件 | 行为 |
+|:---|:---|:---|
+| **DNS 修复** | `isTermux()` 返回 true | 读 `$PREFIX/etc/resolv.conf`，过滤 `::1` / `127.0.0.1`，过滤后为空则 fallback 到 `8.8.8.8` / `1.1.1.1` |
+| **CA 证书** | `isTermux()` 返回 true | 探测 `$PREFIX/etc/tls/cert.pem` 等路径，设置 `SSL_CERT_FILE` 环境变量 |
+| **install.sh** | `IS_TERMUX=1` | 自动 `pkg install ca-certificates`（如果不存在） |
+| **start.sh** | `$PREFIX` 含 `com.termux` | 注入 `export SSL_CERT_FILE=<CA 路径>` |
+
+### 影响范围
+
+| 平台 | `initTermuxCA` | `setupResolver` | 影响 |
+|:---|:---|:---|:---|
+| **Termux** | ✅ 探测 CA | ✅ 过滤回环 DNS | ✅ **DNS + TLS 修复** |
+| **Linux PC** | ❌ 跳过 | ❌ 跳过 | ✅ **零影响** |
+| **macOS** | ❌ 跳过 | ❌ 跳过 | ✅ **零影响** |
+| **Windows** | ❌ 跳过 | ❌ 跳过 | ✅ **零影响** |
+
+**通过 `isTermux()` 判断**（`$PREFIX` / `$TERMUX_PREFIX` 是否包含 `com.termux`），非 Termux 环境完全跳过所有 Termux 专属逻辑。
+
+### Termux 下的启动日志
+
+```
+[TLS] CA 证书: /data/data/com.termux/files/usr/etc/tls/cert.pem (xxxxxx bytes)
+n2n-go-client v1.x.x 启动
+[DNS] 使用 /data/data/com.termux/files/usr/etc/resolv.conf (filtered local, using public) 的 3 个 nameserver: [8.8.8.8:53 1.1.1.1:53 114.114.114.114:53]
+[WS] 连接 wss://...
+已连接信令，Client ID: xxx
+```
+
+### 手动修复（如果自动修复失败）
+
+```bash
+# DNS（Termux）
+echo "nameserver 8.8.8.8" > $PREFIX/etc/resolv.conf
+echo "nameserver 1.1.1.1" >> $PREFIX/etc/resolv.conf
+
+# CA 证书（Termux）
+pkg install -y ca-certificates
+```
+
+> **注意**：Termux 的 `/etc/resolv.conf` 通常是只读的（`Read-only file system`），Go 静态二进制不经过 libc 也不读 `$PREFIX/etc/resolv.conf`——所以**只能通过代码层面覆盖 `net.DefaultResolver`**，无法通过 shell 脚本修复。自动修复机制正是为此设计。
+
+---
+
 ## 🚀 快速开始
 
 > ⚠️ **三个前置注意**：
@@ -332,10 +391,50 @@ sudo ~/.n2n-go/start.sh
 **启动后应该看到**：
 
 ```
+[TLS] CA 证书: /data/data/com.termux/files/usr/etc/tls/cert.pem (xxxxxx bytes)
+[DNS] 使用 ... (filtered local, using public) 的 3 个 nameserver: [8.8.8.8:53 ...]
 [TUN] n2n0 已启动，IP: 10.64.0.3/24，网段: 10.64.0.0/24
 ```
 
 **看到 `[TUN] n2nX 已启动` 就是 TUN 版成功了**，这是和 n2n-termux 的 `[SOCKS5] 监听` 最直接的区别。
+
+### 方式 D：Termux 无 root（仅 SOCKS5 出站）
+
+**不推荐**——无 root 时 `setupTUN` 失败，被动访问和主动 ping 全部不可用。**请用 [n2n-termux](https://github.com/goyo123321/n2n-termux)**。
+
+如果一定要试：
+
+```bash
+# 1. 下载
+curl -L -o ~/n2n-go-client \
+  https://github.com/goyo123321/n2n-go-client/releases/latest/download/n2n-go-client-linux-arm64
+chmod +x ~/n2n-go-client
+
+# 2. 启动（不加 sudo/tsu）
+SIGNALING_URL="wss://<你的-worker>" \
+ROOM_ID="test" \
+CLIENT_ID="android-noroot" \
+SOCKS5_LISTEN="127.0.0.1:1080" \
+~/n2n-go-client 2>&1 | tee ~/n2n.log
+```
+
+**预期行为**：
+
+| 能力 | 无 root Termux |
+|:---|:---|
+| WS 信令连接 | ✅ |
+| 虚拟 IP 分配 | ✅ |
+| TUN 建立 | ❌（`permission denied`） |
+| **SOCKS5 主动访问（仅 TCP）** | ✅ **可用** |
+| **被动接受（被其他设备访问）** | ❌ 不可用 |
+| **主动 ping** | ❌ 不可用 |
+
+**关键日志**：
+
+```
+[TUN] 启动失败: open /dev/net/tun: permission denied    ← 预期
+[SOCKS5] 监听 127.0.0.1:1080                              ← SOCKS5 起来了
+```
 
 ---
 
@@ -421,13 +520,31 @@ ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@10.64.0.2
 
 ## 🆕 版本行为变化说明
 
+### Termux 环境自动 DNS/TLS 适配
+
+**行为变化**：从最新版本起，**Termux 环境下自动修复 DNS 和 CA 证书问题**，PC / macOS / Windows **零影响**。
+
+**为什么改**：
+
+1. **Termux 的 `/etc/resolv.conf` 通常是 `nameserver ::1`**，但 Termux 里没有本地 DNS 服务监听 `[::1]:53`，导致所有域名解析失败。
+2. **Termux 的 `/etc` 是只读的**（`Read-only file system`），无法通过 shell 脚本修改。
+3. **Go 静态二进制不经过 libc**，termux-exec 也拦不住，只能通过代码层面覆盖 `net.DefaultResolver`。
+
+**新行为**：
+
+- 启动时判断 `isTermux()`，**只有 Termux 环境**才执行 `initTermuxCA()` 和 `setupResolver()`
+- `setupResolver()` 过滤本地回环 DNS，fallback 到公网 DNS
+- `initTermuxCA()` 探测 CA 证书路径，设置 `SSL_CERT_FILE`
+
+**PC / macOS / Windows 完全跳过**，行为与升级前一致。
+
 ### 端口漂移保留 P2P 状态（P0 修复）
 
 **行为变化**：从最新版本起，**只有出口 IP 变化时才清空连接状态**，端口漂移（HardNAT 常见）时保留 P2P 状态。
 
 **为什么改**：
 
-旧版 PC 端（与 Termux 一致）在收到 `joined`/`ready` 时，只要 `pubSocket` 变化就无条件 `ClearPeer`。HardNAT 下端口漂移频繁，导致每次 `joined`/`ready` 都清空 P2P 状态，P2P 通道反复断开重连。
+旧版 PC 端在收到 `joined`/`ready` 时，只要 `pubSocket` 变化就无条件 `ClearPeer`。HardNAT 下端口漂移频繁，导致每次 `joined`/`ready` 都清空 P2P 状态，P2P 通道反复断开重连。
 
 **新行为**（与服务端 `room.ts`、Android 端对齐）：
 
@@ -480,6 +597,8 @@ ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@10.64.0.2
 
 ## 📋 启动日志
 
+### PC / macOS / Linux
+
 启动成功后：
 
 ```
@@ -500,13 +619,31 @@ n2n-go-client v1.3.0 启动
 [P2P-Keepalive] 启动，每 15s 刷新 P2P 通道
 ```
 
-**关键检查点**：
+**注意**：PC/macOS/Linux 上**没有** `[TLS] CA 证书` 和 `[DNS] ...` 日志——`isTermux()` 返回 false，Termux 专属逻辑不执行。
+
+### Termux
+
+```
+[TLS] CA 证书: /data/data/com.termux/files/usr/etc/tls/cert.pem (xxxxxx bytes)
+n2n-go-client v1.3.0 启动
+[DNS] 使用 /data/data/com.termux/files/usr/etc/resolv.conf (filtered local, using public) 的 3 个 nameserver: [8.8.8.8:53 1.1.1.1:53 114.114.114.114:53]
+[P2P] UDP 监听端口 54321
+[WS] 连接 wss://<你的-worker-域名>/ws/myroom?cid=termux-a
+已连接信令，Client ID: termux-a，节点名: My-Termux
+[TUN] 启动失败: open /dev/net/tun: permission denied    ← 无 root 时预期
+[SOCKS5] 监听 127.0.0.1:1080
+```
+
+### 关键检查点
 
 | 日志 | 含义 |
 |:---|:---|
+| `[TLS] CA 证书: ...` | ✅ **仅 Termux**：CA 找到 |
+| `[DNS] ... (filtered local, using public)` | ✅ **仅 Termux**：本地 DNS 被过滤 |
 | `[NAT] 上报 LAN 地址: [...]` 非空 | LAN 收集成功 |
-| `[TUN] n2n0 已启动` | **PC 独有**（不是 Termux 版） |
-| `[WS] 连接 wss://...` | **URL 带了 wss://**（不是 `malformed`） |
+| `[TUN] n2n0 已启动` | **PC / macOS / Linux 独有** |
+| `[SOCKS5] 监听 127.0.0.1:1080` | **Termux 独有** |
+| `[WS] 连接 wss://...` | URL 带了 wss://（不是 `malformed`） |
 | `[信令] 上报 p2p_metadata: ... features=[n2na,n2nw]` | 能力上报成功 |
 | `[P2P] xxx 新建 peer，初始 UDPAddr 用 LAN: ...` | LAN 优先生效 |
 
@@ -713,7 +850,7 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o n2n-go-client-windows-amd64.
 
 ```
 n2n-go-client/
-├── main.go                       # 主程序
+├── main.go                       # 主程序 + Termux DNS/TLS 适配
 ├── ws_transport.go               # WebSocket 传输层
 ├── relay_fallback.go             # 四级降级管理器
 ├── turn_client.go                # TURN 客户端
@@ -827,6 +964,65 @@ sudo SIGNALING_URL="wss://<你的-worker-域名>" \
 | `your-worker.example.com` | ❌ 缺前缀 |
 | `wss://your-worker.example.com/ws/myroom` | ❌ 不要带路径 |
 
+### Q: Termux 里报 `lookup xxx on [::1]:53: connection refused`？
+
+**原因**：Termux 的 `/etc/resolv.conf` 是 `nameserver ::1`，但本地没有 DNS 服务监听。
+
+**修复**：**升级到最新版本**——`setupResolver()` 会自动过滤 `::1` / `127.0.0.1`，fallback 到公网 DNS。
+
+**手动验证**：
+
+```bash
+# 确认 /etc 不可写
+touch /etc/resolv.conf
+# 期望：touch: cannot touch '/etc/resolv.conf': Read-only file system
+
+# 确认 $PREFIX/etc/resolv.conf 内容（虽然对 Go 二进制无效）
+cat $PREFIX/etc/resolv.conf
+```
+
+**最新版本日志表现**：
+
+```
+[DNS] 使用 /data/data/com.termux/files/usr/etc/resolv.conf (filtered local, using public) 的 3 个 nameserver: [8.8.8.8:53 1.1.1.1:53 114.114.114.114:53]
+```
+
+### Q: Termux 里报 `x509: certificate signed by unknown authority`？
+
+**原因**：Termux 没有系统 CA 证书路径，Go 找不到 CA。
+
+**修复**：
+
+```bash
+# 1. 装 CA 证书
+pkg install -y ca-certificates
+
+# 2. 升级到最新版本（会自动探测 CA 路径 + 设置 SSL_CERT_FILE）
+```
+
+**最新版本日志表现**：
+
+```
+[TLS] CA 证书: /data/data/com.termux/files/usr/etc/tls/cert.pem (xxxxxx bytes)
+```
+
+### Q: 无 root Termux 能跑吗？
+
+**能跑，但数据面不完整**。
+
+| 能力 | 无 root Termux |
+|:---|:---|
+| WS 信令连接 | ✅ |
+| 虚拟 IP 分配 | ✅ |
+| TUN 建立 | ❌（`permission denied`） |
+| **SOCKS5 主动访问（仅 TCP）** | ✅ **可用** |
+| **被动接受（被其他设备访问）** | ❌ 不可用（包被丢弃） |
+| **主动 ping** | ❌ 不可用（无 TUN 接收 ICMP Echo Reply） |
+
+**根本原因**：`tunReadLoop` 和 `tunWriteLoop` 都依赖 TUN 网卡。没有 TUN，出方向无数据源，入方向无落地点。
+
+**推荐**：**用 [n2n-termux](https://github.com/goyo123321/n2n-termux)**——它用 `packet_forwarder.go` 在用户态实现 TCP/UDP/ICMP，**无 TUN 也能双向互通**。
+
 ### Q: 启动报错 `permission denied: /dev/net/tun`？
 
 **原因**：**没有 root 权限**。TUN 需要 root。
@@ -872,7 +1068,7 @@ su -c "modprobe tun" 2>/dev/null
 
 ### Q: 在 Termux 里装 n2n-go-client 提示「Termux 环境但没有 TUN」？
 
-**原因**：**这是正常的**。Termux 无 root 时没有 TUN 权限，这个客户端跑不起来。
+**原因**：**这是正常的**。Termux 无 root 时没有 TUN 权限，这个客户端跑不起来完整版。
 
 **两个选择**：
 
@@ -889,6 +1085,12 @@ bash ~/install_n2n_termux.sh
 su -c "ls -la /dev/net/tun"               # 确认存在
 su -c "insmod /system/lib/modules/tun.ko"  # 不存在时加载
 bash ~/install_n2n.sh                     # 重新运行安装
+```
+
+**选择 C**：`ALLOW_TERMUX=1` 强制安装，只测 SOCKS5 出站：
+
+```bash
+ALLOW_TERMUX=1 bash ~/install_n2n.sh
 ```
 
 ### Q: ping 不通怎么办？
