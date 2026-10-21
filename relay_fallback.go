@@ -35,7 +35,7 @@ type RelayManager struct {
 	turnClient *TURNClient
 	edge       *Edge
 	states     map[string]ConnType
-	failCounts map[string]int // ★ 新增：UDP 连续发送失败计数
+	failCounts map[string]int
 }
 
 func NewRelayManager(ws *WSTransport, turnClient *TURNClient, edge *Edge) *RelayManager {
@@ -85,8 +85,6 @@ func (rm *RelayManager) MarkP2P(peerId string) {
 	}
 }
 
-// MarkFallback 常规降级路径。保护 P2PAvailable 状态。
-// ★ 修复：3s → 10s（TCP 空闲连接更宽容）
 func (rm *RelayManager) MarkFallback(peerId string) {
 	rm.mu.Lock()
 
@@ -114,7 +112,6 @@ func (rm *RelayManager) MarkFallback(peerId string) {
 
 		if lastRecv > 0 {
 			idleMs := time.Now().UnixMilli() - lastRecv
-			// ★ 3s → 10s
 			if idleMs < 10000 {
 				log.Printf("[连接] %s 最近 %dms 收到过 UDP 包，跳过降级", peerId, idleMs)
 				return
@@ -280,8 +277,17 @@ func (rm *RelayManager) SendViaRelay(data []byte) error {
 
 // SendToPeer 按当前状态发送数据。
 //
-// ★ ConnP2P 分支加连续失败计数，连续 5 次失败才降级。
-// ★ PC 特有：e.udpConn 是 *net.UDPConn，用 WriteToUDP。
+// ★ P0 修复（本次）：ConnP2P 分支加 selfIsOnTargetLAN 判断
+//
+// 旧版问题：
+//   - 跨网络场景下，target.LanEndpoints 是旧 LAN 地址（对端已切走），
+//     直接 WriteTo 返回 nil，被误判为成功，实际是黑洞。
+//   - UDPAddr 如果是"本机不可达的私网"，同样会写黑洞。
+//
+// 新版逻辑：
+//   - LAN 优先：只有本机也在 target 的 LAN 上才走
+//   - UDPAddr：只有不是"本机不可达的私网"时，才写
+//   - 全失败 → 走 TURN / WS 兜底
 func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo) bool {
 	state := rm.GetState(peerId)
 
@@ -298,8 +304,11 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 
 		sent := false
 
-		// LAN 优先
-		if target.UDPAddr != nil &&
+		// ★ P0 修复：判断本机是否在 target 的 LAN 上
+		selfOnLAN := rm.edge.selfIsOnTargetLAN(target)
+
+		// LAN 优先：只有本机也在该 LAN 上，且 target.UDPAddr 不是私网时才走
+		if selfOnLAN && target.UDPAddr != nil &&
 			!isPrivateIPv4(target.UDPAddr.IP) &&
 			len(target.LanEndpoints) > 0 {
 			for _, lan := range target.LanEndpoints {
@@ -314,12 +323,21 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 			}
 		}
 
-		// UDPAddr
+		// UDPAddr：只有不是"本机不可达的私网"时，才写
 		if !sent && target.UDPAddr != nil {
-			if _, err := rm.edge.udpConn.WriteToUDP(data, target.UDPAddr); err == nil {
-				sent = true
-			} else {
-				log.Printf("[P2P] UDP 发送到 %s 失败: %v", peerId, err)
+			skip := false
+			if isPrivateIPv4(target.UDPAddr.IP) && !selfOnLAN {
+				// 私网 + 本机不在该 LAN → 黑洞，跳过
+				skip = true
+				log.Printf("[P2P] %s UDPAddr=%s 是私网且本机不在该 LAN，跳过（避免黑洞）",
+					peerId, target.UDPAddr)
+			}
+			if !skip {
+				if _, err := rm.edge.udpConn.WriteToUDP(data, target.UDPAddr); err == nil {
+					sent = true
+				} else {
+					log.Printf("[P2P] UDP 发送到 %s 失败: %v", peerId, err)
+				}
 			}
 		}
 
@@ -330,7 +348,6 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 			return true
 		}
 
-		// ★ 失败：累积计数，连续 5 次才降级
 		rm.mu.Lock()
 		rm.failCounts[peerId]++
 		fc := rm.failCounts[peerId]
