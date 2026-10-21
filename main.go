@@ -29,23 +29,14 @@ var (
 const DefaultVirtualCIDR = "10.64.0.0/24"
 
 // ============================================================
-// ★ 方案 C：仅 Termux 环境启用 DNS/TLS 修复
-//
-// 从 n2n-termux 移植：
-//   - initTermuxCA：自动探测 Termux 的 CA 证书，设置 SSL_CERT_FILE
-//   - setupResolver：自动过滤本地回环 DNS，fallback 公网 DNS
-//
-// PC / macOS / Windows 通过 isTermux() 返回 false，
-// 这两个函数都不会执行，100% 零影响。
+// 方案 C：仅 Termux 环境启用 DNS/TLS 修复
 // ============================================================
-
 func init() {
 	if isTermux() {
 		initTermuxCA()
 	}
 }
 
-// isTermux 判断是否在 Termux 环境
 func isTermux() bool {
 	prefix := os.Getenv("PREFIX")
 	if prefix == "" {
@@ -88,10 +79,7 @@ func initTermuxCA() {
 	fmt.Fprintf(os.Stderr, "[TLS]    修复: pkg install ca-certificates\n")
 }
 
-// ============================================================
 // LAN 缓存
-// ============================================================
-
 var (
 	lanCacheMu   sync.Mutex
 	lanCache     []string
@@ -116,10 +104,6 @@ func loadLANCache() []string {
 	}
 	return append([]string(nil), lanCache...)
 }
-
-// ============================================================
-// 数据结构
-// ============================================================
 
 type PeerInfo struct {
 	ClientID          string
@@ -538,8 +522,6 @@ func lastIndexByte(s string, c byte) int {
 // ============ 主函数 ============
 
 func main() {
-	// ★ 方案 C：只在 Termux 环境启用 DNS 修复
-	//   PC / macOS / Windows 完全跳过，100% 零影响
 	if isTermux() {
 		setupResolver()
 	}
@@ -676,7 +658,6 @@ func main() {
 		edge.p2pAvailTimers = make(map[string]*time.Timer)
 		edge.p2pAvailTimersMu.Unlock()
 
-		// ★ P1 修复：同时清空 failCounts 和 natHoleActive
 		natHoleActiveMu.Lock()
 		failCount := len(failCounts)
 		if failCount > 0 {
@@ -867,8 +848,6 @@ func (e *Edge) Stop() {
 	}
 }
 
-// ============ p2p_metadata 上报（含 features） ============
-
 func (e *Edge) reportMetadata() {
 	if e.ws == nil || e.natMeta == nil {
 		return
@@ -1016,7 +995,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 	if t == "_reconnected" {
 		log.Printf("[信令] WebSocket 重连成功，重新上报元数据")
 
-		// ★ P1 修复：同时清空 failCounts 和 natHoleActive
 		natHoleActiveMu.Lock()
 		count := len(failCounts)
 		if count > 0 {
@@ -1360,7 +1338,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 	}
 }
 
-// ★ P0 修复：只在 IP 变化时清空连接状态，端口漂移保留 P2P 状态
 func (e *Edge) maybeResetFailCountForPeer(peerID, newPubIP string, newPubPort int) {
 	if peerID == "" || newPubIP == "" || newPubPort <= 0 {
 		return
@@ -1758,12 +1735,48 @@ func (e *Edge) tunReadLoop(tun *TUNDevice) {
 	}
 }
 
+// ★ P0 修复：selfIsOnTargetLAN 判断本机是否在 target 的 LAN 上
+func (e *Edge) selfIsOnTargetLAN(target *PeerInfo) bool {
+	if target == nil || len(target.LanEndpoints) == 0 {
+		return false
+	}
+	myPrefixes := localPrefixes(e.getVirtualIPLocked())
+	if len(myPrefixes) == 0 {
+		return false
+	}
+	for _, lan := range target.LanEndpoints {
+		ra, err := net.ResolveUDPAddr("udp", lan)
+		if err != nil || ra == nil || ra.IP == nil {
+			continue
+		}
+		for _, p := range myPrefixes {
+			if p.Contains(ra.IP) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// ★ P0 修复：sendICMPDirect 的 LAN 分支加 selfIsOnTargetLAN 判断
+//
+// 旧版问题：WriteToUDP 返回 nil 只表示"写到本地 socket"，不表示"对方收到"。
+// 跨网络场景下，target.LanEndpoints 是旧 LAN 地址，写进去就是黑洞。
+//
+// 新版逻辑：
+//   1. 只有本机也在 target 的 LAN 上，才走 LAN 分支
+//   2. UDPAddr 如果是"本机不可达的私网"，也跳过
+//   3. TURN 兜底（必做）
+//   4. WS 兜底（必做）
 func (e *Edge) sendICMPDirect(target *PeerInfo, pkt []byte) {
 	if target == nil {
 		return
 	}
 
-	if len(target.LanEndpoints) > 0 && e.udpConn != nil {
+	selfOnLAN := e.selfIsOnTargetLAN(target)
+
+	// 1. LAN 优先：只有本机也在该 LAN 上
+	if selfOnLAN && len(target.LanEndpoints) > 0 && e.udpConn != nil {
 		for _, lan := range target.LanEndpoints {
 			ra, err := net.ResolveUDPAddr("udp", lan)
 			if err != nil || ra == nil || ra.IP == nil {
@@ -1775,12 +1788,23 @@ func (e *Edge) sendICMPDirect(target *PeerInfo, pkt []byte) {
 		}
 	}
 
+	// 2. UDPAddr：只有不是"本机不可达的私网"时，才写
 	if target.UDPAddr != nil && e.udpConn != nil {
-		if _, err := e.udpConn.WriteToUDP(pkt, target.UDPAddr); err == nil {
-			return
+		skip := false
+		if isPrivateIPv4(target.UDPAddr.IP) && !selfOnLAN {
+			// 私网 + 本机不在该 LAN → 黑洞，跳过
+			skip = true
+			log.Printf("[ICMP] %s UDPAddr=%s 是私网且本机不在该 LAN，跳过（避免黑洞）",
+				target.ClientID, target.UDPAddr)
+		}
+		if !skip {
+			if _, err := e.udpConn.WriteToUDP(pkt, target.UDPAddr); err == nil {
+				return
+			}
 		}
 	}
 
+	// 3. TURN 兜底
 	if target.TurnRelayAddr != "" && e.turnClient != nil && e.turnClient.IsReady() {
 		relayAddr, err := net.ResolveUDPAddr("udp", target.TurnRelayAddr)
 		if err == nil {
@@ -1790,6 +1814,7 @@ func (e *Edge) sendICMPDirect(target *PeerInfo, pkt []byte) {
 		}
 	}
 
+	// 4. WS 兜底
 	if e.ws != nil {
 		frame := buildN2NWFrame(target.ClientID, pkt)
 		_ = e.ws.SendBinary(frame)
@@ -2081,17 +2106,7 @@ func splitCSV(s string) []string {
 	return out
 }
 
-// ============================================================
-// ★ 方案 C：setupResolver 只在 Termux 环境被调用
-//
-// 行为：
-//   1. 读 Termux 的 resolv.conf
-//   2. 过滤本地回环 DNS（::1 / 127.0.0.1）
-//   3. 过滤后为空 → fallback 公网 DNS
-//   4. 过滤后非空 → 用这些 DNS
-//
-// PC / macOS / Windows 不会调用此函数（isTermux() 返回 false）。
-// ============================================================
+// ============ 方案 C：setupResolver 只在 Termux 环境被调用 ============
 
 func setupResolver() {
 	prefix := os.Getenv("PREFIX")
@@ -2119,7 +2134,6 @@ func setupResolver() {
 		}
 	}
 
-	// ★ 过滤本地回环 DNS
 	filtered := make([]string, 0, len(nameservers))
 	for _, ns := range nameservers {
 		host := ns
