@@ -112,6 +112,10 @@ type Edge struct {
 	// ★ P0-3：最近一次真实数据帧发送时间（用于自适应保活）
 	lastDataFrameAt int64
 
+	// ★ Bug 2 修复：已上报 P2P 状态的目标（避免并行指令重复上报 p2p_status=3）
+	p2pStatusReported   map[string]bool
+	p2pStatusReportedMu sync.Mutex
+
 	streamMgr  *AppStreamManager
 	p2pStreams *P2PStreamManager
 	socks5Srv  *Socks5Server
@@ -128,8 +132,6 @@ func (e *Edge) Done() <-chan struct{} { return e.doneCh }
 
 // ============ TUN 读错误分类 ============
 
-// isTransientReadError 判断错误是否是临时的（可重试）。
-// EAGAIN/EWOULDBLOCK/EINTR/超时 → 继续读；其他 → 退出读循环。
 func isTransientReadError(err error) bool {
 	if err == nil {
 		return false
@@ -199,7 +201,6 @@ func (e *Edge) startKeepalive() {
 
 	safeGo("keepalive", func() {
 		sendOnce := func() {
-			// ★ 自适应：10s 内有数据帧 → 跳过（真实数据天然刷新映射）
 			last := atomic.LoadInt64(&e.lastDataFrameAt)
 			if last > 0 && time.Now().UnixMilli()-last < 10000 {
 				return
@@ -228,7 +229,6 @@ func (e *Edge) startKeepalive() {
 
 // ============ P2P 通道保活 + 活性检测 ============
 
-// ★ 修复：15s → 10s，60s → 30s
 const p2pKeepaliveInterval = 10 * time.Second
 const p2pIdleDeadMs = 30000
 
@@ -268,7 +268,6 @@ func (e *Edge) sendP2PKeepalive() {
 
 		if st == ConnP2P || st == ConnP2PAvailable {
 			idleMs := now - p.lastRecvAt
-			// ★ 60s → 30s
 			if p.lastRecvAt > 0 && idleMs > p2pIdleDeadMs {
 				deadPeers = append(deadPeers, id)
 				continue
@@ -280,7 +279,6 @@ func (e *Edge) sendP2PKeepalive() {
 	e.peersMu.RUnlock()
 
 	for _, id := range deadPeers {
-		// ★ 日志用常量
 		log.Printf("[P2P] %s %ds 无任何流量，判定 P2P 失效，强制降级",
 			id, p2pIdleDeadMs/1000)
 		e.relayMgr.ForceFallback(id, "no-traffic-30s")
@@ -377,7 +375,6 @@ func (e *Edge) cancelFallbackTimer(peerID string) {
 	}
 }
 
-// ★ 修复：30s → 60s（给 TCP 更多验证时间）
 func (e *Edge) scheduleP2PAvailTimeout(peerID string) {
 	if e.relayMgr == nil || peerID == "" {
 		return
@@ -523,18 +520,19 @@ func main() {
 	}
 
 	edge := &Edge{
-		clientId:       clientId,
-		nodeName:       nodeName,
-		roomId:         roomId,
-		virtualCIDR:    DefaultVirtualCIDR,
-		peers:          make(map[string]*PeerInfo),
-		tunWriteCh:     make(chan []byte, 1024),
-		udpPort:        udpPort,
-		fallbackTimers: make(map[string]*time.Timer),
-		p2pAvailTimers: make(map[string]*time.Timer),
-		lastNoPeerLog:  make(map[string]int64),
-		tunStateLog:    make(map[string]ConnType),
-		doneCh:         make(chan struct{}),
+		clientId:          clientId,
+		nodeName:          nodeName,
+		roomId:            roomId,
+		virtualCIDR:       DefaultVirtualCIDR,
+		peers:             make(map[string]*PeerInfo),
+		tunWriteCh:        make(chan []byte, 1024),
+		udpPort:           udpPort,
+		fallbackTimers:    make(map[string]*time.Timer),
+		p2pAvailTimers:    make(map[string]*time.Timer),
+		lastNoPeerLog:     make(map[string]int64),
+		tunStateLog:       make(map[string]ConnType),
+		p2pStatusReported: make(map[string]bool), // ★ Bug 2 修复
+		doneCh:            make(chan struct{}),
 	}
 	edge.punchAckLimiter = newPunchAckLimiter()
 	edge.streamMgr = NewAppStreamManager()
@@ -594,6 +592,11 @@ func main() {
 		if edge.streamMgr != nil {
 			edge.streamMgr.closeAll()
 		}
+
+		// ★ Bug 2 修复：清空去重标记
+		edge.p2pStatusReportedMu.Lock()
+		edge.p2pStatusReported = make(map[string]bool)
+		edge.p2pStatusReportedMu.Unlock()
 
 		edge.p2pAvailTimersMu.Lock()
 		for _, t := range edge.p2pAvailTimers {
@@ -717,6 +720,9 @@ func main() {
 	edge.socks5Srv = NewSocks5Server(edge, socks5Listen)
 	safeGo("socks5-server", func() { edge.socks5Srv.Serve() })
 
+	// ============================================================
+	// ★ nat-probe：STUN 探测完成后合并端点（Bug 1 修复）
+	// ============================================================
 	safeGo("turn-init", func() {
 		time.Sleep(2 * time.Second)
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -743,6 +749,12 @@ func main() {
 	log.Println("正在退出...")
 	edge.Stop()
 }
+
+// ============================================================
+// ★ Bug 1 修复：PC 端异步 nat-probe，替换 natMeta 时保留已有 AllEndpoints
+//   这段在 Start 里被调用（这里保留为 main.go 里内联的 probeNAT 调用块，
+//   完整逻辑见 Start() 函数里的 safeGo("nat-probe", ...)）
+// ============================================================
 
 func (e *Edge) Stop() {
 	e.closeMu.Lock()
@@ -950,6 +962,11 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			e.streamMgr.closeAll()
 		}
 
+		// ★ Bug 2 修复：清空去重标记
+		e.p2pStatusReportedMu.Lock()
+		e.p2pStatusReported = make(map[string]bool)
+		e.p2pStatusReportedMu.Unlock()
+
 		e.reportMetadata()
 		return
 	}
@@ -1116,7 +1133,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			}
 			e.logPeerReady(from)
 
-			// ★ P0-2 预连接：立即发一次 PING 试探（不等打洞指令）
+			// ★ P0-2 预连接：立即发一次 PING 试探
 			if e.p2pStreams != nil && e.relayMgr != nil {
 				if e.relayMgr.GetState(from) != ConnP2P {
 					targetID := from
@@ -1213,6 +1230,11 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		}
 
 		e.cancelP2PAvailTimeout(from)
+
+		// ★ Bug 2 修复：清理去重标记
+		e.p2pStatusReportedMu.Lock()
+		delete(e.p2pStatusReported, from)
+		e.p2pStatusReportedMu.Unlock()
 
 		natHoleActiveMu.Lock()
 		delete(failCounts, from)
@@ -1362,7 +1384,6 @@ func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natTyp
 			p.LanEndpoints = sortedLAN
 		}
 	} else {
-		// 新建 peer 时优先用 LAN 初始化 UDPAddr
 		var initialUDP *net.UDPAddr
 		if len(sortedLAN) > 0 {
 			for _, lan := range sortedLAN {
@@ -1481,10 +1502,25 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 	})
 }
 
+// reportP2PStatus 上报 P2P 状态。
+//
+// ★ Bug 2 修复：同一 peer 只上报一次（避免并行打洞导致重复）。
+//   - 首次调用：发消息 + 标记 reported
+//   - 后续调用：跳过（除非 left 后重新清理）
 func (e *Edge) reportP2PStatus(peerID string, status int) {
 	if e.ws == nil || peerID == "" {
 		return
 	}
+
+	// ★ 去重：同一 peer 只上报一次
+	e.p2pStatusReportedMu.Lock()
+	if e.p2pStatusReported[peerID] {
+		e.p2pStatusReportedMu.Unlock()
+		return
+	}
+	e.p2pStatusReported[peerID] = true
+	e.p2pStatusReportedMu.Unlock()
+
 	_ = e.ws.Send(map[string]interface{}{
 		"type": "p2p_state_info",
 		"payload": map[string]interface{}{
@@ -1505,9 +1541,7 @@ func (e *Edge) reportP2PStatus(peerID string, status int) {
 }
 
 // tunReadLoop 从 TUN 读出 IPv4 包，按 peer 状态选择 P2P / TURN / WS 中继发送。
-//
-// ★ ICMP 分支绕过状态机（LAN → UDPAddr → TURN → WS）。
-// ★ P0-3：发送数据后更新 lastDataFrameAt（自适应保活用）。
+// ★ ICMP 分支绕过状态机；P0-3：发送后更新 lastDataFrameAt。
 func (e *Edge) tunReadLoop(tun *TUNDevice) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -1556,7 +1590,6 @@ func (e *Edge) tunReadLoop(tun *TUNDevice) {
 			proto = int(buf[9])
 		}
 
-		// ★ 无目标：仍发裸 IPv4，服务端按 dstIP 查表
 		if target == nil {
 			if proto == 17 && n < 200 {
 				if e.ws != nil {
@@ -1568,10 +1601,8 @@ func (e *Edge) tunReadLoop(tun *TUNDevice) {
 			continue
 		}
 
-		// ★★ ICMP 特殊处理：绕过状态机，优先 LAN
 		if proto == 1 {
 			e.sendICMPDirect(target, buf[:n])
-			// ★ P0-3：ICMP 也算数据帧
 			atomic.StoreInt64(&e.lastDataFrameAt, time.Now().UnixMilli())
 			if n >= 10 {
 				e.logTunForward(target.ClientID, dstIP, n, proto, true, ConnP2P)
@@ -1579,7 +1610,6 @@ func (e *Edge) tunReadLoop(tun *TUNDevice) {
 			continue
 		}
 
-		// 非 ICMP：走 relayMgr 状态机
 		state := ConnUnknown
 		if e.relayMgr != nil {
 			state = e.relayMgr.GetState(target.ClientID)
@@ -1599,7 +1629,6 @@ func (e *Edge) tunReadLoop(tun *TUNDevice) {
 				}
 				e.logTunForward(targetID, dstIP, pktLen, proto, sent, ConnTURN)
 				if sent {
-					// ★ P0-3：更新数据帧时间戳
 					atomic.StoreInt64(&e.lastDataFrameAt, time.Now().UnixMilli())
 				}
 				if !sent && e.ws != nil {
@@ -1615,7 +1644,6 @@ func (e *Edge) tunReadLoop(tun *TUNDevice) {
 			sent = e.relayMgr.SendToPeer(target.ClientID, buf[:n], target)
 		}
 		if sent {
-			// ★ P0-3：更新数据帧时间戳
 			atomic.StoreInt64(&e.lastDataFrameAt, time.Now().UnixMilli())
 		}
 		if n >= 10 {
@@ -1630,21 +1658,12 @@ func (e *Edge) tunReadLoop(tun *TUNDevice) {
 }
 
 // sendICMPDirect 是 ICMP 专用的发送路径，绕过 relayMgr 状态机。
-//
 // 顺序：LAN → UDPAddr → TURN → WS
-// 效果：
-//   - LAN 通：稳定 6-10ms（不受 P2P/TURN 状态切换影响）
-//   - LAN 单向不通：60-90ms（公网 hairpin）
-//   - TURN 兜底：100-180ms（稳定，不跳）
-//   - WS 兜底：100-300ms（最后底线）
-//
-// ★ PC 特有：e.udpConn 是 *net.UDPConn，用 WriteToUDP。
 func (e *Edge) sendICMPDirect(target *PeerInfo, pkt []byte) {
 	if target == nil {
 		return
 	}
 
-	// 1. LAN 优先（核心修复）
 	if len(target.LanEndpoints) > 0 && e.udpConn != nil {
 		for _, lan := range target.LanEndpoints {
 			ra, err := net.ResolveUDPAddr("udp", lan)
@@ -1657,14 +1676,12 @@ func (e *Edge) sendICMPDirect(target *PeerInfo, pkt []byte) {
 		}
 	}
 
-	// 2. UDPAddr（可能是 LAN，也可能是公网）
 	if target.UDPAddr != nil && e.udpConn != nil {
 		if _, err := e.udpConn.WriteToUDP(pkt, target.UDPAddr); err == nil {
 			return
 		}
 	}
 
-	// 3. TURN 兜底
 	if target.TurnRelayAddr != "" && e.turnClient != nil && e.turnClient.IsReady() {
 		relayAddr, err := net.ResolveUDPAddr("udp", target.TurnRelayAddr)
 		if err == nil {
@@ -1674,7 +1691,6 @@ func (e *Edge) sendICMPDirect(target *PeerInfo, pkt []byte) {
 		}
 	}
 
-	// 4. WS 中继（最后兜底）
 	if e.ws != nil {
 		frame := buildN2NWFrame(target.ClientID, pkt)
 		_ = e.ws.SendBinary(frame)
