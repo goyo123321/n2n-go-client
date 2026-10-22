@@ -121,7 +121,7 @@ type PeerInfo struct {
 	AssistedEndpoints []string
 	LanEndpoints      []string
 	Features          []string
-	registeredAt      int64 // ★ 新增：peer 首次注册时间，用于 lastLANRecvAt 兜底
+	registeredAt      int64 // ★ peer 首次注册时间，用于 lastLANRecvAt 兜底
 }
 
 type Edge struct {
@@ -280,7 +280,7 @@ func (e *Edge) startKeepalive() {
 
 // ============ P2P 通道保活 + 活性检测 ============
 
-const p2pKeepaliveInterval = 10 * time.Second
+const p2pKeepaliveInterval = 15 * time.Second // 从 10s 改为 15s（对齐 README）
 const p2pIdleDeadMs = 30000
 
 func (e *Edge) startP2PKeepalive() {
@@ -301,6 +301,16 @@ func (e *Edge) startP2PKeepalive() {
 	})
 }
 
+// sendP2PKeepalive 每 15 秒一次：向所有 peer 发 N2NS PING 探针，
+// 同时对 P2P / P2PAvailable 状态做 30 秒无流量降级检测。
+//
+// ★ P1 修复（本次，与 n2n-android / n2n-termux 同步）：
+//   1. 降级后重置 lastRecvAt，避免下一次 keepalive 立即重复触发
+//   2. relay_fallback.go 的 ForceFallback 允许 ConnP2P 在 no-traffic 场景降级
+//
+// ★ 与 Android / Termux 的差异：
+//   PC 是桌面端，无 WiFi 芯片 PS-Poll 省电问题，**不需要 2 秒空闲保活**。
+//   保持单一 15s 循环即可。
 func (e *Edge) sendP2PKeepalive() {
 	if e.relayMgr == nil || e.p2pStreams == nil {
 		return
@@ -333,6 +343,12 @@ func (e *Edge) sendP2PKeepalive() {
 		log.Printf("[P2P] %s %ds 无任何流量，判定 P2P 失效，强制降级",
 			id, p2pIdleDeadMs/1000)
 		e.relayMgr.ForceFallback(id, "no-traffic-30s")
+		// ★ P1 修复：重置 lastRecvAt，避免下一次 keepalive 立即重复触发
+		e.peersMu.Lock()
+		if p := e.peers[id]; p != nil {
+			p.lastRecvAt = time.Now().UnixMilli()
+		}
+		e.peersMu.Unlock()
 	}
 
 	for _, id := range alivePeers {
