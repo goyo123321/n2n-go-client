@@ -447,6 +447,9 @@ func isN2NAFrame(data []byte) bool {
 // handleN2NAFrame 处理服务端转发来的 N2NA 帧（binary app_stream_data）。
 //
 // 帧头 peerId 是发送方 clientId（服务端重写后），payload 是 TCP 原始字节。
+//
+// ★ 修复：更新 lastRecvAt 后调用 RecordWSFrame，让 N2NA 也参与
+// WS 帧降级判断（与 N2NW 对齐）。5 秒内 ≥5 帧且无 P2P 流量才降级。
 func (e *Edge) handleN2NAFrame(data []byte) {
 	if len(data) < n2naHdrMin {
 		return
@@ -482,6 +485,14 @@ func (e *Edge) handleN2NAFrame(data []byte) {
 		p.lastRecvAt = now
 	}
 	e.peersMu.Unlock()
+
+	// ★ 新增：N2NA 也参与 WS 帧降级保护（与 N2NW 对齐）
+	if e.relayMgr != nil {
+		st := e.relayMgr.GetState(senderID)
+		if st == ConnP2P || st == ConnP2PAvailable {
+			e.relayMgr.RecordWSFrame(senderID)
+		}
+	}
 
 	if e.streamMgr == nil {
 		return
