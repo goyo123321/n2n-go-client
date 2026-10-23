@@ -43,7 +43,7 @@ type TURNClient struct {
 	edge         *Edge
 	onMessage    func([]byte, net.Addr)
 	stopCh       chan struct{}
-	stopOnce     sync.Once // ★ 新增：stopCh 只关一次
+	stopOnce     sync.Once
 	permissions  map[string]bool
 	alive        bool
 }
@@ -102,8 +102,6 @@ func (tc *TURNClient) markDead(reason string) {
 // ============ 请求凭证并建立分配 ============
 
 func (tc *TURNClient) FetchAndSetup(ctx context.Context) (err error) {
-	// ★ 加 recover：从 StartReconnectLoop / turn-init 两处调用，
-	//   任一路径的 panic 都不该崩穿进程
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[TURN] FetchAndSetup panic: %v\n%s", r, debug.Stack())
@@ -225,9 +223,48 @@ func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 
 	log.Printf("[TURN] 中继地址: %s", tc.relayAddr)
 
-	// ★ 用 safeGo 起 readLoop：panic 时标记失效，让重连循环重建
 	safeGo("turn-readLoop", tc.readLoop)
 	return nil
+}
+
+// RebuildAllocation 网络变化后重建 TURN allocation。
+//
+// 场景：客户端换网络，旧 allocation 基于旧 NAT 映射失效。但 UDP socket
+// 没关，Send() 可能返回 nil（假成功），数据丢失。旧版靠 StartReconnectLoop
+// 30s 周期重建。
+//
+// 修复：主动清理旧 allocation + 立即重建。重建期间 IsReady()=false，
+// SendToPeer 的 ConnTURN 分支会检测到并走 WS 兜底。
+//
+// 注意：保留 tc.server（TURN 凭证 24 小时内有效），避免重复调
+// /api/turn-credentials 消耗 Worker 配额。
+func (tc *TURNClient) RebuildAllocation(ctx context.Context) error {
+	// 清理旧状态（不调 markDead：markDead 保留 tc.client 引用会阻止重建）
+	tc.mu.Lock()
+	oldClient := tc.client
+	oldConn := tc.relayConn
+	tc.client = nil
+	tc.relayConn = nil
+	tc.relayAddr = nil
+	tc.alive = false
+	tc.permissions = make(map[string]bool)
+	serverCached := tc.server
+	tc.mu.Unlock()
+
+	if oldClient != nil {
+		oldClient.Close()
+	}
+	if oldConn != nil {
+		_ = oldConn.Close()
+	}
+
+	if serverCached == nil {
+		// 完全没有凭证，走完整 FetchAndSetup
+		return tc.FetchAndSetup(ctx)
+	}
+
+	// 保留凭证，只重建 allocation
+	return tc.setupAllocation(ctx)
 }
 
 // ============ 收发 ============
@@ -272,7 +309,6 @@ func (tc *TURNClient) readLoop() {
 		if tc.onMessage != nil && n > 0 {
 			data := make([]byte, n)
 			copy(data, buf[:n])
-			// ★ 独立 recover：即使调用方没包 recover，也不会崩穿 readLoop
 			func() {
 				defer func() {
 					if r := recover(); r != nil {
@@ -389,8 +425,6 @@ func (tc *TURNClient) GetRelayAddr() string {
 // ============ 关闭 ============
 
 func (tc *TURNClient) Close() {
-	// ★ sync.Once 保证 stopCh 只关一次：
-	//   多个 goroutine 同时调 Close 不会 panic: close of closed channel
 	tc.stopOnce.Do(func() {
 		close(tc.stopCh)
 	})
