@@ -115,6 +115,7 @@ type PeerInfo struct {
 	UDPAddr           *net.UDPAddr
 	lastRecvAt        int64
 	lastLANRecvAt     int64
+	lastP2PRecvAt     int64 // ★ 新增：P2P 直连真实数据帧时间（viaTURN=false 且 isRealData=true）
 	loggedReady       bool
 	hasRealData       bool
 	probeReplied      bool
@@ -130,6 +131,13 @@ type Edge struct {
 	virtualIP   string
 	virtualCIDR string
 	roomId      string
+
+	// ★ 新增：网络变化去抖 / 合并延迟（见 edge_network.go）
+	lastNetworkChangedAt int64
+	lastNetworkType      string
+	pendingNetChangeMu   sync.Mutex
+	pendingNetChange     string
+	pendingNetChangeT    *time.Timer
 
 	serverSeenIP string
 
@@ -280,7 +288,7 @@ func (e *Edge) startKeepalive() {
 
 // ============ P2P 通道保活 + 活性检测 ============
 
-const p2pKeepaliveInterval = 15 * time.Second // 从 10s 改为 15s（对齐 README）
+const p2pKeepaliveInterval = 15 * time.Second
 const p2pIdleDeadMs = 30000
 
 func (e *Edge) startP2PKeepalive() {
@@ -301,16 +309,16 @@ func (e *Edge) startP2PKeepalive() {
 	})
 }
 
-// sendP2PKeepalive 每 15 秒一次：向所有 peer 发 N2NS PING 探针，
-// 同时对 P2P / P2PAvailable 状态做 30 秒无流量降级检测。
+// sendP2PKeepalive 15 秒循环：检查 P2P 状态 30s 无 P2P 真实数据降级 + 对所有 peer 发 probe。
 //
-// ★ P1 修复（本次，与 n2n-android / n2n-termux 同步）：
-//   1. 降级后重置 lastRecvAt，避免下一次 keepalive 立即重复触发
-//   2. relay_fallback.go 的 ForceFallback 允许 ConnP2P 在 no-traffic 场景降级
+// ★ 修复（与 n2n-android / n2n-termux 对齐）：
+//   只检查 lastP2PRecvAt（P2P 直连真实数据时间），不检查 lastRecvAt。
+//   旧版用 lastRecvAt，对端通过 TURN/WS 发的包也会刷新 lastRecvAt，
+//   单向 P2P 丢包（B→A 丢，A→B 走 TURN）永远不会被发现 → 卡在 ConnP2P
+//   但实际数据走 TURN，面板显示不准。
 //
-// ★ 与 Android / Termux 的差异：
-//   PC 是桌面端，无 WiFi 芯片 PS-Poll 省电问题，**不需要 2 秒空闲保活**。
-//   保持单一 15s 循环即可。
+// ★ PC 端与 Android/Termux 的差异：PC 没有 WiFi PS-Poll 省电问题，
+//   不需要 2 秒空闲保活。保持单一 15s 循环即可（最坏 45s 检测到 30s 无流量）。
 func (e *Edge) sendP2PKeepalive() {
 	if e.relayMgr == nil || e.p2pStreams == nil {
 		return
@@ -327,12 +335,12 @@ func (e *Edge) sendP2PKeepalive() {
 		}
 		st := e.relayMgr.GetState(id)
 
-		if st == ConnP2P || st == ConnP2PAvailable {
-			idleMs := now - p.lastRecvAt
-			if p.lastRecvAt > 0 && idleMs > p2pIdleDeadMs {
-				deadPeers = append(deadPeers, id)
-				continue
-			}
+		// ★ 修复：ConnP2P 用 lastP2PRecvAt 判定；ConnP2PAvailable 交给 60s 超时
+		if st == ConnP2P && p.lastP2PRecvAt > 0 && now-p.lastP2PRecvAt > p2pIdleDeadMs {
+			log.Printf("[P2P] %s P2P 真实数据 %ds 未更新（lastRecvAt 可能被 TURN/WS 包刷新），判定 P2P 失效",
+				id, (now-p.lastP2PRecvAt)/1000)
+			deadPeers = append(deadPeers, id)
+			continue
 		}
 
 		alivePeers = append(alivePeers, id)
@@ -340,13 +348,13 @@ func (e *Edge) sendP2PKeepalive() {
 	e.peersMu.RUnlock()
 
 	for _, id := range deadPeers {
-		log.Printf("[P2P] %s %ds 无任何流量，判定 P2P 失效，强制降级",
+		log.Printf("[P2P] %s %ds 无 P2P 真实数据，判定 P2P 失效，强制降级",
 			id, p2pIdleDeadMs/1000)
 		e.relayMgr.ForceFallback(id, "no-traffic-30s")
-		// ★ P1 修复：重置 lastRecvAt，避免下一次 keepalive 立即重复触发
+		// 重置 lastP2PRecvAt，避免下一次 keepalive 立即重复触发
 		e.peersMu.Lock()
 		if p := e.peers[id]; p != nil {
-			p.lastRecvAt = time.Now().UnixMilli()
+			p.lastP2PRecvAt = time.Now().UnixMilli()
 		}
 		e.peersMu.Unlock()
 	}
@@ -794,6 +802,9 @@ func main() {
 	edge.startKeepalive()
 	edge.startP2PKeepalive()
 
+	// ★ 启动网络变化探测（PC 没有 ConnectivityManager，10s 定时探测出口 IP）
+	edge.startNetworkMonitor()
+
 	edge.socks5Srv = NewSocks5Server(edge, socks5Listen)
 	safeGo("socks5-server", func() { edge.socks5Srv.Serve() })
 
@@ -833,6 +844,15 @@ func (e *Edge) Stop() {
 	e.closed = true
 	close(e.doneCh)
 	e.closeMu.Unlock()
+
+	// ★ 清理 pending network change timer
+	e.pendingNetChangeMu.Lock()
+	if e.pendingNetChangeT != nil {
+		e.pendingNetChangeT.Stop()
+		e.pendingNetChangeT = nil
+	}
+	e.pendingNetChange = ""
+	e.pendingNetChangeMu.Unlock()
 
 	e.fallbackTimersMu.Lock()
 	for _, t := range e.fallbackTimers {
@@ -1045,6 +1065,37 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		e.p2pStatusReportedMu.Unlock()
 
 		e.reportMetadata()
+		atomic.StoreInt64(&e.lastMetadataReportAt, time.Now().UnixMilli())
+
+		// ★ 补发 network_changed（防止切换瞬间丢失导致服务端 punchState 残留）
+		if e.ws != nil {
+			_ = e.ws.Send(map[string]interface{}{
+				"type":   "network_changed",
+				"reason": "ws-reconnected",
+			})
+			log.Printf("[Network] WS 重连，补发 network_changed (reason=ws-reconnected)")
+		}
+
+		// ★ 主动触发一次 STUN 探测（不等 5s 保活周期）
+		safeGo("reconnect-stun-probe", func() {
+			time.Sleep(300 * time.Millisecond)
+			if e.udpConn == nil {
+				return
+			}
+			sent := 0
+			for _, server := range keepaliveServers {
+				addr, err := net.ResolveUDPAddr("udp4", server)
+				if err != nil {
+					continue
+				}
+				probe := buildSTUNBindingRequest()
+				if _, err := e.udpConn.WriteToUDP(probe, addr); err == nil {
+					sent++
+				}
+			}
+			log.Printf("[Network] WS 重连，主动触发 STUN 探测（%d 个服务器，不等 5s 保活）", sent)
+		})
+
 		return
 	}
 
@@ -1319,6 +1370,63 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 	case "pong":
 		return
 
+	case "connection_status":
+		return
+
+	// ★ 新增：peer_network_changed
+	//   - reason == "ws-reconnected"：只刷新 lastRecvAt，保留 P2P 状态
+	//   - 其他 reason：清 UDPAddr / LanEndpoints / TurnRelayAddr
+	case "peer_network_changed":
+		reason, _ := msg["reason"].(string)
+		log.Printf("[Network] %s 网络变化 (%s)，重置与其相关的状态", from, reason)
+
+		if reason == "ws-reconnected" {
+			e.peersMu.Lock()
+			if p := e.peers[from]; p != nil {
+				p.lastRecvAt = time.Now().UnixMilli()
+			}
+			e.peersMu.Unlock()
+			log.Printf("[Network] %s ws-reconnected，保留 P2P 状态", from)
+			return
+		}
+
+		if e.relayMgr != nil {
+			e.relayMgr.ClearPeer(from)
+		}
+
+		e.peersMu.Lock()
+		oldTurnRelay := ""
+		oldUDPAddr := ""
+		if p := e.peers[from]; p != nil {
+			oldTurnRelay = p.TurnRelayAddr
+			if p.UDPAddr != nil {
+				oldUDPAddr = p.UDPAddr.String()
+			}
+			p.UDPAddr = nil
+			p.lastLANRecvAt = 0
+			p.lastRecvAt = 0
+			p.lastP2PRecvAt = 0 // ★ 新增：清 P2P 真实数据时间
+			p.PubIP = ""
+			p.PubPort = 0
+			p.TurnRelayAddr = ""
+			p.AssistedEndpoints = nil
+			p.LanEndpoints = nil
+		}
+		e.peersMu.Unlock()
+		if oldTurnRelay != "" || oldUDPAddr != "" {
+			log.Printf("[Network] %s 已清空 TurnRelayAddr=%q UDPAddr=%q",
+				from, oldTurnRelay, oldUDPAddr)
+		}
+
+		natHoleActiveMu.Lock()
+		delete(failCounts, from)
+		delete(natHoleActive, from)
+		natHoleActiveMu.Unlock()
+
+		e.cancelFallbackTimer(from)
+		e.cancelP2PAvailTimeout(from)
+		return
+
 	case "left":
 		log.Printf("[信令] 节点离开: %s", from)
 
@@ -1390,6 +1498,13 @@ func (e *Edge) maybeResetFailCountForPeer(peerID, newPubIP string, newPubPort in
 	}
 }
 
+// maybeResetOwnFailCounts 本机出口 IP 变化时重置失败计数。
+//
+// ★ 修复：oldIP == "" 时不 return，而是更新 PublicEndpoint。
+//   场景：A 换网络 → OnNetworkChanged 清空 natMeta.PublicEndpoint
+//   → 首次 STUN 响应到达 → oldIP = "" → 旧版直接 return
+//   → PublicEndpoint 永远为空 → reportMetadata 上报空地址
+//   → 服务端 peer.pubSocket = "" → 不生成打洞指令 → 永远卡在 Unknown
 func (e *Edge) maybeResetOwnFailCounts(newEndpoint string) {
 	if newEndpoint == "" {
 		return
@@ -1409,7 +1524,8 @@ func (e *Edge) maybeResetOwnFailCounts(newEndpoint string) {
 
 	oldIP := extractIPFromEndpoint(oldEndpoint)
 
-	if oldIP == "" || oldIP == newIP {
+	// ★ 修复：只有相同 IP 才 return；oldIP == ""（换网络后首次）继续更新
+	if oldIP == newIP {
 		return
 	}
 
@@ -1420,15 +1536,20 @@ func (e *Edge) maybeResetOwnFailCounts(newEndpoint string) {
 	}
 	e.mu.Unlock()
 
-	natHoleActiveMu.Lock()
-	count := len(failCounts)
-	if count > 0 {
-		failCounts = make(map[string]int)
-	}
-	natHoleActiveMu.Unlock()
+	// ★ 修复：oldIP == "" 时说明是换网络后首次，只更新地址，不清 failCounts
+	if oldIP != "" {
+		natHoleActiveMu.Lock()
+		count := len(failCounts)
+		if count > 0 {
+			failCounts = make(map[string]int)
+		}
+		natHoleActiveMu.Unlock()
 
-	log.Printf("[NAT-HOLE] 本机出口 IP 变化 %s → %s，重置所有失败计数 (count=%d)",
-		oldIP, newIP, count)
+		log.Printf("[NAT-HOLE] 本机出口 IP 变化 %s → %s，重置所有失败计数 (count=%d)",
+			oldIP, newIP, count)
+	} else {
+		log.Printf("[NAT-HOLE] 本机出口 IP 首次设置: %s（换网络后）", newIP)
+	}
 }
 
 func (e *Edge) peerExists(peerID string) bool {
@@ -2010,6 +2131,13 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 	}
 
 	best.lastRecvAt = now
+	// ★ 新增：只有 P2P 直连的真实数据才刷新 lastP2PRecvAt
+	//   对端通过 TURN 发的包（viaTURN=true）不算 P2P，不刷新
+	//   避免单向 P2P 丢包（B→A 丢，A→B 走 TURN）时 lastRecvAt 被
+	//   TURN 包持续刷新导致永远不降级
+	if isRealData && !viaTURN {
+		best.lastP2PRecvAt = now
+	}
 	if isRealData {
 		best.hasRealData = true
 	}
@@ -2090,6 +2218,16 @@ func (e *Edge) sendProbeTo(addr *net.UDPAddr) {
 
 // ============ 多 STUN 端点收集 ============
 
+// addAssistedEndpoint 添加 STUN 探测到的辅助端点。
+//
+// ★ 修复：wasEmpty || ipChanged 都立即上报，绕过 30 秒节流。
+//
+// 场景：
+//   - wasEmpty：换网络后首次 STUN 响应，PublicEndpoint 从空变非空
+//   - ipChanged：WSS 重连时 _reconnected 先上报了旧地址（natMeta.PublicEndpoint
+//     是旧值），随后 STUN 响应带回新 IP。旧版 wasEmpty=false 走 30 秒节流，
+//     B 有 30 秒用旧 UDPAddr 丢包。新版 ipChanged=true 立即上报，把窗口压到
+//     STUN 一个周期（~5 秒，配合 _reconnected 主动探测更快）。
 func (e *Edge) addAssistedEndpoint(ip string, port int) {
 	if ip == "" || port <= 0 {
 		return
@@ -2112,12 +2250,37 @@ func (e *Edge) addAssistedEndpoint(ip string, port int) {
 	}
 	e.natMeta.AllEndpoints = append(e.natMeta.AllEndpoints, ep)
 	count := len(e.natMeta.AllEndpoints)
+	oldPublicEndpoint := e.natMeta.PublicEndpoint
+	wasEmpty := oldPublicEndpoint == ""
 	e.mu.Unlock()
 
 	e.maybeResetOwnFailCounts(ep)
 
-	log.Printf("[NAT] +assisted: %s (total=%d)", ep, count)
-	e.reportMetadataThrottled()
+	e.mu.Lock()
+	newPubIP := ""
+	oldPubIP := extractIPFromEndpoint(oldPublicEndpoint)
+	if e.natMeta != nil {
+		newPubIP = extractIPFromEndpoint(e.natMeta.PublicEndpoint)
+	}
+	e.mu.Unlock()
+
+	ipChanged := oldPubIP != "" && newPubIP != "" && oldPubIP != newPubIP
+
+	log.Printf("[NAT] +assisted: %s (total=%d, wasEmpty=%v, ipChanged=%v, %s→%s)",
+		ep, count, wasEmpty, ipChanged, oldPubIP, newPubIP)
+
+	if wasEmpty || ipChanged {
+		atomic.StoreInt64(&e.lastMetadataReportAt, 0)
+		e.reportMetadata()
+		if ipChanged {
+			log.Printf("[NAT] PublicEndpoint IP 变化 %s → %s，立即上报 p2p_metadata",
+				oldPubIP, newPubIP)
+		} else {
+			log.Printf("[NAT] PublicEndpoint 首次设置，立即上报 p2p_metadata")
+		}
+	} else {
+		e.reportMetadataThrottled()
+	}
 }
 
 func (e *Edge) reportMetadataThrottled() {
