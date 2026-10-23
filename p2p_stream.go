@@ -887,23 +887,12 @@ func (s *P2PStream) close(reason string) {
 }
 
 // ============ N2NW / N2NA 二进制帧（WS 中继数据面） ============
-//
-// 两套二进制协议：
-//   - N2NW（flags=0）：IPv4 数据面，服务端按目标 peer 直接转发裸 IPv4 包
-//   - N2NA：app_stream 数据面，服务端按 streamId 转发 TCP 字节流
-//
-// handleAppStreamBinary 是 WS 二进制的统一入口：
-//   1. 先判 N2NA（app_stream 二进制）→ 交给 handleN2NAFrame
-//   2. 再判 N2NW（IPv4 数据面）→ 提取 senderID 后送 TUN
-//   3. 其他 → 丢弃
 
 const (
 	n2nwHdrMin  = 6
 	n2nwPeerMax = 255
 )
 
-// buildN2NWFrame 构造 N2NW 帧。targetID 是目标 peer 的 clientId，
-// 服务端会把它重写为发送方 ID 后再转发给对端。
 func buildN2NWFrame(targetID string, payload []byte) []byte {
 	idBytes := []byte(targetID)
 	if len(idBytes) > n2nwPeerMax {
@@ -914,7 +903,7 @@ func buildN2NWFrame(targetID string, payload []byte) []byte {
 	frame[1] = '2'
 	frame[2] = 'N'
 	frame[3] = 'W'
-	frame[4] = 0 // flags
+	frame[4] = 0
 	frame[5] = byte(len(idBytes))
 	copy(frame[n2nwHdrMin:], idBytes)
 	copy(frame[n2nwHdrMin+len(idBytes):], payload)
@@ -924,6 +913,9 @@ func buildN2NWFrame(targetID string, payload []byte) []byte {
 // handleAppStreamBinary 处理服务端转发来的 WS 二进制帧。
 //
 // ★ 先判 N2NA（app_stream 二进制），再判 N2NW（IPv4 数据面）。
+//
+// ★ 修复：N2NW 分支加 RecordWSFrame 保护，5 秒内 ≥5 帧且无 P2P 流量
+// 才降级，避免单个 WS 帧就触发 ForceFallback 导致震荡。
 func (e *Edge) handleAppStreamBinary(data []byte) {
 	// ★ N2NA 分支（app_stream 二进制数据面）
 	if isN2NAFrame(data) {
@@ -968,6 +960,15 @@ func (e *Edge) handleAppStreamBinary(data []byte) {
 		p.lastRecvAt = now
 	}
 	e.peersMu.Unlock()
+
+	// ★ 新增：WS 帧降级保护（5 秒内 ≥5 帧且无 P2P 流量才降级）
+	//   与 n2n-android / n2n-termux 对齐
+	if e.relayMgr != nil {
+		st := e.relayMgr.GetState(senderID)
+		if st == ConnP2P || st == ConnP2PAvailable {
+			e.relayMgr.RecordWSFrame(senderID)
+		}
+	}
 
 	// PC 有 TUN，直接入队；enqueueTUN 内部会调 tun.Write
 	e.enqueueTUN(payload)
