@@ -1,6 +1,6 @@
 package main
 
-// 网络切换（WiFi ↔ Cellular / 出口 IP 变化）时的状态清理。
+// 网络切换（出口 IP 变化）时的状态清理。
 //
 // PC / 路由器没有 Android ConnectivityManager，用 10 秒定时探测
 // 本机出口 IP 变化，变了就触发 OnNetworkChanged。
@@ -15,7 +15,6 @@ import (
 const networkChangeMergeDelay = 1500 * time.Millisecond
 const networkProbeInterval = 10 * time.Second
 
-// OnNetworkChanged 网络切换入口（1.5 秒合并）。
 func (e *Edge) OnNetworkChanged(networkType string) {
 	e.pendingNetChangeMu.Lock()
 	e.pendingNetChange = networkType
@@ -42,7 +41,6 @@ func (e *Edge) OnNetworkChanged(networkType string) {
 	log.Printf("[Network] %s 已排队（1.5s 内合并）", networkType)
 }
 
-// applyNetworkChanged 实际执行 10 步清理。
 func (e *Edge) applyNetworkChanged(networkType string) {
 	log.Printf("[Network] 执行网络变化处理: %s", networkType)
 
@@ -164,7 +162,7 @@ func (e *Edge) applyNetworkChanged(networkType string) {
 
 		log.Printf("[TURN] 网络变化，开始重建 allocation...")
 		if err := e.turnClient.RebuildAllocation(ctx); err != nil {
-			log.Printf("[TURN] 网络变化后重建失败: %v（走 WS 兜底，30 秒后 StartReconnectLoop 重试）", err)
+			log.Printf("[TURN] 网络变化后重建失败: %v（走 WS 兜底，5 秒后 StartReconnectLoop 重试）", err)
 			return
 		}
 		log.Printf("[TURN] ✅ 网络变化后重建成功: %s", e.turnClient.GetRelayAddr())
@@ -183,7 +181,6 @@ func (e *Edge) applyNetworkChanged(networkType string) {
 	})
 }
 
-// startNetworkMonitor 定时探测本机出口 IP 变化（10 秒周期）。
 func (e *Edge) startNetworkMonitor() {
 	if e.udpConn == nil {
 		return
