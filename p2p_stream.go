@@ -923,7 +923,7 @@ func (e *Edge) handleAppStreamBinary(data []byte) {
 		return
 	}
 
-	// N2NW 分支（IPv4 数据面，原有逻辑）
+	// N2NW 分支（IPv4 数据面）
 	if len(data) < n2nwHdrMin {
 		return
 	}
@@ -948,12 +948,6 @@ func (e *Edge) handleAppStreamBinary(data []byte) {
 		return
 	}
 
-	// 更新发送方 peer 的活跃时间
-	//
-	// 用途：
-	//   - P2P 空闲检测（sendP2PKeepalive 里的 30s p2pIdleDeadMs）
-	//   - MarkFallback 的 10 秒保护（relay_fallback.go）
-	//   - 面板 lastSeen / idleFor
 	now := time.Now().UnixMilli()
 	e.peersMu.Lock()
 	if p, ok := e.peers[senderID]; ok {
@@ -962,14 +956,13 @@ func (e *Edge) handleAppStreamBinary(data []byte) {
 	e.peersMu.Unlock()
 
 	// ★ 新增：WS 帧降级保护（5 秒内 ≥5 帧且无 P2P 流量才降级）
-	//   与 n2n-android / n2n-termux 对齐
 	if e.relayMgr != nil {
 		st := e.relayMgr.GetState(senderID)
-		if st == ConnP2P || st == ConnP2PAvailable {
+		if st == ConnLAN || st == ConnP2P || st == ConnP2PAvailable {
 			e.relayMgr.RecordWSFrame(senderID)
 		}
 	}
 
-	// PC 有 TUN，直接入队；enqueueTUN 内部会调 tun.Write
+	// PC 有 TUN，直接入队
 	e.enqueueTUN(payload)
 }
