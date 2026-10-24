@@ -40,17 +40,30 @@ func NewSocks5Server(edge *Edge, listen string) *Socks5Server {
 	}
 }
 
-func (s *Socks5Server) Serve() {
+// Listen 同步监听。失败返回 error。
+//
+// ★ 修复：拆成 Listen() / Serve() 两步。
+//   Listen() 同步监听，失败返回 error（供上层判断端口冲突）。
+//   Serve() 阻塞 Accept 循环，前提是 Listen() 已成功。
+//   旧版 Serve() 里静默 return，上层不知道端口冲突，用户看到"启动成功"但 SOCKS5 没起来。
+func (s *Socks5Server) Listen() error {
 	ln, err := net.Listen("tcp", s.listen)
 	if err != nil {
-		log.Printf("[SOCKS5] 监听 %s 失败: %v", s.listen, err)
-		return
+		return fmt.Errorf("SOCKS5 监听 %s 失败: %w", s.listen, err)
 	}
 	s.ln = ln
 	log.Printf("[SOCKS5] 监听 %s（用 curl --socks5 或 ALL_PROXY 访问虚拟 IP）", s.listen)
+	return nil
+}
 
+// Serve 阻塞 Accept 循环，前提是 Listen() 已成功。
+func (s *Socks5Server) Serve() {
+	if s.ln == nil {
+		log.Printf("[SOCKS5] Serve 调用时 ln 为 nil（Listen 未调用？），退出")
+		return
+	}
 	for {
-		conn, err := ln.Accept()
+		conn, err := s.ln.Accept()
 		if err != nil {
 			select {
 			case <-s.stopCh:
@@ -161,12 +174,13 @@ func (s *Socks5Server) handleConn(conn net.Conn) {
 		return
 	}
 
-	// ★ 修复：加入 IsP2PAvailable —— 打洞握手成功后、PONG 验证完成前的
-	//   窗口期内，P2P 通道实际可用。之前跳过这个状态，导致每次 SOCKS5
-	//   都走 WS 中继。
+	// ★ 修复：加入 IsLAN —— LAN 直连也是非 WS 中继路径
+	//   打洞握手成功后、PONG 验证完成前的窗口期内，P2P 通道实际可用。
+	//   之前跳过这个状态，导致每次 SOCKS5 都走 WS 中继。
 	useP2P := s.edge.p2pStreams != nil &&
 		s.edge.relayMgr != nil &&
-		(s.edge.relayMgr.IsP2P(peerID) ||
+		(s.edge.relayMgr.IsLAN(peerID) ||
+			s.edge.relayMgr.IsP2P(peerID) ||
 			s.edge.relayMgr.IsP2PAvailable(peerID) ||
 			s.edge.relayMgr.IsTURN(peerID))
 
