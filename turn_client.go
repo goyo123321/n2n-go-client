@@ -46,6 +46,9 @@ type TURNClient struct {
 	stopOnce     sync.Once
 	permissions  map[string]bool
 	alive        bool
+
+	// ★ 新增：Send 连续失败计数，5 次失败主动 markDead
+	consecutiveSendFails int
 }
 
 // ============ 辅助函数 ============
@@ -82,6 +85,7 @@ func (tc *TURNClient) markDead(reason string) {
 	tc.mu.Lock()
 	wasAlive := tc.alive
 	tc.alive = false
+	tc.consecutiveSendFails = 0
 	client := tc.client
 	conn := tc.relayConn
 	tc.mu.Unlock()
@@ -229,17 +233,9 @@ func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 
 // RebuildAllocation 网络变化后重建 TURN allocation。
 //
-// 场景：客户端换网络，旧 allocation 基于旧 NAT 映射失效。但 UDP socket
-// 没关，Send() 可能返回 nil（假成功），数据丢失。旧版靠 StartReconnectLoop
-// 30s 周期重建。
-//
-// 修复：主动清理旧 allocation + 立即重建。重建期间 IsReady()=false，
-// SendToPeer 的 ConnTURN 分支会检测到并走 WS 兜底。
-//
-// 注意：保留 tc.server（TURN 凭证 24 小时内有效），避免重复调
+// 保留 tc.server（TURN 凭证 24 小时内有效），避免重复调
 // /api/turn-credentials 消耗 Worker 配额。
 func (tc *TURNClient) RebuildAllocation(ctx context.Context) error {
-	// 清理旧状态（不调 markDead：markDead 保留 tc.client 引用会阻止重建）
 	tc.mu.Lock()
 	oldClient := tc.client
 	oldConn := tc.relayConn
@@ -247,6 +243,7 @@ func (tc *TURNClient) RebuildAllocation(ctx context.Context) error {
 	tc.relayConn = nil
 	tc.relayAddr = nil
 	tc.alive = false
+	tc.consecutiveSendFails = 0
 	tc.permissions = make(map[string]bool)
 	serverCached := tc.server
 	tc.mu.Unlock()
@@ -259,11 +256,8 @@ func (tc *TURNClient) RebuildAllocation(ctx context.Context) error {
 	}
 
 	if serverCached == nil {
-		// 完全没有凭证，走完整 FetchAndSetup
 		return tc.FetchAndSetup(ctx)
 	}
-
-	// 保留凭证，只重建 allocation
 	return tc.setupAllocation(ctx)
 }
 
@@ -335,10 +329,26 @@ func (tc *TURNClient) Send(data []byte, remoteAddr net.Addr) error {
 		return fmt.Errorf("CreatePermission 失败: %w", err)
 	}
 	_, err := conn.WriteTo(data, remoteAddr)
-	if err != nil && isNetworkUnreachable(err) {
-		tc.markDead("write failed: network unreachable")
+	if err != nil {
+		if isNetworkUnreachable(err) {
+			tc.markDead("write failed: network unreachable")
+		} else {
+			// ★ 新增：连续失败计数，5 次失败主动 markDead
+			tc.mu.Lock()
+			tc.consecutiveSendFails++
+			fails := tc.consecutiveSendFails
+			tc.mu.Unlock()
+			if fails >= 5 {
+				log.Printf("[TURN] Send 连续失败 %d 次，主动标记失效", fails)
+				tc.markDead("send fails")
+			}
+		}
+		return err
 	}
-	return err
+	tc.mu.Lock()
+	tc.consecutiveSendFails = 0
+	tc.mu.Unlock()
+	return nil
 }
 
 func (tc *TURNClient) ensurePermission(remoteAddr net.Addr) error {
@@ -370,42 +380,97 @@ func (tc *TURNClient) ensurePermission(remoteAddr net.Addr) error {
 	return nil
 }
 
+// ping 主动发送 CreatePermission 验证 TURN 服务器活着。
+//
+// CreatePermission 是同步阻塞的（pion 内部有重传），用 goroutine + ctx
+// 包装，超时后返回 ctx.Err()，不阻塞 StartReconnectLoop 的下一轮。
+func (tc *TURNClient) ping(ctx context.Context) error {
+	tc.mu.RLock()
+	client := tc.client
+	tc.mu.RUnlock()
+	if client == nil {
+		return fmt.Errorf("TURN client nil")
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				done <- fmt.Errorf("panic: %v", r)
+			}
+		}()
+		dummyAddr := &net.UDPAddr{IP: net.ParseIP("1.1.1.1"), Port: 53}
+		done <- client.CreatePermission(dummyAddr)
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // ============ 后台重连循环 ============
 
 func (tc *TURNClient) StartReconnectLoop() {
 	safeGo("turn-reconnect", func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
+		consecutiveFails := 0
+		lastPingAt := time.Now()
 		for {
+			// 5s 周期检测；重建失败时指数退避：5s → 10s → 20s → 40s → ... 封顶 5min
+			wait := 5 * time.Second
+			if consecutiveFails > 0 {
+				wait = time.Duration(5<<uint(consecutiveFails-1)) * time.Second
+				if wait > 5*time.Minute {
+					wait = 5 * time.Minute
+				}
+			}
+
 			select {
 			case <-tc.stopCh:
 				return
-			case <-ticker.C:
-				if tc.IsReady() {
-					continue
-				}
+			case <-time.After(wait):
+			}
 
-				log.Printf("[TURN] 检测到分配失效，尝试重建")
-				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				err := tc.FetchAndSetup(ctx)
-				cancel()
-				if err != nil {
-					log.Printf("[TURN] 重建失败: %v（30 秒后重试）", err)
-					continue
-				}
+			if tc.IsReady() {
+				consecutiveFails = 0
 
-				log.Printf("[TURN] ✅ 重建成功: %s", tc.GetRelayAddr())
-
-				if tc.edge != nil && tc.edge.ws != nil {
-					_ = tc.edge.ws.Send(map[string]interface{}{
-						"type":      "turn_relay_info",
-						"relayAddr": tc.GetRelayAddr(),
-					})
+				// ★ 新增：每 30s 主动 ping TURN（验证服务器活着）
+				if time.Since(lastPingAt) >= 30*time.Second {
+					lastPingAt = time.Now()
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					err := tc.ping(ctx)
+					cancel()
+					if err != nil {
+						log.Printf("[TURN] 主动 ping 失败: %v，标记失效", err)
+						tc.markDead("ping failed")
+					}
 				}
+				continue
+			}
 
-				if tc.edge != nil && tc.edge.relayMgr != nil {
-					tc.edge.relayMgr.UpgradeRelaysToTURN()
-				}
+			log.Printf("[TURN] 检测到分配失效，尝试重建 (失败 %d 次)", consecutiveFails)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			err := tc.FetchAndSetup(ctx)
+			cancel()
+			if err != nil {
+				consecutiveFails++
+				log.Printf("[TURN] 重建失败: %v", err)
+				continue
+			}
+
+			consecutiveFails = 0
+			log.Printf("[TURN] ✅ 重建成功: %s", tc.GetRelayAddr())
+
+			if tc.edge != nil && tc.edge.ws != nil {
+				_ = tc.edge.ws.Send(map[string]interface{}{
+					"type":      "turn_relay_info",
+					"relayAddr": tc.GetRelayAddr(),
+				})
+			}
+			if tc.edge != nil && tc.edge.relayMgr != nil {
+				tc.edge.relayMgr.UpgradeRelaysToTURN()
 			}
 		}
 	})
