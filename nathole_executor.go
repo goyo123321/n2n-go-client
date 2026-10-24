@@ -95,8 +95,6 @@ func extractPortFromEndpoint(ep string) int {
 	return port
 }
 
-// lastIndexByte 定义在 main.go 里，同 package 直接调用
-
 func (e *Edge) startFailCountResetLoop() {
 	safeGo("fail-count-reset", func() {
 		ticker := time.NewTicker(5 * time.Minute)
@@ -226,7 +224,6 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		return nil
 	}
 
-	// ★ P0-1 打洞并行化：去重 key 用 target@rung，允许同一 target 的多个 rung 并行
 	activeKey := fmt.Sprintf("%s@%d", instr.TargetMac, instr.BehaviorIndex)
 	if natHoleActive[activeKey] {
 		natHoleActiveMu.Unlock()
@@ -449,6 +446,9 @@ func (e *Edge) resetFailCount(peerID string) {
 	natHoleActiveMu.Unlock()
 }
 
+// recordP2PSuccess 记录打洞成功时的 peer 地址。
+//
+// ★ 修复：打洞命中 LAN → 直接 MarkLAN（不是 MarkP2P）。
 func (e *Edge) recordP2PSuccess(instr *NatHoleInstruction, targetAddr *net.UDPAddr) {
 	e.peersMu.Lock()
 	if p, ok := e.peers[instr.TargetMac]; ok {
@@ -488,6 +488,16 @@ func (e *Edge) recordP2PSuccess(instr *NatHoleInstruction, targetAddr *net.UDPAd
 		}
 	}
 	e.peersMu.Unlock()
+
+	// ★ 新增：打洞命中 LAN → MarkLAN（不是 MarkP2P）
+	if isPrivateIPv4(targetAddr.IP) && e.relayMgr != nil {
+		cur := e.relayMgr.GetState(instr.TargetMac)
+		if cur != ConnLAN && cur != ConnP2P {
+			log.Printf("[LAN] 打洞命中 LAN 地址 %s → LAN 直连（prev=%s）",
+				targetAddr, cur)
+			e.relayMgr.MarkLAN(instr.TargetMac)
+		}
+	}
 }
 
 func (e *Edge) reportInProgress(instr *NatHoleInstruction) {
