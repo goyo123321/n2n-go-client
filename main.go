@@ -115,7 +115,7 @@ type PeerInfo struct {
 	UDPAddr           *net.UDPAddr
 	lastRecvAt        int64
 	lastLANRecvAt     int64
-	lastP2PRecvAt     int64 // ★ 新增：P2P 直连真实数据帧时间（viaTURN=false 且 isRealData=true）
+	lastP2PRecvAt     int64 // ★ P2P 直连真实数据帧时间（viaTURN=false 且 isRealData=true）
 	loggedReady       bool
 	hasRealData       bool
 	probeReplied      bool
@@ -132,7 +132,7 @@ type Edge struct {
 	virtualCIDR string
 	roomId      string
 
-	// ★ 新增：网络变化去抖 / 合并延迟（见 edge_network.go）
+	// ★ 网络变化去抖 / 合并延迟（见 edge_network.go）
 	lastNetworkChangedAt int64
 	lastNetworkType      string
 	pendingNetChangeMu   sync.Mutex
@@ -173,7 +173,7 @@ type Edge struct {
 
 	lastDataFrameAt int64
 
-	// ★ 修复：bool → int，记录上次 status，值变化时才重新上报
+	// ★ 记录上次 status（int），值变化时才重新上报
 	p2pStatusReported   map[string]int
 	p2pStatusReportedMu sync.Mutex
 
@@ -640,7 +640,7 @@ func main() {
 		p2pAvailTimers:    make(map[string]*time.Timer),
 		lastNoPeerLog:     make(map[string]int64),
 		tunStateLog:       make(map[string]ConnType),
-		p2pStatusReported: make(map[string]int), // ★ int（was bool）
+		p2pStatusReported: make(map[string]int),
 		doneCh:            make(chan struct{}),
 	}
 	edge.punchAckLimiter = newPunchAckLimiter()
@@ -703,7 +703,7 @@ func main() {
 		}
 
 		edge.p2pStatusReportedMu.Lock()
-		edge.p2pStatusReported = make(map[string]int) // ★ int
+		edge.p2pStatusReported = make(map[string]int)
 		edge.p2pStatusReportedMu.Unlock()
 
 		edge.p2pAvailTimersMu.Lock()
@@ -1091,13 +1091,20 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		}
 
 		e.p2pStatusReportedMu.Lock()
-		e.p2pStatusReported = make(map[string]int) // ★ int
+		e.p2pStatusReported = make(map[string]int)
 		e.p2pStatusReportedMu.Unlock()
+
+		// ★ P1-1：清理 pending 的 P2PAvailable 60s 超时 timer（与 Android / Termux 一致）
+		e.p2pAvailTimersMu.Lock()
+		for _, tt := range e.p2pAvailTimers {
+			tt.Stop()
+		}
+		e.p2pAvailTimers = make(map[string]*time.Timer)
+		e.p2pAvailTimersMu.Unlock()
 
 		e.reportMetadata()
 		atomic.StoreInt64(&e.lastMetadataReportAt, time.Now().UnixMilli())
 
-		// ★ 补发 network_changed（防止切换瞬间丢失导致服务端 punchState 残留）
 		if e.ws != nil {
 			_ = e.ws.Send(map[string]interface{}{
 				"type":   "network_changed",
@@ -1106,7 +1113,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			log.Printf("[Network] WS 重连，补发 network_changed (reason=ws-reconnected)")
 		}
 
-		// ★ 主动触发一次 STUN 探测（不等 5s 保活周期）
 		safeGo("reconnect-stun-probe", func() {
 			time.Sleep(300 * time.Millisecond)
 			if e.udpConn == nil {
@@ -1370,7 +1376,13 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			if e.relayMgr == nil {
 				continue
 			}
-			if e.relayMgr.GetState(peerID) == ConnP2P {
+			// ★ P1-3：与 n2n-android / n2n-termux 对齐
+			//   ConnLAN / ConnP2P 都跳过，并主动上报 p2p_status=3
+			//   否则服务端 punchState 一直是旧值，每 15s 重发 force_fallback
+			st := e.relayMgr.GetState(peerID)
+			if st == ConnLAN || st == ConnP2P {
+				log.Printf("[信令] %s 已 %s，忽略 force_fallback，上报 p2p_status=3", peerID, st)
+				e.reportP2PStatus(peerID, 3)
 				continue
 			}
 			e.relayMgr.ForceFallback(peerID, reason)
@@ -1403,7 +1415,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 	case "connection_status":
 		return
 
-	// ★ 新增：peer_network_changed
+	// peer_network_changed
 	//   - reason == "ws-reconnected"：只刷新 lastRecvAt，保留 P2P 状态
 	//   - 其他 reason：清 UDPAddr / LanEndpoints / TurnRelayAddr
 	case "peer_network_changed":
@@ -1435,7 +1447,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			p.UDPAddr = nil
 			p.lastLANRecvAt = 0
 			p.lastRecvAt = 0
-			p.lastP2PRecvAt = 0 // ★ 清 P2P 真实数据时间
+			p.lastP2PRecvAt = 0
 			p.PubIP = ""
 			p.PubPort = 0
 			p.TurnRelayAddr = ""
@@ -2093,6 +2105,18 @@ func (e *Edge) notePeerTrafficTURN(addr *net.UDPAddr) {
 	e.notePeerCommon(addr, true, true, false)
 }
 
+// notePeerCommon 统一处理所有来源的 UDP 包。
+//
+// ★ P0-1' 修复：TURN 场景下 addr 是对端的 relay 地址（TURN Data Indication
+//   的 XOR-PEER-ADDRESS），不在该 peer 的 UDPAddr / LanEndpoints /
+//   AssistedEndpoints 里。加一个 TurnRelayAddr 反向匹配分支，否则
+//   TURN 场景下 best == nil，P0-1 / P0-2 全部空转。
+//
+// ★ P0-2 修复：isRealData 分支加 viaTURN 处理，与 n2n-android / n2n-termux
+//   完全一致。
+//   - isRealData && !viaTURN → 更新 lastP2PRecvAt
+//   - viaTURN && cur == ConnUnknown → MarkFallback（面板不再显示 --）
+//   - viaTURN && cur == ConnLAN/ConnP2P → ForceFallback("peer-via-turn")
 func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, isAck bool) {
 	now := time.Now().UnixMilli()
 
@@ -2150,6 +2174,26 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 			bestScore = score
 		}
 	}
+
+	// ★ P0-1'：TURN 场景下 addr 是对端 relay 地址，按 TurnRelayAddr 反查
+	//
+	// 场景：A 已降级到 TURN，通过 TURN 服务器给 B 发数据帧。
+	// B 的 turnClient.onMessage 收到的 addr 是 A 的 TURN relay 地址
+	// （TURN Data Indication 的 XOR-PEER-ADDRESS），
+	// 它不在 A 的 UDPAddr / LanEndpoints / AssistedEndpoints 里。
+	//
+	// 不加这段的话，P0-1 在 TURN 场景下匹配失败，状态机不更新，
+	// B 会继续往 A 的旧 P2P 地址发包 → 丢包 → ping 卡住。
+	if best == nil && viaTURN {
+		addrStr := addr.String()
+		for _, p := range e.peers {
+			if p.TurnRelayAddr != "" && p.TurnRelayAddr == addrStr {
+				best = p
+				break
+			}
+		}
+	}
+
 	if best == nil {
 		e.peersMu.Unlock()
 		return
@@ -2164,7 +2208,7 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 	} else if !oldIsLAN && newIsLAN {
 		shouldUpdate = true
 	} else if oldIsLAN && !newIsLAN {
-		// ★ P0 修复：lastLANRecvAt 为 0 时用 registeredAt 兜底
+		// ★ 修复：lastLANRecvAt 为 0 时用 registeredAt 兜底
 		lastLAN := best.lastLANRecvAt
 		if lastLAN == 0 {
 			lastLAN = best.registeredAt
@@ -2193,7 +2237,7 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 	}
 
 	best.lastRecvAt = now
-	// ★ 新增：只有 P2P 直连的真实数据才刷新 lastP2PRecvAt
+	// ★ 只有 P2P 直连的真实数据才刷新 lastP2PRecvAt
 	//   对端通过 TURN 发的包（viaTURN=true）不算 P2P，不刷新
 	//   避免单向 P2P 丢包（B→A 丢，A→B 走 TURN）时 lastRecvAt 被
 	//   TURN 包持续刷新导致永远不降级
@@ -2211,15 +2255,30 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 		return
 	}
 
+	// ★ P0-2：isRealData 分支加 viaTURN 处理（与 n2n-android / n2n-termux 一致）
 	if isRealData {
-		// ★ 新增：区分 LAN 和公网 P2P
+		cur := e.relayMgr.GetState(clientID)
+
+		if viaTURN {
+			if cur == ConnLAN || cur == ConnP2P {
+				log.Printf("[TURN] 从 %s (%s) 收到真实数据帧（via TURN）→ 对端已降级，本机跟进",
+					clientID, ip)
+				e.relayMgr.ForceFallback(clientID, "peer-via-turn")
+			} else if cur == ConnUnknown {
+				log.Printf("[TURN] 从 %s (%s) 收到真实数据帧（Unknown → TURN）",
+					clientID, ip)
+				e.relayMgr.MarkFallback(clientID)
+			}
+			return
+		}
+
 		if newIsLAN {
-			if e.relayMgr.GetState(clientID) != ConnLAN {
+			if cur != ConnLAN {
 				log.Printf("[LAN] 从 %s (%s) 收到真实数据帧 → LAN 直连", clientID, ip)
 				e.relayMgr.MarkLAN(clientID)
 			}
 		} else {
-			if e.relayMgr.GetState(clientID) != ConnP2P {
+			if cur != ConnP2P {
 				log.Printf("[P2P] 从 %s (%s) 收到真实数据帧 → P2P 直连", clientID, ip)
 				e.relayMgr.MarkP2P(clientID)
 			}
