@@ -13,7 +13,7 @@ type ConnType string
 const (
 	ConnUnknown      ConnType = "unknown"
 	ConnP2PAvailable ConnType = "p2p-avail"
-	ConnLAN          ConnType = "lan"  // ★ 新增
+	ConnLAN          ConnType = "lan"
 	ConnP2P          ConnType = "p2p"
 	ConnTURN         ConnType = "turn"
 	ConnRelay        ConnType = "relay"
@@ -38,9 +38,7 @@ type RelayManager struct {
 	states     map[string]ConnType
 	failCounts map[string]int
 
-	// ★ 新增：peer-via-ws 震荡保护
-	//   5 秒内累计 ≥5 个 WS 帧才降级
-	//   且要求 5 秒内没有 P2P 真实数据（lastRecvAt 保护）
+	// peer-via-ws 震荡保护：5 秒内累计 ≥5 个 WS 帧才降级
 	wsFrameCounts map[string]int
 	wsFirstAt     map[string]int64
 }
@@ -72,13 +70,13 @@ func (rm *RelayManager) MarkP2PAvailable(peerID string) {
 
 	if rm.edge != nil {
 		rm.edge.cancelP2PAvailTimeout(peerID)
-		rm.edge.reportP2PStatus(peerID, 2) // ★ 新增
+		rm.edge.reportP2PStatus(peerID, 2)
 	}
 }
 
 // MarkLAN 标记 LAN 直连已验证。
 //
-// 与 n2n-android 对齐：LAN 和公网 P2P 分开管理，独立 60s 超时降级。
+// 与 n2n-android / n2n-termux 对齐：LAN 和公网 P2P 分开管理，独立 60s 超时降级。
 func (rm *RelayManager) MarkLAN(peerId string) {
 	rm.mu.Lock()
 	prev := rm.states[peerId]
@@ -126,10 +124,20 @@ func (rm *RelayManager) MarkP2P(peerId string) {
 
 	if rm.edge != nil {
 		rm.edge.cancelP2PAvailTimeout(peerId)
-		rm.edge.reportP2PStatus(peerId, 3) // ★ 新增
+		rm.edge.reportP2PStatus(peerId, 3)
 	}
 }
 
+// MarkFallback 从 Unknown 状态降级到 TURN/WS。
+//
+// ★ P0-3 修复：删除 "lastRecvAt < 10s 就跳过降级" 的早退逻辑，与 n2n-android
+// / n2n-termux 对齐。
+//
+// 旧版问题：8s fallback timer 触发时，如果刚好收到一个 punch（lastRecvAt 被刷新），
+// 本函数早退 → 状态卡 Unknown → 后续 punch 又刷新 → 永远进不了 TURN 状态
+// → 面板状态在 unknown / p2p / turn 之间反复跳 → ping 状态不稳定。
+//
+// 正确做法：8s timer 到点就降级，不在 MarkFallback 里妥协。
 func (rm *RelayManager) MarkFallback(peerId string) {
 	rm.mu.Lock()
 
@@ -148,24 +156,7 @@ func (rm *RelayManager) MarkFallback(peerId string) {
 	}
 	rm.mu.Unlock()
 
-	if rm.edge != nil {
-		rm.edge.peersMu.RLock()
-		p, ok := rm.edge.peers[peerId]
-		var lastRecv int64 = 0
-		if ok {
-			lastRecv = p.lastRecvAt
-		}
-		rm.edge.peersMu.RUnlock()
-
-		if lastRecv > 0 {
-			idleMs := time.Now().UnixMilli() - lastRecv
-			if idleMs < 10000 {
-				log.Printf("[连接] %s 最近 %dms 收到过 UDP 包，跳过降级", peerId, idleMs)
-				return
-			}
-		}
-	}
-
+	// 双重检查：unlock 到 re-lock 之间状态可能已被别的 goroutine 改了
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 
@@ -194,7 +185,7 @@ func (rm *RelayManager) MarkFallback(peerId string) {
 
 // ForceFallback 强制降级。
 //
-// ★ 修复：允许 ConnLAN / ConnP2P 在特定 reason 下降级。
+// 允许 ConnLAN / ConnP2P 在特定 reason 下降级。
 func (rm *RelayManager) ForceFallback(peerId string, reason string) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
@@ -203,7 +194,7 @@ func (rm *RelayManager) ForceFallback(peerId string, reason string) {
 		return
 	}
 
-	// ★ ConnLAN 分支
+	// ConnLAN 分支
 	if rm.states[peerId] == ConnLAN {
 		if reason != "peer-via-turn" &&
 			reason != "peer-via-ws" &&
@@ -216,7 +207,7 @@ func (rm *RelayManager) ForceFallback(peerId string, reason string) {
 		log.Printf("[连接] %s 从 LAN 降级 (force: %s)", peerId, reason)
 	}
 
-	// ★ ConnP2P 分支
+	// ConnP2P 分支
 	if rm.states[peerId] == ConnP2P {
 		if reason != "no-traffic-30s" &&
 			reason != "p2p-avail-timeout" &&
@@ -238,7 +229,7 @@ func (rm *RelayManager) ForceFallback(peerId string, reason string) {
 	rm.cancelFallbackTimer(peerId)
 	if rm.edge != nil {
 		rm.edge.cancelP2PAvailTimeout(peerId)
-		rm.edge.reportP2PStatus(peerId, 0) // ★ 新增
+		rm.edge.reportP2PStatus(peerId, 0)
 	}
 }
 
@@ -459,10 +450,6 @@ func (rm *RelayManager) SendViaRelay(data []byte) error {
 }
 
 // SendToPeer 按当前状态发送数据。
-//
-// ★ 修复：
-//   - 新增 ConnLAN 分支（LAN 发送失败降级到 P2PAvailable）
-//   - ConnTURN 每次发送前检查 TURN 是否真的就绪
 func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo) bool {
 	state := rm.GetState(peerId)
 
@@ -602,7 +589,6 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 		return rm.ws.SendBinary(buildN2NWFrame(peerId, data)) == nil
 
 	case ConnTURN:
-		// ★ 修复：每次发送前检查 TURN 是否真的就绪
 		if rm.turnClient == nil || !rm.turnClient.IsReady() {
 			log.Printf("[TURN] %s TURN 未就绪（可能已断开），直接走 WS 兜底", peerId)
 			rm.mu.Lock()
